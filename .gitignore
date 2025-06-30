@@ -1,0 +1,9 @@
+*.csv
+.idea
+.ipynb_checkpoints
+__pycache__
+*.jsonl
+.new-env
+.venv
+.DS_Store
+token_file.ini
