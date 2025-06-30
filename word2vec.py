@@ -1,10 +1,11 @@
 """In order to use our word embeddings for similiraty search in combination with infinigram, we should tokenize the whole thing∏
 """
 from transformers import AutoTokenizer
+from datasets import load_dataset
 import time
 from tqdm import tqdm
 from pathlib import Path
-import json
+
 from gensim.test.utils import datapath
 from gensim import utils
 from gensim.utils import simple_preprocess
@@ -78,3 +79,17 @@ class MyJsonCorpus:
         print(f"Found {len(results)} occurrences")
         return results
 
+
+class HFStreamingCorpus:
+    def __init__(self, dataset_name, split="train", text_field="text", subset=None):
+        self.dataset_name = dataset_name
+        self.split = split
+        self.text_field = text_field
+        self.subset = subset
+
+    def __iter__(self):
+        ds = load_dataset(self.dataset_name, self.subset, split=self.split, streaming=True)
+        for i, example in enumerate(tqdm(ds, desc="Streaming examples", unit="docs")):
+            text = example.get(self.text_field, "")
+            if text:
+                yield simple_preprocess(text.lower())
