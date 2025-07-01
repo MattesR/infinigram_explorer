@@ -1,21 +1,34 @@
-"""In order to use our word embeddings for similiraty search in combination with infinigram, we should tokenize the whole thing∏
+"""
 """
 from transformers import AutoTokenizer
 from datasets import load_dataset
 import time
 from tqdm import tqdm
 from pathlib import Path
-
+import click
+import yaml
+from gensim.models import Word2Vec
 from gensim.test.utils import datapath
 from gensim import utils
 from gensim.utils import simple_preprocess
 from typing import Iterator
 from utils import get_token
 
+from loguru import logger
+import logging
+
+class LoguruHandler(logging.Handler):
+    def emit(self, record):
+        # Use Loguru to handle logs from gensim
+        logger_opt = logger.opt(depth=6, exception=record.exc_info)
+        logger_opt.log(record.levelname, record.getMessage())
+logger.add("word2vec_training.log", level="INFO")
+
+
 HF_TOKEN = get_token('HF_TOKEN')
 INDEX='v4_olmo-2-0325-32b-instruct_llama'
 TOKENIZER_NAME='meta-llama/Llama-2-7b-hf'
-TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
+## TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
 
 
 class MyJsonCorpus:
@@ -25,15 +38,20 @@ class MyJsonCorpus:
     tokenized, and yielded as a list of tokens.
     """
 
-    def __init__(self, dir_path):
+    def __init__(self, dir_path, max_sentences=None):
         self.dir_path = Path(dir_path)
+        self.max_sentences = max_sentences
 
     def __iter__(self):
         files = list(self.dir_path.glob("*.json"))
+        count = 0
         for file_path in tqdm(files, desc="Processing files"):
             try:
                 text = self.prep_text_file(file_path)
                 text = text.lower()
+                count += 1
+                if self.max_sentences and count > self.max_sentences:
+                    break
                 yield simple_preprocess(text)
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
@@ -81,15 +99,119 @@ class MyJsonCorpus:
 
 
 class HFStreamingCorpus:
-    def __init__(self, dataset_name, split="train", text_field="text", subset=None):
+    def __init__(self, dataset_name, split="train", text_field="text", subset=None, max_sentences=None):
         self.dataset_name = dataset_name
         self.split = split
         self.text_field = text_field
         self.subset = subset
+        self.max_sentences = max_sentences
 
     def __iter__(self):
-        ds = load_dataset(self.dataset_name, self.subset, split=self.split, streaming=True)
-        for i, example in enumerate(tqdm(ds, desc="Streaming examples", unit="docs")):
+        if self.subset:
+            ds = load_dataset(self.dataset_name, self.subset, split=self.split, streaming=True)
+        else:
+            ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+
+        count = 0
+        for example in tqdm(ds, desc="Streaming examples", unit="docs"):
             text = example.get(self.text_field, "")
             if text:
                 yield simple_preprocess(text.lower())
+                count += 1
+                if self.max_sentences and count >= self.max_sentences:
+                    break
+
+
+
+def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
+    if isinstance(output_dir,str):
+        utput_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup Loguru logger
+    log_path = output_dir / "word2vec_training.log"
+    logger.remove()  # Remove default logger to avoid duplicate logs
+    logger.add(log_path, level="INFO")
+
+    # Redirect gensim logs to loguru
+    gensim_logger = logging.getLogger("gensim")
+    gensim_logger.setLevel(logging.INFO)
+    gensim_logger.handlers.clear()
+    gensim_logger.addHandler(LoguruHandler())
+    logger.info("Starting Word2Vec training")
+    
+    model = Word2Vec(
+        sentences=corpus_iterable,
+        vector_size=vector_size,
+        window=window,
+        min_count=min_count,
+        workers=workers,
+        epochs=epochs,
+    )
+
+    # Save model
+    model_path = output_dir / "word2vec.model"
+    model.save(str(model_path))
+    logger.info(f"Model training complete and saved to {model_path}")
+
+
+def read_config(config_path: str) -> dict:
+    """
+    Reads a YAML config file and fills omitted values with defaults.
+    Logs warnings for each defaulted value.
+    """
+    DEFAULT_CONFIG = {
+    "vector_size": 100,
+    "window": 5,
+    "min_count": 5,
+    "workers": 4,
+    "sg": 0,
+    "epochs": 5,
+    "batch_words": 10000
+    }
+    config_path = Path(config_path)
+    with open(config_path / 'config.yml', 'r') as f:
+        user_config = yaml.safe_load(f) or {}
+
+    config = user_config.copy()  # start with all user keys (including extras)
+
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in config:
+            config[key] = default_value
+            logger.warning(f"Config key '{key}' missing; using default value: {default_value}")
+    
+    if 'path' in user_config:
+        config['corpus_iterable'] = MyJsonCorpus(user_config['path'])
+    elif 'huggingface_url' in user_config:
+        hf_kwargs = {
+            "dataset_name": user_config["huggingface_url"],
+            "split": user_config.get("split", "train"),
+            "text_field": user_config.get("text_field", "text"),
+            "subset": user_config.get("subset")  # Can be None
+        }
+        config['corpus_iterable'] = HFStreamingCorpus(**hf_kwargs)
+    else:
+        raise ValueError("Config must contain either 'path' or 'huggingface_url'")
+    print(config)
+    if 'outpath' not in config:
+        config['output_dir'] = Path(config_path).parent
+        print('adding outpath')
+        logger.warning(f'adding default outpath {config["output_dir"]} to config')
+
+    return config
+
+
+@click.command()
+@click.argument("config_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def main(config_dir: Path):
+    config_path = config_dir / "config.yml"
+    if not config_path.exists():
+        raise click.ClickException(f"No config.yml found in {config_dir}")
+
+    config=read_config(config_dir)
+    print('training now')
+    train_word2vec_model(**config)
+
+
+if __name__ == "__main__":
+    main()
