@@ -1,3 +1,16 @@
+import html
+import re
+
+def clean_html(text):
+    # Decode HTML entities (e.g., &lt;, &amp;, &nbsp;)
+    text = html.unescape(text)
+
+    # Collapse multiple spaces
+    text = re.sub(r'</?(br|div|p|b|i|span|a)[^>]*>', ' ', text, flags=re.IGNORECASE)
+
+    return text
+
+
 def get_token(key: str, filename: str = "token_file.ini") -> str | None:
     try:
         with open(filename, "r") as f:

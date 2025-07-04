@@ -1,0 +1,15 @@
+## This is an example config file for reference.
+## best to put it in a folder and then also store the model there
+## either data_dir or hf_dataset has to be part of the config
+## you can specify an out_dir that it different from the config
+## if no outdir is in the config, the path of the config will be taken as an outdir 
+## this is where to model will be saved at the end
+data_dir: ./path/to/json/files 
+## OR
+huggingface_url: https://huggingface.co/datasets/allenai/olmo-mix-1124 # or whatever
+vector_size: 300 #same size as google news and other static embeddings
+window: 5
+min_count: 10 
+workers: 4 ## you can either put an int or  ALL, which will be num_cores - 1, or MAX which will be num_cores 
+sg: 1
+epochs: 5
