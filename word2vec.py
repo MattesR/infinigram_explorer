@@ -18,6 +18,7 @@ from loguru import logger
 import logging
 from datetime import timedelta
 from huggingface_hub import list_repo_files
+import sys
 
 class LoguruHandler(logging.Handler):
     def emit(self, record):
@@ -109,7 +110,8 @@ class HFStreamingCorpus:
                  max_sentences=None, 
                  max_files_per_stream=1000,
                  data_dir="data",
-                 revision=None):
+                 revision=None,
+                 tokenizer=None):
         
         self.dataset_name = dataset_name
         self.subset = subset
@@ -120,53 +122,91 @@ class HFStreamingCorpus:
         self.data_dir = data_dir.strip("/")
         self.revision = revision
         self.repo_id = dataset_name  # HF dataset name doubles as repo_id
-
+        self.tokenizer = tokenizer
         self.batches = self._prepare_batches()
 
     def _prepare_batches(self):
-        logger.info(f"Listing files from dataset: {self.repo_id}")
-        files = list_repo_files(self.repo_id, repo_type="dataset", revision=self.revision)
+        logger.info(f"Fetching file list from repository: {self.dataset_name}")
+        files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
+        if self.subset:
+            self.data_dir = f'{self.data_dir}/{self.subset}'
         files = [f for f in files if f.startswith(self.data_dir)]
         logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
 
-        # Group files by top-level subset (data/starcoder/ → starcoder)
-        subsets = defaultdict(list)
-        for f in files:
-            parts = PurePosixPath(f).parts
-            if len(parts) >= 2:
-                subset = parts[1]
-                subsets[subset].append(f)
+        # Step 1: Map actual folders (parents of files) → files
+        parent_to_files = defaultdict(list)
+        for file in files:
+            parent = str(PurePosixPath(file).parent)
+            parent_to_files[parent].append(file)
 
-        logger.info(f"Found {len(subsets)} top-level subsets: {list(subsets.keys())}")
+        logger.info(f"Found {len(parent_to_files)} folders with files")
 
+        # Step 2: Determine batches
         batches = {}
-        for subset_name, subset_files in subsets.items():
-            if len(subset_files) <= self.max_files_per_stream:
-                batch_path = f"{self.data_dir}/{subset_name}/**/*"
-                batches[batch_path] = subset_files
-                logger.info(f"Added batch: {batch_path} with {len(subset_files)} files")
-            else:
-                # Chunk files within large subset
-                for i in range(0, len(subset_files), self.max_files_per_stream):
-                    chunk = subset_files[i:i + self.max_files_per_stream]
-                    batch_path = f"{self.data_dir}/{subset_name}/chunk_{i//self.max_files_per_stream}/**/*"
-                    batches[batch_path] = chunk
-                    logger.info(f"Added chunked batch: {batch_path} with {len(chunk)} files")
 
-        return batches if batches else None
+        # Group folders by their grandparent
+        grandparent_to_parents = defaultdict(list)
+        for parent in parent_to_files:
+            parts = PurePosixPath(parent).parts
+            if len(parts) < 3:
+                # Unexpected short path, skip
+                continue
+            grandparent = str(PurePosixPath(*parts[:-1]))
+            grandparent_to_parents[grandparent].append(parent)
+
+        # Step 3: Walk through each grandparent group
+        for grandparent, parents in grandparent_to_parents.items():
+            if PurePosixPath(grandparent).parent == PurePosixPath(self.data_dir):
+                # Direct child of data_dir (e.g., data/wiki)
+                for parent in parents:
+                    files = parent_to_files[parent]
+                    if len(files) > self.max_files_per_stream:
+                        # Chunk
+                        for i in range(0, len(files), self.max_files_per_stream):
+                            chunk = files[i:i + self.max_files_per_stream]
+                            batch_name = f"{parent}/chunk_{i // self.max_files_per_stream}"
+                            batches[batch_name] = chunk
+                            logger.info(f"Chunked batch {batch_name} with {len(chunk)} files")
+                    else:
+                        batches[parent] = files
+                        logger.info(f"Added batch {parent} with {len(files)} files")
+            else:
+                # Deeper level – try merging siblings under this grandparent
+                all_files = []
+                for parent in parents:
+                    all_files.extend(parent_to_files[parent])
+                if len(all_files) <= self.max_files_per_stream:
+                    batches[grandparent] = all_files
+                    logger.info(f"Merged batch {grandparent} with {len(all_files)} files from {len(parents)} folders")
+                else:
+                    # Too big to merge, handle each leaf individually
+                    for parent in parents:
+                        files = parent_to_files[parent]
+                        if len(files) > self.max_files_per_stream:
+                            for i in range(0, len(files), self.max_files_per_stream):
+                                chunk = files[i:i + self.max_files_per_stream]
+                                batch_name = f"{parent}/chunk_{i // self.max_files_per_stream}"
+                                batches[batch_name] = chunk
+                                logger.info(f"Chunked batch {batch_name} with {len(chunk)} files")
+                        else:
+                            batches[parent] = files
+                            logger.info(f"Added batch {parent} with {len(files)} files")
+
+        self.batches = batches
+        return batches
 
 
     def __iter__(self):
         count = 0
         if self.batches:
-            for path in self.batches:
+            for path, files in self.batches.items():
                 logger.info(f"Streaming batch from path: {path}")
                 try:
                     ds = load_dataset(self.dataset_name,
                                         name=self.subset,
                                         split=self.split,
                                         streaming=True,
-                                        data_files={self.split: path},
+                                        data_files={self.split: files},
                                         revision=self.revision)
                 except Exception as ds_exeption:
                    logger.error(f"Failed to load batch from {path}: {ds_exeption}") 
@@ -214,13 +254,15 @@ class HFStreamingCorpus:
 
 def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
     if isinstance(output_dir,str):
-        utput_dir = Path(output_dir)
+        output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_model_path = output_dir / '.tmp_word2vec.model'
 
     # Setup Loguru logger
     log_path = output_dir / "word2vec_training.log"
     logger.remove()  # Remove default logger to avoid duplicate logs
     logger.add(log_path, level="INFO")
+    logger.add(sys.stderr, level="INFO") 
 
     # Redirect gensim logs to loguru
     gensim_logger = logging.getLogger("gensim")
@@ -228,15 +270,19 @@ def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200,
     gensim_logger.handlers.clear()
     gensim_logger.addHandler(LoguruHandler())
     logger.info("Starting Word2Vec training")
-    
-    model = Word2Vec(
-        sentences=corpus_iterable,
-        vector_size=vector_size,
-        window=window,
-        min_count=min_count,
-        workers=workers,
-        epochs=epochs,
-    )
+    if tmp_model_path.exists():
+        logger.info(f"Resuming from existing model: {tmp_model_path}")
+        model = Word2Vec.load(tmp_model_path)
+    else:
+        logger.info("Starting new Word2Vec model")
+        model = Word2Vec(
+            sentences=corpus_iterable,
+            vector_size=vector_size,
+            window=window,
+            min_count=min_count,
+            workers=workers,
+            epochs=epochs,
+        )
 
     # Save model
     if output_dir:
@@ -258,7 +304,8 @@ def read_config(config_path: str) -> dict:
     "workers": 4,
     "sg": 0,
     "epochs": 5,
-    "batch_words": 10000
+    "batch_words": 10000,
+    "tokenizer": None
     }
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
