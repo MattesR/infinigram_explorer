@@ -10,6 +10,7 @@ huggingface_url: https://huggingface.co/datasets/allenai/olmo-mix-1124 # or what
 vector_size: 300 #same size as google news and other static embeddings
 window: 5
 min_count: 10 
+max_sentences: 1000 
 workers: 4 ## you can either put an int or  ALL, which will be num_cores - 1, or MAX which will be num_cores 
-sg: 1
+sg: 1 ## skip-gram, 0 for cbow
 epochs: 5

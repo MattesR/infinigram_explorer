@@ -205,7 +205,7 @@ class HFStreamingCorpus:
                 logger.info(f"Streaming batch from path: {path}")
                 try:
                     ds = load_dataset(self.dataset_name,
-                                        name=self.subset,
+                                        name=self.subset if self.subset else path.split('/')[1],
                                         split=self.split,
                                         streaming=True,
                                         data_files={self.split: files},
