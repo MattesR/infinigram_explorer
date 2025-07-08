@@ -162,37 +162,55 @@ class HFStreamingCorpus:
                 # Direct child of data_dir (e.g., data/wiki)
                 for parent in parents:
                     files = parent_to_files[parent]
+                    subset_name = parent.split('/')[1]
                     if len(files) > self.max_files_per_stream:
                         # Chunk
                         for i in range(0, len(files), self.max_files_per_stream):
                             chunk = files[i:i + self.max_files_per_stream]
                             batch_name = f"{parent}/chunk_{i // self.max_files_per_stream}"
-                            batches[batch_name] = chunk
-                            logger.info(f"Chunked batch {batch_name} with {len(chunk)} files")
+                            batches[batch_name] = {
+                                'files': chunk,
+                                'subset': subset_name
+                            }
+                            logger.info(f"Chunked batch {batch_name} with {len(chunk)} files, and subset {subset_name}")
                     else:
-                        batches[parent] = files
-                        logger.info(f"Added batch {parent} with {len(files)} files")
+                        batches[parent] = {
+                            'files': files,
+                            'subset': subset_name
+                        }
+                        logger.info(f"Added batch {parent} with {len(files)} files and subset {subset_name}")
             else:
                 # Deeper level – try merging siblings under this grandparent
                 all_files = []
                 for parent in parents:
                     all_files.extend(parent_to_files[parent])
+                subset_name = grandparent.split('/')[1]
                 if len(all_files) <= self.max_files_per_stream:
-                    batches[grandparent] = all_files
-                    logger.info(f"Merged batch {grandparent} with {len(all_files)} files from {len(parents)} folders")
+                    batches[grandparent] = {
+                        'files': all_files,
+                        'subset': subset_name
+                    }
+                    logger.info(f"Merged batch {grandparent} with {len(all_files)} files from {len(parents)} folders and subset {subset_name}")
                 else:
                     # Too big to merge, handle each leaf individually
                     for parent in parents:
                         files = parent_to_files[parent]
+                        subset_name = parent.split('/')[1]
                         if len(files) > self.max_files_per_stream:
                             for i in range(0, len(files), self.max_files_per_stream):
                                 chunk = files[i:i + self.max_files_per_stream]
                                 batch_name = f"{parent}/chunk_{i // self.max_files_per_stream}"
-                                batches[batch_name] = chunk
-                                logger.info(f"Chunked batch {batch_name} with {len(chunk)} files")
+                                batches[batch_name] = {
+                                    'files': chunk,
+                                    'subset': subset_name
+                                }
+                                logger.info(f"Chunked batch {batch_name} with {len(chunk)} files and subset {subset_name}")
                         else:
-                            batches[parent] = files
-                            logger.info(f"Added batch {parent} with {len(files)} files")
+                            batches[parent] = {
+                                'files': files,
+                                'subset': subset_name
+                            }
+                            logger.info(f"Added batch {parent} with {len(files)} files and subset {subset_name}")
 
         self.batches = batches
         return batches
@@ -201,14 +219,14 @@ class HFStreamingCorpus:
     def __iter__(self):
         count = 0
         if self.batches:
-            for path, files in self.batches.items():
+            for path, batch in self.batches.items():
                 logger.info(f"Streaming batch from path: {path}")
                 try:
                     ds = load_dataset(self.dataset_name,
-                                        name=self.subset if self.subset else path.split('/')[1],
+                                        name=self.subset if self.subset else batch['subset'],
                                         split=self.split,
                                         streaming=True,
-                                        data_files={self.split: files},
+                                        data_files={self.split: batch['files']},
                                         revision=self.revision)
                 except Exception as ds_exeption:
                    logger.error(f"Failed to load batch from {path}: {ds_exeption}") 
