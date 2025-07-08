@@ -17,7 +17,7 @@ from utils import get_token, clean_html
 from loguru import logger
 import logging
 from datetime import timedelta
-from huggingface_hub import list_repo_files
+from huggingface_hub import list_repo_files, login
 import sys
 import multiprocessing
 
@@ -30,6 +30,7 @@ logger.add("word2vec_training.log", level="INFO")
 
 
 HF_TOKEN = get_token('HF_TOKEN')
+login(HF_TOKEN)
 INDEX='v4_olmo-2-0325-32b-instruct_llama'
 TOKENIZER_NAME='meta-llama/Llama-2-7b-hf'
 ## TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
