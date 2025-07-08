@@ -19,6 +19,7 @@ import logging
 from datetime import timedelta
 from huggingface_hub import list_repo_files
 import sys
+import multiprocessing
 
 class LoguruHandler(logging.Handler):
     def emit(self, record):
@@ -270,18 +271,13 @@ def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200,
     gensim_logger.handlers.clear()
     gensim_logger.addHandler(LoguruHandler())
     logger.info("Starting Word2Vec training")
-    if tmp_model_path.exists():
-        logger.info(f"Resuming from existing model: {tmp_model_path}")
-        model = Word2Vec.load(tmp_model_path)
-    else:
-        logger.info("Starting new Word2Vec model")
-        model = Word2Vec(
-            sentences=corpus_iterable,
-            vector_size=vector_size,
-            window=window,
-            min_count=min_count,
-            workers=workers,
-            epochs=epochs,
+    model = Word2Vec(
+        sentences=corpus_iterable,
+        vector_size=vector_size,
+        window=window,
+        min_count=min_count,
+        workers=workers,
+        epochs=epochs,
         )
 
     # Save model
@@ -336,6 +332,17 @@ def read_config(config_path: str) -> dict:
         config['output_dir'] = Path(config_path)
         print('adding outpath')
         logger.warning(f'adding default outpath {config["output_dir"]} to config')
+    
+    if isinstance(config['workers'], str):
+        total_cpus = multiprocessing.cpu_count()
+        if config['workers'].lower() == "all":
+            config['workers'] = max(1, total_cpus - 1)
+            logger.info(f"setting workers to {config['workers']} (all)")
+        elif config['workers'].lower() == 'max':
+            config['workers'] = max(1, total_cpus)
+            logger.info(f"setting workers to {config['workers']} (max)")
+        else:
+            raise ValueError(f'malformed workers count, must be an int, ALL or MAX, got {config["workers"]}')
 
     return config
 
