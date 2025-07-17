@@ -7,6 +7,9 @@
 data_dir: ./path/to/json/files 
 ## OR
 huggingface_url: https://huggingface.co/datasets/allenai/olmo-mix-1124 # or whatever
+subset: #can be a list or a string, must be a subset for which a loader exists on hf hub.
+  - wiki
+  - arxiv
 vector_size: 300 #same size as google news and other static embeddings
 window: 5
 min_count: 10 
@@ -14,3 +17,4 @@ max_sentences: 1000
 workers: 4 ## you can either put an int or  ALL, which will be num_cores - 1, or MAX which will be num_cores 
 sg: 1 ## skip-gram, 0 for cbow
 epochs: 5
+buffered: False ## If True, will use one cpu core for predownloading batches.

@@ -20,6 +20,9 @@ from datetime import timedelta
 from huggingface_hub import list_repo_files, login
 import sys
 import multiprocessing
+import threading
+from queue import Queue
+
 
 class LoguruHandler(logging.Handler):
     def emit(self, record):
@@ -113,7 +116,8 @@ class HFStreamingCorpus:
                  max_files_per_stream=1000,
                  data_dir="data",
                  revision=None,
-                 tokenizer=None):
+                 tokenizer=None
+                ):
         
         self.dataset_name = dataset_name
         self.subset = subset
@@ -126,17 +130,27 @@ class HFStreamingCorpus:
         self.repo_id = dataset_name  # HF dataset name doubles as repo_id
         self.tokenizer = tokenizer
         self.batches = self._prepare_batches()
+        self.stop_signal = object()
 
     def _prepare_batches(self):
-        logger.info(f"Fetching file list from repository: {self.dataset_name}")
-        files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
+        logger.info(f"Fetching file list from repository: {self.dataset_name}, revision {self.revision if self.revision else 'Main'}")
+        all_files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
         if self.subset:
-            self.data_dir = f'{self.data_dir}/{self.subset}'
-        files = [f for f in files if f.startswith(self.data_dir)]
-        logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
+            if isinstance(self.subset, str):
+                self.subset = [self.subset]
+            files = []
+            for subset in self.subset:
+                subset_folder = f'{self.data_dir}/{subset}'
+                print(f'adding {subset_folder}')
+                files.extend([f for f in all_files if f.startswith(subset_folder)])
+                logger.info(f'total files in folders {self.subset} : {len(files)}')
+        else:
+            files = [f for f in all_files if f.startswith(self.data_dir)]
+            logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
 
         # Step 1: Map actual folders (parents of files) → files
         parent_to_files = defaultdict(list)
+        print(files)
         for file in files:
             parent = str(PurePosixPath(file).parent)
             parent_to_files[parent].append(file)
@@ -151,7 +165,14 @@ class HFStreamingCorpus:
         for parent in parent_to_files:
             parts = PurePosixPath(parent).parts
             if len(parts) < 3:
-                # Unexpected short path, skip
+                # Shallow folder, treat it as its own batch
+                files = parent_to_files[parent]
+                subset_name = parts[1] if len(parts) > 1 else "unknown"
+                batches[parent] = {
+                    'files': files,
+                    'subset': subset_name
+                }
+                logger.info(f"Added shallow batch {parent} with {len(files)} files and subset {subset_name}")
                 continue
             grandparent = str(PurePosixPath(*parts[:-1]))
             grandparent_to_parents[grandparent].append(parent)
@@ -223,7 +244,7 @@ class HFStreamingCorpus:
                 logger.info(f"Streaming batch from path: {path}")
                 try:
                     ds = load_dataset(self.dataset_name,
-                                        name=self.subset if self.subset else batch['subset'],
+                                        name= batch['subset'],
                                         split=self.split,
                                         streaming=True,
                                         data_files={self.split: batch['files']},
@@ -270,6 +291,66 @@ class HFStreamingCorpus:
         except Exception as stream_ex:
             logger.error(f"Error during dataset streaming: {stream_ex}")
             return
+
+
+class HFCorpusBuffered(HFStreamingCorpus):
+    def __init__(self, *args, buffer_size=2, **kwargs,):
+        super().__init__(*args, **kwargs)
+        self.buffer_size = buffer_size
+
+        self.queue = Queue(maxsize=2) ## prefetch at most 1 batch
+        self._stop_event = threading.Event()
+
+    def _producer(self):
+        for path, batch in self.batches.items():
+            logger.info(f"[Producer] Downloading batch from {path}")
+            try:
+                ds = load_dataset(
+                    self.dataset_name,
+                    name=batch['subset'],
+                    split=self.split,
+                    # streaming=True, # no!
+                    data_files={self.split: batch['files']},
+                    revision=self.revision
+                )
+                self.queue.put((path, ds))  # Block if queue is full
+                logger.info(f"[Producer] Batch {path} queued")
+            except Exception as e:
+                logger.error(f"[Producer] Failed to load batch {path}: {e}")
+                continue
+        self.queue.put(self._stop_event)  # Sentinel to signal end
+        logger.info("[Producer] Finished loading all batches")
+
+    def __iter__(self):
+        # Start background producer thread
+        producer_thread = threading.Thread(target=self._producer)
+        producer_thread.daemon = True
+        producer_thread.start()
+
+        count = 0
+        while True:
+            item = self.queue.get()
+            if item is None:
+                logger.info("[Consumer] All batches processed")
+                break
+            path, ds = item
+            logger.info(f"[Consumer] Processing batch from {path}")
+            try:
+                for example in tqdm(ds, desc=f"Streaming from {path}", unit="docs"):
+                    try:
+                        text = example.get(self.text_field, "")
+                        if text:
+                            yield simple_preprocess(text.lower())
+                            count += 1
+                            if self.max_sentences and count >= self.max_sentences:
+                                logger.info("[Consumer] Reached max_sentences limit")
+                                return
+                    except Exception as ex:
+                        logger.warning(f"[Consumer] Error in example from {path}: {ex}")
+                        continue
+            except Exception as stream_ex:
+                logger.error(f"[Consumer] Error while streaming from {path}: {stream_ex}")
+                continue
 
 
 def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
@@ -320,7 +401,9 @@ def read_config(config_path: str) -> dict:
     "sg": 0,
     "epochs": 5,
     "batch_words": 10000,
-    "tokenizer": None
+    "tokenizer": None,
+    'buffered': False,
+    'revision': None
     }
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
@@ -341,9 +424,13 @@ def read_config(config_path: str) -> dict:
             "split": user_config.get("split", "train"),
             "text_field": user_config.get("text_field", "text"),
             "subset": user_config.get("subset"),  # Can be None
-            "max_sentences": user_config.get("max_sentences", None)
+            "max_sentences": user_config.get("max_sentences", None),
+            "revision": user_config.get("revision", None)
         }
-        config['corpus_iterable'] = HFStreamingCorpus(**hf_kwargs)
+        if config['buffered']:
+            config['corpus_iterable'] = HFCorpusBuffered(**hf_kwargs)      
+        else:
+            config['corpus_iterable'] = HFStreamingCorpus(**hf_kwargs)
     else:
         raise ValueError("Config must contain either 'path' or 'huggingface_url'")
     print(config)
