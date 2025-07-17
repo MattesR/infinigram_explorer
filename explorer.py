@@ -19,6 +19,26 @@ However, he was later revived and brainwashed as the Winter Soldier, a Soviet as
 He is a central figure in Marvel's comic book universe and has been portrayed by Sebastian Stan in the Marvel Cinematic Universe, notably in films like "Captain America: The Winter Soldier." 
 His story is one of redemption, as he struggles with his past and the mind control he was subjected to as the Winter Soldier."""
 
+GPT_FACTS= [
+"The Winter Soldier is a fictional character.",
+"He appears in American comic books.",
+"These comic books are published by Marvel Comics.",
+"The character was originally introduced as Bucky Barnes.",
+"Bucky Barnes was Captain America's sidekick during World War II.",
+"Bucky Barnes was believed to have perished.",
+"He was later revived.",
+"He was brainwashed and became the Winter Soldier.",
+"As the Winter Soldier, he was a Soviet assassin.",
+"He has a cybernetic arm.",
+"The character has had a complex and evolving storyline.",
+"The Winter Soldier has taken on the role of Captain America at some point.",
+"He is a central figure in Marvel’s comic book universe.",
+"The character is portrayed by Sebastian Stan in the Marvel Cinematic Universe (MCU).",
+'He appears in MCU films, including "Captain America: The Winter Soldier."',
+"His story includes a theme of redemption.",
+"He struggles with his past.",
+"He struggles with the mind control he was subjected to as the Winter Soldier."
+]
 INDEX='v4_olmo-2-0325-32b-instruct_llama'
 TOKENIZER_NAME='meta-llama/Llama-2-7b-hf'
 TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
@@ -73,9 +93,9 @@ def get_all_ngrams(query=TEST_OUTPUT, tokenizer=TOKENIZER, min_len=2, max_len=No
 def get_all_docs(query, string_query=True, index=INDEX, delay=0.2, max_docs=1000000, output_dir=None, overwrite=True, dry=False):
     find = query_infinigram(query_type='find', query=query, string_query=string_query)
     if find['cnt'] > max_docs:
-        print(f'there are {find['cnt']} documents for that query, will only get {max_docs}')
+        print(f'there are {find["cnt"]} documents for that query, will only get {max_docs}')
     if dry:
-        print(f'there are {find['cnt']} documents for the query:\n{query}')
+        print(f'there are {find["cnt"]} documents for the query:\n{query}')
         return find
     responses = []
     if output_dir:
@@ -137,7 +157,7 @@ def get_all_docs(query, string_query=True, index=INDEX, delay=0.2, max_docs=1000
             
 
 
-def batch_query(query_list,  string_query=False, query_type='count', added_payload={} , index=INDEX, delay = 0.2):
+def batch_query(query_list,  string_query=False, query_type='count', added_payload={} , index=INDEX, delay = 0.1):
     responses = []
     failures = {'ids':[], 'errors': []}
     for idx, query in tqdm(enumerate(query_list)):
@@ -154,4 +174,4 @@ def batch_query(query_list,  string_query=False, query_type='count', added_paylo
         else:
             responses.append(response)
         time.sleep(delay)
-    return responses
+    return responses, failures

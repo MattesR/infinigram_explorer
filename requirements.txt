@@ -36,7 +36,6 @@ debugpy==1.8.14
 decorator==5.2.1
 defusedxml==0.7.1
 dill==0.3.8
-en_core_web_trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl#sha256=272a31e9d8530d1e075351d30a462d7e80e31da23574f1b274e200f3fff35bf5
 executing==2.2.0
 fastjsonschema==2.21.1
 filelock==3.18.0
@@ -101,20 +100,6 @@ nest-asyncio==1.6.0
 networkx==3.4.2
 notebook_shim==0.2.4
 numpy==1.26.4
-nvidia-cublas-cu12==12.6.4.1
-nvidia-cuda-cupti-cu12==12.6.80
-nvidia-cuda-nvrtc-cu12==12.6.77
-nvidia-cuda-runtime-cu12==12.6.77
-nvidia-cudnn-cu12==9.5.1.17
-nvidia-cufft-cu12==11.3.0.4
-nvidia-cufile-cu12==1.11.1.6
-nvidia-curand-cu12==10.3.7.77
-nvidia-cusolver-cu12==11.7.1.2
-nvidia-cusparse-cu12==12.5.4.2
-nvidia-cusparselt-cu12==0.6.3
-nvidia-nccl-cu12==2.26.2
-nvidia-nvjitlink-cu12==12.6.85
-nvidia-nvtx-cu12==12.6.77
 omegaconf==2.3.0
 overrides==7.7.0
 packaging==25.0
@@ -180,8 +165,7 @@ torchvision==0.22.0
 tornado==6.5
 tqdm==4.67.1
 traitlets==5.14.3
-transformers @ git+https://github.com/huggingface/transformers.git@174684a9b6f6f4c754c1afdae66e7a5a63a36639
-triton==3.3.0
+transformers @ git+https://github.com/huggingface/transformers.git@174684a9b6f6f4c754c1afdae66e7a5a63a36639ß
 typer==0.16.0
 types-python-dateutil==2.9.0.20250516
 typing-inspection==0.4.0

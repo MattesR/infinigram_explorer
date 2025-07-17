@@ -7,4 +7,8 @@ __pycache__
 .venv
 .DS_Store
 token_file.ini
+<<<<<<< Updated upstream
 word2vec_training.log
+=======
+.python-version
+>>>>>>> Stashed changes
