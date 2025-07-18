@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import json
 from utils import get_token
+from math import prod
+import pandas as pd
 HF_TOKEN = get_token('HF_TOKEN')
 
 TEST_OUTPUT = """The Winter Soldier is a fictional character appearing in American comic books published by Marvel Comics. 
@@ -42,6 +44,19 @@ GPT_FACTS= [
 INDEX='v4_olmo-2-0325-32b-instruct_llama'
 TOKENIZER_NAME='meta-llama/Llama-2-7b-hf'
 TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
+WORDSTART_SYMBOL = '▁'
+LINEBREAK_TOKEN = '<0x0A>'
+
+
+
+
+def get_span_probability_from_span(span, unigram_probability, tokenizer=tokenizer, ids=False):
+    if not ids:
+        ids = tokenizer.encode(span, add_special_tokens=False)
+    else: # means that the span is already ids, maybe that code is weird..
+        ids = span
+    return prod([unigram_probability[token] for token in ids])
+    
 
 
 
@@ -71,11 +86,11 @@ def query_infinigram(query_type='count', string_query=False, query='', added_pay
     return response
 
 
-def get_all_ngrams(query=TEST_OUTPUT, tokenizer=TOKENIZER, min_len=2, max_len=None, olmotrace_criterion=False):
+def get_all_ngrams(query=TEST_OUTPUT, tokenizer=TOKENIZER, min_len=2, max_len=None, olmotrace_criterion=True):
     ## first, tokenize with the llama tokenizer
-    tokens = tokenizer(query, add_special_tokens=False)['input_ids']
+    token_ids = tokenizer.encode(query, add_special_tokens=False)
     ## ChatGPT-Code
-    n = len(tokens)
+    n = len(token_ids)
     if not max_len:
         max_len = n
     max_len+=1
@@ -84,12 +99,26 @@ def get_all_ngrams(query=TEST_OUTPUT, tokenizer=TOKENIZER, min_len=2, max_len=No
     result = []
     for length in range(min_len, max_len):
         for start in range(n - length + 1):
-            sublist = tokens[start:start + length]
-            if olmotrace_criterion:
-                tokens=tokenizer.decode(sublist)
-                
-            result.append(sublist)
+            sublist = token_ids[start:start + length]
+            if olmotrace_criterion: # Here, we can check whether the span starts with a word and has no . or \n in it
+                tokens=tokenizer.convert_ids_to_tokens(sublist)
+                if  not tokens[0].startswith('▁'):
+                    # print(f'sublist {tokens} is omitted, it starts with a subword')
+                    continue
+                elif '<0x0A>' in tokens[:-1]: #  '.' in tokens[:-1] or omitted:  don't like to check for period hear, John N. Mitchell already breaks this
+                    # print(f'sublist {tokens} is omitted, it has a linebreak in not the end')
+                    continue
+                next_token_idx = start + length
+                if next_token_idx >= len(token_ids) or tokenizer.convert_ids_to_tokens(token_ids[next_token_idx]).startswith('▁'):
+                    result.append(sublist)
+            else:
+                result.append(sublist)
     return result
+
+
+def create_token_prob_table(query, tokenizer=TOKENIZER, probabilities, min_len=2, max_len=None, olmotrace_criterion=True):
+    sublists = get_all_ngrams(query, tokenizer,min_len,max_len,olmotrace_criterion)
+    lists_and_probs = [{'sublist': sublist, 'prob', get
 
 
 def get_all_docs(query, string_query=True, index=INDEX, delay=0.2, max_docs=1000000, output_dir=None, overwrite=True, dry=False):
