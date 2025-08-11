@@ -44,6 +44,10 @@ TOKENIZER_NAME='meta-llama/Llama-2-7b-hf'
 TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
 
 
+
+
+
+
 def query_infinigram(query_type='count', string_query=False, query='', added_payload={}, index=INDEX):
     """Counts the number of occurences of 'query' in 'index'.
     :param query_type: which api endpoint to request
@@ -63,10 +67,8 @@ def query_infinigram(query_type='count', string_query=False, query='', added_pay
         for k, v in added_payload.items():
             payload[k] = v
     response = requests.post('https://api.infini-gram.io/', json=payload).json()
-    if 'error' in response:
-        raise Exception(response['error'])
-    else:
-        return response
+    # don't raise error here, the consumer has to deal with the exception
+    return response
 
 
 def get_all_ngrams(query=TEST_OUTPUT, tokenizer=TOKENIZER, min_len=2, max_len=None, olmotrace_criterion=False):
