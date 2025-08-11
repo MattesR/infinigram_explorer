@@ -1,7 +1,8 @@
 """
+Modified version of your streaming code with FEATURES support
 """
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, Features, Value
 import time
 from tqdm import tqdm
 from pathlib import Path, PurePosixPath
@@ -30,6 +31,27 @@ class LoguruHandler(logging.Handler):
         logger_opt = logger.opt(depth=6, exception=record.exc_info)
         logger_opt.log(record.levelname, record.getMessage())
 logger.add("word2vec_training.log", level="INFO")
+
+FEATURES = Features({
+    "text": Value("string"),
+    "added": Value("string"),
+    "created": Value("string"),
+    "attributes": Value("string"),
+    "doc": Value("string"),
+    "id": Value("string"),
+    "metadata": Value("string"),
+    "source": Value("string"),
+    "version": Value("string"),
+    "bff_contained_ngram_count_before_dedupe": Value("int64"),
+    "previous_word_count": Value("int64"),
+    "url": Value("string"),
+    "warcinfo": Value("string"),
+    "fasttext_openhermes_reddit_eli5_vs_rw_v2_bigram_200k_train_prob": Value("float64"),
+    "language_id_whole_page_fasttext": {
+        "en": Value("float64")
+    },
+})
+
 
 
 HF_TOKEN = get_token('HF_TOKEN')
@@ -116,7 +138,8 @@ class HFStreamingCorpus:
                  max_files_per_stream=1000,
                  data_dir="data",
                  revision=None,
-                 tokenizer=None
+                 tokenizer=None,
+                 use_features=False  # NEW PARAMETER
                 ):
         
         self.dataset_name = dataset_name
@@ -129,6 +152,7 @@ class HFStreamingCorpus:
         self.revision = revision
         self.repo_id = dataset_name  # HF dataset name doubles as repo_id
         self.tokenizer = tokenizer
+        self.use_features = use_features  # STORE THE PARAMETER
         self.batches = self._prepare_batches()
         self.stop_signal = object()
 
@@ -243,12 +267,15 @@ class HFStreamingCorpus:
             for path, batch in self.batches.items():
                 logger.info(f"Streaming batch from path: {path}")
                 try:
-                    ds = load_dataset(self.dataset_name,
-                                        name= batch['subset'],
-                                        split=self.split,
-                                        streaming=True,
-                                        data_files={self.split: batch['files']},
-                                        revision=self.revision)
+                    ds = load_dataset(
+                        self.dataset_name,
+                        name=batch['subset'],
+                        split=self.split,
+                        streaming=True,
+                        data_files={self.split: batch['files']},
+                        revision=self.revision,
+                        features=FEATURES if self.use_features else None  # MODIFIED LINE
+                    )
                 except Exception as ds_exeption:
                    logger.error(f"Failed to load batch from {path}: {ds_exeption}") 
                    continue
@@ -271,9 +298,20 @@ class HFStreamingCorpus:
             logger.info("Streaming dataset without batching")
             try:
                 if self.subset:
-                    ds = load_dataset(self.dataset_name, name=self.subset if self.subset else None, split=self.split, streaming=True)
+                    ds = load_dataset(
+                        self.dataset_name, 
+                        name=self.subset if self.subset else None, 
+                        split=self.split, 
+                        streaming=True,
+                        features=FEATURES if self.use_features else None  # MODIFIED LINE
+                    )
                 else:
-                    ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+                    ds = load_dataset(
+                        self.dataset_name, 
+                        split=self.split, 
+                        streaming=True,
+                        features=FEATURES if self.use_features else None  # MODIFIED LINE
+                    )
             except Exception as ds_exeption:
                 logger.error(f"Failed to load dataset: {ds_exeption}")
                 return
@@ -311,7 +349,8 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     split=self.split,
                     # streaming=True, # no!
                     data_files={self.split: batch['files']},
-                    revision=self.revision
+                    revision=self.revision,
+                    features=FEATURES if self.use_features else None  # MODIFIED LINE
                 )
                 self.queue.put((path, ds))  # Block if queue is full
                 logger.info(f"[Producer] Batch {path} queued")
@@ -403,7 +442,8 @@ def read_config(config_path: str) -> dict:
     "batch_words": 10000,
     "tokenizer": None,
     'buffered': False,
-    'revision': None
+    'revision': None,
+    'use_features': False  # NEW DEFAULT CONFIG
     }
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
@@ -425,7 +465,8 @@ def read_config(config_path: str) -> dict:
             "text_field": user_config.get("text_field", "text"),
             "subset": user_config.get("subset"),  # Can be None
             "max_sentences": user_config.get("max_sentences", None),
-            "revision": user_config.get("revision", None)
+            "revision": user_config.get("revision", None),
+            "use_features": config.get("use_features", False)  # PASS THE PARAMETER
         }
         if config['buffered']:
             config['corpus_iterable'] = HFCorpusBuffered(**hf_kwargs)      
