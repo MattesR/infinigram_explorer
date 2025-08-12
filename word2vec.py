@@ -1,6 +1,7 @@
 """
 Modified version of your streaming code with FEATURES support
 """
+import json
 from transformers import AutoTokenizer
 from datasets import load_dataset, Features, Value
 import time
@@ -135,7 +136,7 @@ class HFStreamingCorpus:
                  text_field="text", 
                  subset=None,
                  max_sentences=None, 
-                 max_files_per_stream=1000,
+                 max_files_per_stream=100,
                  data_dir="data",
                  revision=None,
                  tokenizer=None,
@@ -375,7 +376,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
             path, ds = item
             logger.info(f"[Consumer] Processing batch from {path}")
             try:
-                for example in tqdm(ds, desc=f"Streaming from {path}", unit="docs"):
+                for example in tqdm(ds, desc=f"iterating over data in {path}", unit="docs"):
                     try:
                         text = example.get(self.text_field, "")
                         if text:
@@ -388,9 +389,15 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         logger.warning(f"[Consumer] Error in example from {path}: {ex}")
                         continue
             except Exception as stream_ex:
-                logger.error(f"[Consumer] Error while streaming from {path}: {stream_ex}")
+                logger.error(f"[Consumer] iterating over data in {path}: {stream_ex}")
                 continue
-
+            ## cleanup
+            try:
+                logger.info(f"[Consumer] Cleaning up HF cache for {path}")
+                removed_files = ds.cleanup_cache_files()
+                logger.info(f"[Consumer] HF cache cleanup done for {path}, removed {len(removed_files)} files")
+            except Exception as e:
+                logger.error(f"[Consumer] Failed to clean HF cache for {path}: {e}")
 
 def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
     if isinstance(output_dir,str):
