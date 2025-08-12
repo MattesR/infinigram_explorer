@@ -24,6 +24,7 @@ import sys
 import multiprocessing
 import threading
 from queue import Queue
+import gc
 
 
 class LoguruHandler(logging.Handler):
@@ -158,108 +159,50 @@ class HFStreamingCorpus:
         self.stop_signal = object()
 
     def _prepare_batches(self):
-        logger.info(f"Fetching file list from repository: {self.dataset_name}, revision {self.revision if self.revision else 'Main'}")
-        all_files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
-        if self.subset:
-            if isinstance(self.subset, str):
-                self.subset = [self.subset]
-            files = []
-            for subset in self.subset:
-                subset_folder = f'{self.data_dir}/{subset}'
-                print(f'adding {subset_folder}')
-                files.extend([f for f in all_files if f.startswith(subset_folder)])
-                logger.info(f'total files in folders {self.subset} : {len(files)}')
-        else:
-            files = [f for f in all_files if f.startswith(self.data_dir)]
-            logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
+            """Fixed version that respects max_files_per_stream strictly"""
+            logger.info(f"Fetching file list from repository: {self.dataset_name}, revision {self.revision if self.revision else 'Main'}")
+            all_files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
+            
+            if self.subset:
+                if isinstance(self.subset, str):
+                    self.subset = [self.subset]
+                files = []
+                for subset in self.subset:
+                    subset_folder = f'{self.data_dir}/{subset}'
+                    print(f'adding {subset_folder}')
+                    files.extend([f for f in all_files if f.startswith(subset_folder)])
+                    logger.info(f'total files in folders {self.subset} : {len(files)}')
+            else:
+                files = [f for f in all_files if f.startswith(self.data_dir)]
+                logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
 
-        # Step 1: Map actual folders (parents of files) → files
-        parent_to_files = defaultdict(list)
-        print(files)
-        for file in files:
-            parent = str(PurePosixPath(file).parent)
-            parent_to_files[parent].append(file)
-
-        logger.info(f"Found {len(parent_to_files)} folders with files")
-
-        # Step 2: Determine batches
-        batches = {}
-
-        # Group folders by their grandparent
-        grandparent_to_parents = defaultdict(list)
-        for parent in parent_to_files:
-            parts = PurePosixPath(parent).parts
-            if len(parts) < 3:
-                # Shallow folder, treat it as its own batch
-                files = parent_to_files[parent]
-                subset_name = parts[1] if len(parts) > 1 else "unknown"
-                batches[parent] = {
-                    'files': files,
+            # Get subset name from first file
+            if files:
+                subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
+            else:
+                subset_name = "unknown"
+            
+            # Create batches strictly respecting max_files_per_stream
+            batches = {}
+            batch_counter = 0
+            
+            logger.info(f"Creating batches with max {self.max_files_per_stream} files per batch")
+            
+            for i in range(0, len(files), self.max_files_per_stream):
+                chunk = files[i:i + self.max_files_per_stream]
+                
+                batch_name = f"batch_{batch_counter:04d}_{subset_name}"
+                batches[batch_name] = {
+                    'files': chunk,
                     'subset': subset_name
                 }
-                logger.info(f"Added shallow batch {parent} with {len(files)} files and subset {subset_name}")
-                continue
-            grandparent = str(PurePosixPath(*parts[:-1]))
-            grandparent_to_parents[grandparent].append(parent)
+                
+                logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
+                batch_counter += 1
 
-        # Step 3: Walk through each grandparent group
-        for grandparent, parents in grandparent_to_parents.items():
-            if PurePosixPath(grandparent).parent == PurePosixPath(self.data_dir):
-                # Direct child of data_dir (e.g., data/wiki)
-                for parent in parents:
-                    files = parent_to_files[parent]
-                    subset_name = parent.split('/')[1]
-                    if len(files) > self.max_files_per_stream:
-                        # Chunk
-                        for i in range(0, len(files), self.max_files_per_stream):
-                            chunk = files[i:i + self.max_files_per_stream]
-                            batch_name = f"{parent}/chunk_{i // self.max_files_per_stream}"
-                            batches[batch_name] = {
-                                'files': chunk,
-                                'subset': subset_name
-                            }
-                            logger.info(f"Chunked batch {batch_name} with {len(chunk)} files, and subset {subset_name}")
-                    else:
-                        batches[parent] = {
-                            'files': files,
-                            'subset': subset_name
-                        }
-                        logger.info(f"Added batch {parent} with {len(files)} files and subset {subset_name}")
-            else:
-                # Deeper level – try merging siblings under this grandparent
-                all_files = []
-                for parent in parents:
-                    all_files.extend(parent_to_files[parent])
-                subset_name = grandparent.split('/')[1]
-                if len(all_files) <= self.max_files_per_stream:
-                    batches[grandparent] = {
-                        'files': all_files,
-                        'subset': subset_name
-                    }
-                    logger.info(f"Merged batch {grandparent} with {len(all_files)} files from {len(parents)} folders and subset {subset_name}")
-                else:
-                    # Too big to merge, handle each leaf individually
-                    for parent in parents:
-                        files = parent_to_files[parent]
-                        subset_name = parent.split('/')[1]
-                        if len(files) > self.max_files_per_stream:
-                            for i in range(0, len(files), self.max_files_per_stream):
-                                chunk = files[i:i + self.max_files_per_stream]
-                                batch_name = f"{parent}/chunk_{i // self.max_files_per_stream}"
-                                batches[batch_name] = {
-                                    'files': chunk,
-                                    'subset': subset_name
-                                }
-                                logger.info(f"Chunked batch {batch_name} with {len(chunk)} files and subset {subset_name}")
-                        else:
-                            batches[parent] = {
-                                'files': files,
-                                'subset': subset_name
-                            }
-                            logger.info(f"Added batch {parent} with {len(files)} files and subset {subset_name}")
-
-        self.batches = batches
-        return batches
+            logger.info(f"Created {len(batches)} total batches from {len(files)} files")
+            self.batches = batches
+            return batches
 
 
     def __iter__(self):
@@ -398,6 +341,8 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 logger.info(f"[Consumer] HF cache cleanup done for {path}, removed {len(removed_files)} files")
             except Exception as e:
                 logger.error(f"[Consumer] Failed to clean HF cache for {path}: {e}")
+            del ds
+            gc.collect()
 
 def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
     if isinstance(output_dir,str):
@@ -450,7 +395,8 @@ def read_config(config_path: str) -> dict:
     "tokenizer": None,
     'buffered': False,
     'revision': None,
-    'use_features': False  # NEW DEFAULT CONFIG
+    'use_features': False,
+    'max_files_per_stream': 4
     }
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
@@ -470,10 +416,11 @@ def read_config(config_path: str) -> dict:
             "dataset_name": user_config["huggingface_url"],
             "split": user_config.get("split", "train"),
             "text_field": user_config.get("text_field", "text"),
-            "subset": user_config.get("subset"),  # Can be None
+            "subset": user_config.get("subset"), 
             "max_sentences": user_config.get("max_sentences", None),
             "revision": user_config.get("revision", None),
-            "use_features": config.get("use_features", False)  # PASS THE PARAMETER
+            "use_features": config.get("use_features", False),  # PASS THE PARAMETER
+            "max_files_per_stream": config.get("max_files_per_stream", 4)
         }
         if config['buffered']:
             config['corpus_iterable'] = HFCorpusBuffered(**hf_kwargs)      
