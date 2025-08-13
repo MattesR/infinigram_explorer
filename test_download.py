@@ -9,12 +9,15 @@ import shutil
 import psutil
 import time
 import tempfile
+import signal
+import sys
 from pathlib import Path
 from loguru import logger
 import click
 import gc
 from word2vec import HFCorpusBuffered, FEATURES
 
+# Global variable to handle graceful shutdown
 corpus_instance = None
 
 def signal_handler(signum, frame):
@@ -83,14 +86,13 @@ def monitor_system(cache_dir, label=""):
 @click.command()
 @click.option('--dataset', default="allenai/olmo-mix-1124", help="Dataset name")
 @click.option('--subset', default="wiki", help="Subset to test (use comma-separated for multiple: wiki,algebraic-stack)")
-@click.option('--max-sentences', default=10, type=int, help="Max sentences to process")
-@click.option('--max-sentences-per-batch', default=None, type=int, help="Max sentences per batch (if set, overrides global limit)")
+@click.option('--max-sentences', default=10, type=int, help="Max sentences to process PER BATCH")
 @click.option('--max-files', default=1, type=int, help="Max files per stream")
 @click.option('--buffer-size', default=2, type=int, help="Buffer size for HFCorpusBuffered")
 @click.option('--use-features/--no-features', default=True, help="Use FEATURES or not")
 @click.option('--log-level', default="INFO", help="Log level")
 @click.option('--monitor-interval', default=5, type=int, help="Monitor every N sentences")
-def main(dataset, subset, max_sentences, max_sentences_per_batch, max_files, buffer_size, use_features, log_level, monitor_interval):
+def main(dataset, subset, max_sentences, max_files, buffer_size, use_features, log_level, monitor_interval):
     """Test the fixed HFCorpusBuffered class with comprehensive monitoring"""
     
     # Set up signal handlers for graceful shutdown
@@ -121,24 +123,13 @@ def main(dataset, subset, max_sentences, max_sentences_per_batch, max_files, buf
         subset_list = subset
         logger.info(f"Using single subset: {subset}")
     
-    # Determine sentence limiting strategy
-    if max_sentences_per_batch:
-        effective_max_sentences = max_sentences_per_batch * (len(subset_list) if isinstance(subset_list, list) else 1)
-        logger.info(f"Per-batch limit: {max_sentences_per_batch} sentences per batch")
-        logger.info(f"Effective total limit: {effective_max_sentences} sentences")
-    else:
-        effective_max_sentences = max_sentences
-        logger.info(f"Global limit: {max_sentences} sentences total")
-    
     logger.info("="*80)
     logger.info("IMPROVED HFCorpusBuffered DEBUG TEST")
     logger.info("="*80)
     logger.info(f"Configuration:")
     logger.info(f"  dataset: {dataset}")
     logger.info(f"  subset: {subset_list}")
-    logger.info(f"  max_sentences: {max_sentences}")
-    logger.info(f"  max_sentences_per_batch: {max_sentences_per_batch}")
-    logger.info(f"  effective_max_sentences: {effective_max_sentences}")
+    logger.info(f"  max_sentences_per_batch: {max_sentences}")
     logger.info(f"  max_files_per_stream: {max_files}")
     logger.info(f"  buffer_size: {buffer_size}")
     logger.info(f"  use_features: {use_features}")
@@ -167,7 +158,7 @@ def main(dataset, subset, max_sentences, max_sentences_per_batch, max_files, buf
             subset=subset_list,  # Use the processed subset list
             split="train",
             text_field="text",
-            max_sentences=effective_max_sentences,  # Use effective limit
+            max_sentences=max_sentences,  # Now means per-batch
             max_files_per_stream=max_files,
             buffer_size=buffer_size,
             data_dir="data",
@@ -220,10 +211,7 @@ def main(dataset, subset, max_sentences, max_sentences_per_batch, max_files, buf
                 
                 last_monitor_time = current_time
             
-            # Check if we've reached the limit
-            if sentence_count >= max_sentences:
-                logger.info(f"Reached sentence limit ({max_sentences}), stopping")
-                break
+            # NO MORE GLOBAL LIMIT CHECK - let the corpus handle it per-batch
         
         # Final iteration stats
         end_time = time.time()

@@ -131,6 +131,7 @@ class MyJsonCorpus:
         return results
 
 
+
 class HFStreamingCorpus:
     def __init__(self, 
                  dataset_name, 
@@ -164,48 +165,73 @@ class HFStreamingCorpus:
         self.stop_signal = object()
 
     def _prepare_batches(self):
-        """Fixed version that respects max_files_per_stream strictly"""
+        """Fixed version that respects max_files_per_stream and separates by subset"""
         logger.info(f"Fetching file list from repository: {self.dataset_name}, revision {self.revision if self.revision else 'Main'}")
         all_files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
+        
+        batches = {}
+        batch_counter = 0
         
         if self.subset:
             if isinstance(self.subset, str):
                 self.subset = [self.subset]
-            files = []
+            
+            # Process each subset separately
             for subset in self.subset:
                 subset_folder = f'{self.data_dir}/{subset}'
-                logger.info(f'Adding {subset_folder}')
-                files.extend([f for f in all_files if f.startswith(subset_folder)])
-                logger.info(f'Total files in folders {self.subset}: {len(files)}')
+                logger.info(f'Processing subset: {subset}')
+                
+                # Get files for this specific subset
+                subset_files = [f for f in all_files if f.startswith(subset_folder)]
+                logger.info(f'Files in {subset}: {len(subset_files)}')
+                
+                if not subset_files:
+                    logger.warning(f'No files found for subset: {subset}')
+                    continue
+                
+                # Create batches for this subset
+                for i in range(0, len(subset_files), self.max_files_per_stream):
+                    chunk = subset_files[i:i + self.max_files_per_stream]
+                    
+                    batch_name = f"batch_{batch_counter:04d}_{subset}"
+                    batches[batch_name] = {
+                        'files': chunk,
+                        'subset': subset
+                    }
+                    
+                    logger.info(f"Created batch '{batch_name}' with {len(chunk)} files from subset '{subset}'")
+                    logger.info(f"  Files: {[f.split('/')[-1] for f in chunk]}")  # Show just filenames
+                    batch_counter += 1
         else:
+            # Original logic for when no subset is specified
             files = [f for f in all_files if f.startswith(self.data_dir)]
             logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
 
-        # Get subset name from first file
-        if files:
-            subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
-        else:
-            subset_name = "unknown"
-        
-        # Create batches strictly respecting max_files_per_stream
-        batches = {}
-        batch_counter = 0
-        
-        logger.info(f"Creating batches with max {self.max_files_per_stream} files per batch")
-        
-        for i in range(0, len(files), self.max_files_per_stream):
-            chunk = files[i:i + self.max_files_per_stream]
+            # Get subset name from first file
+            if files:
+                subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
+            else:
+                subset_name = "unknown"
             
-            batch_name = f"batch_{batch_counter:04d}_{subset_name}"
-            batches[batch_name] = {
-                'files': chunk,
-                'subset': subset_name
-            }
-            
-            logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
-            batch_counter += 1
+            # Create batches
+            for i in range(0, len(files), self.max_files_per_stream):
+                chunk = files[i:i + self.max_files_per_stream]
+                
+                batch_name = f"batch_{batch_counter:04d}_{subset_name}"
+                batches[batch_name] = {
+                    'files': chunk,
+                    'subset': subset_name
+                }
+                
+                logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
+                batch_counter += 1
 
-        logger.info(f"Created {len(batches)} total batches from {len(files)} files")
+        logger.info(f"Created {len(batches)} total batches")
+        
+        # Debug: Print all batches
+        for batch_name, batch_info in batches.items():
+            logger.info(f"Batch {batch_name}: {batch_info['subset']} - {len(batch_info['files'])} files")
+        
         return batches
 
     def get_default_cache_info(self):
@@ -328,48 +354,73 @@ class HFStreamingCorpus:
         self.stop_signal = object()
 
     def _prepare_batches(self):
-        """Fixed version that respects max_files_per_stream strictly"""
+        """Fixed version that respects max_files_per_stream and separates by subset"""
         logger.info(f"Fetching file list from repository: {self.dataset_name}, revision {self.revision if self.revision else 'Main'}")
         all_files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
+        
+        batches = {}
+        batch_counter = 0
         
         if self.subset:
             if isinstance(self.subset, str):
                 self.subset = [self.subset]
-            files = []
+            
+            # Process each subset separately
             for subset in self.subset:
                 subset_folder = f'{self.data_dir}/{subset}'
-                logger.info(f'Adding {subset_folder}')
-                files.extend([f for f in all_files if f.startswith(subset_folder)])
-                logger.info(f'Total files in folders {self.subset}: {len(files)}')
+                logger.info(f'Processing subset: {subset}')
+                
+                # Get files for this specific subset
+                subset_files = [f for f in all_files if f.startswith(subset_folder)]
+                logger.info(f'Files in {subset}: {len(subset_files)}')
+                
+                if not subset_files:
+                    logger.warning(f'No files found for subset: {subset}')
+                    continue
+                
+                # Create batches for this subset
+                for i in range(0, len(subset_files), self.max_files_per_stream):
+                    chunk = subset_files[i:i + self.max_files_per_stream]
+                    
+                    batch_name = f"batch_{batch_counter:04d}_{subset}"
+                    batches[batch_name] = {
+                        'files': chunk,
+                        'subset': subset
+                    }
+                    
+                    logger.info(f"Created batch '{batch_name}' with {len(chunk)} files from subset '{subset}'")
+                    logger.info(f"  Files: {[f.split('/')[-1] for f in chunk]}")  # Show just filenames
+                    batch_counter += 1
         else:
+            # Original logic for when no subset is specified
             files = [f for f in all_files if f.startswith(self.data_dir)]
             logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
 
-        # Get subset name from first file
-        if files:
-            subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
-        else:
-            subset_name = "unknown"
-        
-        # Create batches strictly respecting max_files_per_stream
-        batches = {}
-        batch_counter = 0
-        
-        logger.info(f"Creating batches with max {self.max_files_per_stream} files per batch")
-        
-        for i in range(0, len(files), self.max_files_per_stream):
-            chunk = files[i:i + self.max_files_per_stream]
+            # Get subset name from first file
+            if files:
+                subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
+            else:
+                subset_name = "unknown"
             
-            batch_name = f"batch_{batch_counter:04d}_{subset_name}"
-            batches[batch_name] = {
-                'files': chunk,
-                'subset': subset_name
-            }
-            
-            logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
-            batch_counter += 1
+            # Create batches
+            for i in range(0, len(files), self.max_files_per_stream):
+                chunk = files[i:i + self.max_files_per_stream]
+                
+                batch_name = f"batch_{batch_counter:04d}_{subset_name}"
+                batches[batch_name] = {
+                    'files': chunk,
+                    'subset': subset_name
+                }
+                
+                logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
+                batch_counter += 1
 
-        logger.info(f"Created {len(batches)} total batches from {len(files)} files")
+        logger.info(f"Created {len(batches)} total batches")
+        
+        # Debug: Print all batches
+        for batch_name, batch_info in batches.items():
+            logger.info(f"Batch {batch_name}: {batch_info['subset']} - {len(batch_info['files'])} files")
+        
         return batches
 
     def get_default_cache_info(self):
@@ -466,7 +517,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
         self.queue = Queue(maxsize=buffer_size)
         self._stop_event = threading.Event()
         self._downloaded_datasets = []  # Track datasets for cleanup
-
+                    
     def _producer(self):
         """Producer thread that downloads and queues batches"""
         try:
@@ -475,7 +526,8 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     logger.info("[Producer] Stop event set, ending early")
                     break
                     
-                logger.info(f"[Producer] Downloading batch from {path}")
+                logger.info(f"[Producer] Starting download of batch {path} (queue size: {self.queue.qsize()}/{self.buffer_size})")
+                ds = None
                 try:
                     ds = load_dataset(
                         self.dataset_name,
@@ -487,22 +539,72 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         features=FEATURES if self.use_features else None
                     )
                     
+                    # Check stop event before queuing
+                    if self._stop_event.is_set():
+                        logger.info("[Producer] Stop event set after download, cleaning up and stopping")
+                        try:
+                            self._cleanup_dataset_files_only(ds)
+                            del ds
+                        except:
+                            pass
+                        break
+                    
                     # Track this dataset for later cleanup
                     self._downloaded_datasets.append(ds)
                     
-                    self.queue.put((path, ds))
-                    logger.info(f"[Producer] Batch {path} queued (queue size: {self.queue.qsize()})")
+                    logger.info(f"[Producer] Download complete for {path}, queuing... (queue size: {self.queue.qsize()}/{self.buffer_size})")
+                    self.queue.put((path, ds))  # This will block if queue is full
+                    logger.info(f"[Producer] Batch {path} queued successfully (queue size: {self.queue.qsize()}/{self.buffer_size})")
                     
                 except Exception as e:
                     logger.error(f"[Producer] Failed to load batch {path}: {e}")
-                    continue
                     
+                    # Clean up any partial downloads from failed batch
+                    if ds is not None:
+                        try:
+                            logger.info(f"[Producer] Cleaning up failed download for {path}")
+                            self._cleanup_dataset_files_only(ds)
+                            del ds
+                        except Exception as cleanup_e:
+                            logger.warning(f"[Producer] Failed to cleanup failed download: {cleanup_e}")
+                    
+                    # Try to free up space by cleaning temp files
+                    import tempfile
+                    import shutil
+                    try:
+                        # Clean HF temp files
+                        hf_cache_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+                        temp_dirs = [
+                            os.path.join(hf_cache_home, 'hub', 'temp'),
+                            tempfile.gettempdir()
+                        ]
+                        for temp_dir in temp_dirs:
+                            if os.path.exists(temp_dir):
+                                for item in os.listdir(temp_dir):
+                                    if item.startswith('tmp') or item.startswith('hf-'):
+                                        try:
+                                            item_path = os.path.join(temp_dir, item)
+                                            if os.path.isdir(item_path):
+                                                shutil.rmtree(item_path)
+                                            else:
+                                                os.remove(item_path)
+                                            logger.info(f"[Producer] Cleaned temp file: {item_path}")
+                                        except:
+                                            pass
+                    except Exception as temp_cleanup_e:
+                        logger.warning(f"[Producer] Failed to clean temp files: {temp_cleanup_e}")
+                    
+                    continue
         except Exception as e:
             logger.error(f"[Producer] Unexpected error: {e}")
         finally:
             # Signal end of production
-            self.queue.put(None)
-            logger.info("[Producer] Finished loading all batches")
+            if not self._stop_event.is_set():
+                self.queue.put(None)
+                logger.info("[Producer] Finished loading all batches")
+            else:
+                self.queue.put(None)
+                logger.info("[Producer] Stopped early due to stop event")
 
     def _cleanup_dataset(self, ds, path):
         """Clean up a single dataset and its cached files"""
@@ -648,7 +750,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
     def __iter__(self):
         """Iterator that processes downloaded batches"""
         # Start background producer thread
-        producer_thread = threading.Thread(target=self._producer, daemon=True)
+        producer_thread = threading.Thread(target=self._producer, daemon=False)  # Not daemon!
         producer_thread.start()
 
         count = 0
@@ -658,7 +760,9 @@ class HFCorpusBuffered(HFStreamingCorpus):
         try:
             while True:
                 # Get next item from queue
+                logger.info(f"[Consumer] Waiting for next batch (queue size: {self.queue.qsize()}/{self.buffer_size})")
                 item = self.queue.get()
+                logger.info(f"[Consumer] Retrieved batch from queue (queue size: {self.queue.qsize()}/{self.buffer_size})")
                 
                 # Check for end signal
                 if item is None:
@@ -668,6 +772,8 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 path, ds = item
                 processed_datasets.append(ds)
                 logger.info(f"[Consumer] Processing batch from {path}")
+                
+                batch_sentence_count = 0  # Track sentences per batch
                 
                 try:
                     for example in tqdm(ds, desc=f"Processing {path}", unit="docs"):
@@ -679,11 +785,12 @@ class HFCorpusBuffered(HFStreamingCorpus):
                                 else:
                                     yield simple_preprocess(clean_html(text.lower()))
                                 count += 1
+                                batch_sentence_count += 1
                                 
-                                if self.max_sentences and count >= self.max_sentences:
-                                    logger.info(f"[Consumer] Reached max_sentences limit ({self.max_sentences})")
-                                    self._stop_event.set()  # Signal producer to stop
-                                    return
+                                # Check per-batch limit (max_sentences now means per-batch)
+                                if self.max_sentences and batch_sentence_count >= self.max_sentences:
+                                    logger.info(f"[Consumer] Reached per-batch limit ({self.max_sentences}) for {path}")
+                                    break
                                     
                         except Exception as ex:
                             logger.warning(f"[Consumer] Error in example from {path}: {ex}")
@@ -693,9 +800,13 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     logger.error(f"[Consumer] Error iterating over data in {path}: {stream_ex}")
                     continue
                 
+                logger.info(f"[Consumer] Batch {path} completed: {batch_sentence_count} sentences processed")
+                
                 # Clean up this specific dataset and its cache files
+                logger.info(f"[Consumer] Starting cleanup for {path} (queue size: {self.queue.qsize()}/{self.buffer_size})")
                 deleted_mb = self._cleanup_dataset(ds, path)
                 total_deleted_mb += deleted_mb
+                logger.info(f"[Consumer] Cleanup complete for {path} (queue size: {self.queue.qsize()}/{self.buffer_size})")
                 
         except Exception as e:
             logger.error(f"[Consumer] Unexpected error during iteration: {e}")
@@ -711,12 +822,15 @@ class HFCorpusBuffered(HFStreamingCorpus):
             
             logger.info(f"[Consumer] Total disk space freed: {total_deleted_mb:.1f}MB")
             
-            # Wait for producer to finish (with timeout)
+            # Always wait for producer to finish properly
             if producer_thread.is_alive():
+                logger.info("[Consumer] Waiting for producer thread to finish...")
                 self._stop_event.set()
-                producer_thread.join(timeout=10)
+                producer_thread.join(timeout=30)
                 if producer_thread.is_alive():
                     logger.warning("[Consumer] Producer thread did not finish in time")
+                else:
+                    logger.info("[Consumer] Producer thread finished successfully")
 
     def __del__(self):
         """Destructor to ensure cleanup"""
