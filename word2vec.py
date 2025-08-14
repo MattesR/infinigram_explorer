@@ -3,6 +3,7 @@ Modified version of your streaming code with FEATURES support
 """
 import json
 from transformers import AutoTokenizer
+import datasets
 from datasets import load_dataset, Features, Value
 import time
 from tqdm import tqdm
@@ -26,7 +27,13 @@ import threading
 from queue import Queue
 import gc
 import os
+import psutil
 
+# Set HuggingFace timeout and cache settings
+os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '3600'  # 1 hour timeout
+os.environ['DATASETS_DOWNLOAD_TIMEOUT'] = '3600'  # 1 hour timeout
+os.environ['HF_DATASETS_CACHE_MAX_SIZE'] = '50GB'  # Limit cache size
+os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = 'false'  # Keep progress bars for debugging
 
 class LoguruHandler(logging.Handler):
     def emit(self, record):
@@ -332,7 +339,8 @@ class HFStreamingCorpus:
                  data_dir="data",
                  revision=None,
                  tokenizer=None,
-                 use_features=False
+                 use_features=False,
+                 disable_caching=False
                 ):
         
         self.dataset_name = dataset_name
@@ -346,9 +354,12 @@ class HFStreamingCorpus:
         self.repo_id = dataset_name
         self.tokenizer = tokenizer
         self.use_features = use_features
-        
-        # Use default HuggingFace cache
-        self.cache_dir = None  # Let HF handle caching
+        self.disable_caching = disable_caching
+        if self.disable_caching:
+            datasets.disable_caching()
+        else:
+            # Use default HuggingFace cache
+            self.cache_dir = None  # Let HF handle caching
             
         self.batches = self._prepare_batches()
         self.stop_signal = object()
@@ -533,29 +544,42 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         self.dataset_name,
                         name=batch['subset'],
                         split=self.split,
-                        streaming=False,  # Download the data
+                        streaming=False,
                         data_files={self.split: batch['files']},
                         revision=self.revision,
-                        features=FEATURES if self.use_features else None
+                        features=FEATURES if self.use_features else None,
+                        keep_in_memory=True if self.disable_caching else False,
                     )
+                    if self.disable_caching:
+                        # Dataset is now in memory, safe to delete cache files
+                        import shutil
+                        hf_cache_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+                        datasets_cache = os.path.join(hf_cache_home, 'datasets')
+                        
+                        if os.path.exists(datasets_cache):
+                            try:
+                                # Calculate size before deletion
+                                cache_size = sum(f.stat().st_size for f in Path(datasets_cache).rglob('*') if f.is_file()) / (1024**2)
+                                
+                                # Remove all cached datasets since this one is in memory
+                                shutil.rmtree(datasets_cache)
+                                logger.info(f"[Producer] Deleted cache directory after loading {path} into memory ({cache_size:.1f}MB freed)")
+                                
+                                # Recreate the empty directory so HF doesn't complain
+                                os.makedirs(datasets_cache, exist_ok=True)
+                                
+                            except Exception as e:
+                                logger.warning(f"[Producer] Failed to clean cache after loading {path}: {e}")
+                    # ADD THIS DEBUG CODE:
+                    logger.info(f"[Producer] Dataset loaded successfully for {path}")
+                    logger.info(f"[Producer] Dataset length: {len(ds)}")
+                    logger.info(f"[Producer] Dataset features: {ds.features}")
                     
-                    # Check stop event before queuing
-                    if self._stop_event.is_set():
-                        logger.info("[Producer] Stop event set after download, cleaning up and stopping")
-                        try:
-                            self._cleanup_dataset_files_only(ds)
-                            del ds
-                        except:
-                            pass
-                        break
-                    
-                    # Track this dataset for later cleanup
-                    self._downloaded_datasets.append(ds)
-                    
-                    logger.info(f"[Producer] Download complete for {path}, queuing... (queue size: {self.queue.qsize()}/{self.buffer_size})")
-                    self.queue.put((path, ds))  # This will block if queue is full
-                    logger.info(f"[Producer] Batch {path} queued successfully (queue size: {self.queue.qsize()}/{self.buffer_size})")
-                    
+                    if len(ds) > 0:
+                        logger.info(f"[Producer] First example keys: {list(ds[0].keys())}")
+                        logger.info(f"[Producer] First example text preview: {ds[0].get('text', 'NO TEXT FIELD')[:100]}...")
+                    else:
+                        logger.error(f"[Producer] Dataset is empty! This is the problem!")    
                 except Exception as e:
                     logger.error(f"[Producer] Failed to load batch {path}: {e}")
                     
@@ -608,65 +632,80 @@ class HFCorpusBuffered(HFStreamingCorpus):
 
     def _cleanup_dataset(self, ds, path):
         """Clean up a single dataset and its cached files"""
-        try:
-            # Get cache files before deleting the dataset
-            cache_files = []
-            if hasattr(ds, 'cache_files') and ds.cache_files:
-                if isinstance(ds.cache_files, dict):
-                    # If it's a dict, get all values and flatten
-                    cache_files = list(ds.cache_files.values())
-                    cache_files = [f for sublist in cache_files for f in sublist] if cache_files else []
-                elif isinstance(ds.cache_files, list):
-                    # If it's already a list, use it directly
-                    cache_files = ds.cache_files
-                else:
-                    logger.warning(f"[Cleanup] Unexpected cache_files type: {type(ds.cache_files)}")
-            
-            # Delete the dataset object first
-            del ds
-            gc.collect()
-            
-            # Now delete the actual cache files from disk
-            deleted_size = 0
-            deleted_count = 0
-            for cache_file in cache_files:
-                file_path = None
+        if not self.disable_caching:
+            try:
+                # Get cache files before deleting the dataset
+                cache_files = []
+                if hasattr(ds, 'cache_files') and ds.cache_files:
+                    if isinstance(ds.cache_files, dict):
+                        # If it's a dict, get all values and flatten
+                        cache_files = list(ds.cache_files.values())
+                        cache_files = [f for sublist in cache_files for f in sublist] if cache_files else []
+                    elif isinstance(ds.cache_files, list):
+                        # If it's already a list, use it directly
+                        cache_files = ds.cache_files
+                    else:
+                        logger.warning(f"[Cleanup] Unexpected cache_files type: {type(ds.cache_files)}")
                 
-                if isinstance(cache_file, dict) and 'filename' in cache_file:
-                    file_path = cache_file['filename']
-                elif isinstance(cache_file, str):
-                    file_path = cache_file
-                elif hasattr(cache_file, 'filename'):
-                    file_path = cache_file.filename
-                else:
-                    logger.debug(f"[Cleanup] Skipping cache file with unknown format: {cache_file}")
-                    continue
+                # Delete the dataset object first
+                del ds
+                gc.collect()
+                
+                # Now delete the actual cache files from disk
+                deleted_size = 0
+                deleted_count = 0
+                for cache_file in cache_files:
+                    file_path = None
                     
-                if file_path:
-                    try:
-                        if os.path.exists(file_path):
-                            file_size = os.path.getsize(file_path)
-                            os.remove(file_path)
-                            deleted_size += file_size
-                            deleted_count += 1
-                            logger.debug(f"[Cleanup] Deleted cache file: {file_path}")
-                        else:
-                            logger.debug(f"[Cleanup] Cache file not found: {file_path}")
-                    except Exception as e:
-                        logger.warning(f"[Cleanup] Failed to delete cache file {file_path}: {e}")
-            
-            deleted_size_mb = deleted_size / (1024**2)
-            if deleted_count > 0:
-                logger.info(f"[Cleanup] Cleaned up dataset for {path}: deleted {deleted_count} files ({deleted_size_mb:.1f}MB)")
-            else:
-                logger.info(f"[Cleanup] Cleaned up dataset for {path}: no cache files found to delete")
-            return deleted_size_mb
-            
-        except Exception as e:
-            logger.error(f"[Cleanup] Failed to clean dataset for {path}: {e}")
-            import traceback
-            logger.debug(f"[Cleanup] Traceback: {traceback.format_exc()}")
-            return 0
+                    if isinstance(cache_file, dict) and 'filename' in cache_file:
+                        file_path = cache_file['filename']
+                    elif isinstance(cache_file, str):
+                        file_path = cache_file
+                    elif hasattr(cache_file, 'filename'):
+                        file_path = cache_file.filename
+                    else:
+                        logger.debug(f"[Cleanup] Skipping cache file with unknown format: {cache_file}")
+                        continue
+                        
+                    if file_path:
+                        try:
+                            if os.path.exists(file_path):
+                                file_size = os.path.getsize(file_path)
+                                os.remove(file_path)
+                                deleted_size += file_size
+                                deleted_count += 1
+                                logger.debug(f"[Cleanup] Deleted cache file: {file_path}")
+                            else:
+                                logger.debug(f"[Cleanup] Cache file not found: {file_path}")
+                        except Exception as e:
+                            logger.warning(f"[Cleanup] Failed to delete cache file {file_path}: {e}")
+                
+                deleted_size_mb = deleted_size / (1024**2)
+                if deleted_count > 0:
+                    logger.info(f"[Cleanup] Cleaned up dataset for {path}: deleted {deleted_count} files ({deleted_size_mb:.1f}MB)")
+                else:
+                    logger.info(f"[Cleanup] Cleaned up dataset for {path}: no cache files found to delete")
+                return deleted_size_mb
+                
+            except Exception as e:
+                logger.error(f"[Cleanup] Failed to clean dataset for {path}: {e}")
+                import traceback
+                logger.debug(f"[Cleanup] Traceback: {traceback.format_exc()}")
+                return 0
+        else:
+            try:
+                # Just delete the dataset object - no files to clean
+                memory_usage_before = psutil.Process().memory_info().rss
+                del ds
+                gc.collect()
+                memory_usage_after = psutil.Process().memory_info().rss
+                
+                memory_freed_mb = (memory_usage_before - memory_usage_after) / (1024**2)
+                logger.info(f"[Cleanup] Freed {memory_freed_mb:.1f}MB of memory for {path}")
+                return memory_freed_mb
+            except Exception as e:
+                logger.error(f"[Cleanup] Failed to clean dataset for {path}: {e}")
+                return 0
 
     def cleanup_all_datasets(self):
         """Clean up all downloaded datasets and their cache files"""
@@ -675,14 +714,17 @@ class HFCorpusBuffered(HFStreamingCorpus):
         total_deleted_mb = 0
         
         # Clean up any remaining datasets and their cache files
-        for ds in self._downloaded_datasets:
-            try:
-                deleted_mb = self._cleanup_dataset_files_only(ds)
-                total_deleted_mb += deleted_mb
-                del ds
-            except:
-                pass
-        self._downloaded_datasets.clear()
+        if self._downloaded_datasets:
+            for ds in self._downloaded_datasets:
+                try:
+                    deleted_mb = self._cleanup_dataset_files_only(ds)
+                    total_deleted_mb += deleted_mb
+                    del ds
+                except:
+                    pass
+            self._downloaded_datasets.clear()
+        else:
+            logger.warning('cleanup all datasets does not do stuff')
         
         # Force garbage collection
         gc.collect()
@@ -837,6 +879,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
         try:
             self.cleanup_all_datasets()
         except:
+
             pass
 
 def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
@@ -891,7 +934,8 @@ def read_config(config_path: str) -> dict:
     'buffered': False,
     'revision': None,
     'use_features': False,
-    'max_files_per_stream': 4
+    'max_files_per_stream': 4,
+    'disable_caching': False
     }
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
@@ -915,7 +959,8 @@ def read_config(config_path: str) -> dict:
             "max_sentences": user_config.get("max_sentences", None),
             "revision": user_config.get("revision", None),
             "use_features": config.get("use_features", False),  # PASS THE PARAMETER
-            "max_files_per_stream": config.get("max_files_per_stream", 4)
+            "max_files_per_stream": config.get("max_files_per_stream", 4),
+            "disable_caching": config.get("disable_caching", False),
         }
         if config['buffered']:
             config['corpus_iterable'] = HFCorpusBuffered(**hf_kwargs)      
