@@ -27,7 +27,7 @@ import threading
 from queue import Queue
 import gc
 import os
-import psutil
+# import psutil
 
 # Set HuggingFace timeout and cache settings
 os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '3600'  # 1 hour timeout
@@ -632,7 +632,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 self.queue.put(None)
                 logger.info("[Producer] Finished loading all batches")
             else:
-                self.queue.put(None)
+                self.queue.put(self.stop_signal)
                 logger.info("[Producer] Stopped early due to stop event")
 
     def _cleanup_dataset(self, ds, path):
@@ -700,14 +700,14 @@ class HFCorpusBuffered(HFStreamingCorpus):
         else:
             try:
                 # Just delete the dataset object - no files to clean
-                memory_usage_before = psutil.Process().memory_info().rss
+                # memory_usage_before = psutil.Process().memory_info().rss
                 del ds
                 gc.collect()
-                memory_usage_after = psutil.Process().memory_info().rss
+                # memory_usage_after = psutil.Process().memory_info().rss
                 
-                memory_freed_mb = (memory_usage_before - memory_usage_after) / (1024**2)
-                logger.info(f"[Cleanup] Freed {memory_freed_mb:.1f}MB of memory for {path}")
-                return memory_freed_mb
+                # memory_freed_mb = (memory_usage_before - memory_usage_after) / (1024**2)
+                # logger.info(f"[Cleanup] Freed {memory_freed_mb:.1f}MB of memory for {path}")
+                return 0 # memory_freed_mb
             except Exception as e:
                 logger.error(f"[Cleanup] Failed to clean dataset for {path}: {e}")
                 return 0
@@ -812,10 +812,9 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 logger.info(f"[Consumer] Retrieved batch from queue (queue size: {self.queue.qsize()}/{self.buffer_size})")
                 
                 # Check for end signal
-                if item is None:
+                if item is self.stop_signal or item is None:
                     logger.info("[Consumer] All batches processed")
                     break
-                    
                 path, ds = item
                 processed_datasets.append(ds)
                 logger.info(f"[Consumer] Processing batch from {path}")
@@ -837,23 +836,18 @@ class HFCorpusBuffered(HFStreamingCorpus):
                                 # Check per-batch limit (max_sentences now means per-batch)
                                 if self.max_sentences and batch_sentence_count >= self.max_sentences:
                                     logger.info(f"[Consumer] Reached per-batch limit ({self.max_sentences}) for {path}")
-                                    break
-                                    
+                                    break           
                         except Exception as ex:
                             logger.warning(f"[Consumer] Error in example from {path}: {ex}")
                             continue
-                            
                 except Exception as stream_ex:
                     logger.error(f"[Consumer] Error iterating over data in {path}: {stream_ex}")
                     continue
                 
                 logger.info(f"[Consumer] Batch {path} completed: {batch_sentence_count} sentences processed")
-                
-                # Clean up this specific dataset and its cache files
-                logger.info(f"[Consumer] Starting cleanup for {path} (queue size: {self.queue.qsize()}/{self.buffer_size})")
-                deleted_mb = self._cleanup_dataset(ds, path)
-                total_deleted_mb += deleted_mb
-                logger.info(f"[Consumer] Cleanup complete for {path} (queue size: {self.queue.qsize()}/{self.buffer_size})")
+                logger.info(f"[Consumer] Deleting the ds object")
+                del ds
+                gc.collect()
                 
         except Exception as e:
             logger.error(f"[Consumer] Unexpected error during iteration: {e}")
