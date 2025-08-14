@@ -559,14 +559,14 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         if os.path.exists(datasets_cache):
                             try:
                                 # Calculate size before deletion
-                                cache_size = sum(f.stat().st_size for f in Path(datasets_cache).rglob('*') if f.is_file()) / (1024**2)
+                                cache_size = sum(f.stat().st_size for f in Path(hf_cache_home).rglob('*') if f.is_file()) / (1024**2)
                                 
                                 # Remove all cached datasets since this one is in memory
-                                shutil.rmtree(datasets_cache)
+                                shutil.rmtree(hf_cache_home)
                                 logger.info(f"[Producer] Deleted cache directory after loading {path} into memory ({cache_size:.1f}MB freed)")
                                 
                                 # Recreate the empty directory so HF doesn't complain
-                                os.makedirs(datasets_cache, exist_ok=True)
+                                os.makedirs(hf_cache_home, exist_ok=True)
                                 
                             except Exception as e:
                                 logger.warning(f"[Producer] Failed to clean cache after loading {path}: {e}")
@@ -574,12 +574,17 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     logger.info(f"[Producer] Dataset loaded successfully for {path}")
                     logger.info(f"[Producer] Dataset length: {len(ds)}")
                     logger.info(f"[Producer] Dataset features: {ds.features}")
-                    
-                    if len(ds) > 0:
-                        logger.info(f"[Producer] First example keys: {list(ds[0].keys())}")
-                        logger.info(f"[Producer] First example text preview: {ds[0].get('text', 'NO TEXT FIELD')[:100]}...")
-                    else:
-                        logger.error(f"[Producer] Dataset is empty! This is the problem!")    
+                    # Check stop event before queuing
+                    if self._stop_event.is_set():
+                        logger.info("[Producer] Stop event set after download, cleaning up and stopping")
+                        try:
+                            del ds
+                        except:
+                            pass
+                        break
+                    # Track this dataset for later cleanup
+                    self._downloaded_datasets.append(ds)
+                    self.queue.put((path, ds)) 
                 except Exception as e:
                     logger.error(f"[Producer] Failed to load batch {path}: {e}")
                     
