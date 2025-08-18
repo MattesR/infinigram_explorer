@@ -138,196 +138,6 @@ class MyJsonCorpus:
         return results
 
 
-
-class HFStreamingCorpus:
-    def __init__(self, 
-                 dataset_name, 
-                 split="train", 
-                 text_field="text", 
-                 subset=None,
-                 max_sentences=None, 
-                 max_files_per_stream=100,
-                 data_dir="data",
-                 revision=None,
-                 tokenizer=None,
-                 use_features=False
-                ):
-        
-        self.dataset_name = dataset_name
-        self.subset = subset
-        self.split = split
-        self.text_field = text_field
-        self.max_sentences = max_sentences
-        self.max_files_per_stream = max_files_per_stream
-        self.data_dir = data_dir.strip("/")
-        self.revision = revision
-        self.repo_id = dataset_name
-        self.tokenizer = tokenizer
-        self.use_features = use_features
-        
-        # Use default HuggingFace cache
-        self.cache_dir = None  # Let HF handle caching
-            
-        self.batches = self._prepare_batches()
-        self.stop_signal = object()
-
-    def _prepare_batches(self):
-        """Fixed version that respects max_files_per_stream and separates by subset"""
-        logger.info(f"Fetching file list from repository: {self.dataset_name}, revision {self.revision if self.revision else 'Main'}")
-        all_files = list_repo_files(self.dataset_name, repo_type="dataset", revision=self.revision)
-        
-        batches = {}
-        batch_counter = 0
-        
-        if self.subset:
-            if isinstance(self.subset, str):
-                self.subset = [self.subset]
-            
-            # Process each subset separately
-            for subset in self.subset:
-                subset_folder = f'{self.data_dir}/{subset}'
-                logger.info(f'Processing subset: {subset}')
-                
-                # Get files for this specific subset
-                subset_files = [f for f in all_files if f.startswith(subset_folder)]
-                logger.info(f'Files in {subset}: {len(subset_files)}')
-                
-                if not subset_files:
-                    logger.warning(f'No files found for subset: {subset}')
-                    continue
-                
-                # Create batches for this subset
-                for i in range(0, len(subset_files), self.max_files_per_stream):
-                    chunk = subset_files[i:i + self.max_files_per_stream]
-                    
-                    batch_name = f"batch_{batch_counter:04d}_{subset}"
-                    batches[batch_name] = {
-                        'files': chunk,
-                        'subset': subset
-                    }
-                    
-                    logger.info(f"Created batch '{batch_name}' with {len(chunk)} files from subset '{subset}'")
-                    logger.info(f"  Files: {[f.split('/')[-1] for f in chunk]}")  # Show just filenames
-                    batch_counter += 1
-        else:
-            # Original logic for when no subset is specified
-            files = [f for f in all_files if f.startswith(self.data_dir)]
-            logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
-
-            # Get subset name from first file
-            if files:
-                subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
-            else:
-                subset_name = "unknown"
-            
-            # Create batches
-            for i in range(0, len(files), self.max_files_per_stream):
-                chunk = files[i:i + self.max_files_per_stream]
-                
-                batch_name = f"batch_{batch_counter:04d}_{subset_name}"
-                batches[batch_name] = {
-                    'files': chunk,
-                    'subset': subset_name
-                }
-                
-                logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
-                batch_counter += 1
-
-        logger.info(f"Created {len(batches)} total batches")
-        
-        # Debug: Print all batches
-        for batch_name, batch_info in batches.items():
-            logger.info(f"Batch {batch_name}: {batch_info['subset']} - {len(batch_info['files'])} files")
-        
-        return batches
-
-    def get_default_cache_info(self):
-        """Get information about the default HuggingFace cache directory"""
-        hf_cache_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
-        datasets_cache = os.path.join(hf_cache_home, 'datasets')
-        
-        if os.path.exists(datasets_cache):
-            try:
-                total_size = sum(f.stat().st_size for f in Path(datasets_cache).rglob('*') if f.is_file())
-                file_count = len(list(Path(datasets_cache).rglob('*')))
-                return datasets_cache, total_size / (1024**2), file_count
-            except Exception as e:
-                logger.warning(f"Could not calculate cache info: {e}")
-                return datasets_cache, 0, 0
-        return datasets_cache, 0, 0
-
-    def __iter__(self):
-        count = 0
-        if self.batches:
-            for path, batch in self.batches.items():
-                logger.info(f"Streaming batch from path: {path}")
-                try:
-                    ds = load_dataset(
-                        self.dataset_name,
-                        name=batch['subset'],
-                        split=self.split,
-                        streaming=True,
-                        data_files={self.split: batch['files']},
-                        revision=self.revision,
-                        features=FEATURES if self.use_features else None
-                    )
-                except Exception as ds_exception:
-                    logger.error(f"Failed to load batch from {path}: {ds_exception}") 
-                    continue
-                    
-                try:
-                    for example in tqdm(ds, desc=f"Streaming from {path}", unit="docs"):
-                        try:
-                            text = example.get(self.text_field, "")
-                            if text:
-                                if self.tokenizer:
-                                    yield self.tokenizer.tokenize(text)
-                                else:
-                                    yield simple_preprocess(clean_html(text.lower()))
-                                count += 1
-                                if self.max_sentences and count >= self.max_sentences:
-                                    return
-                        except Exception as ex:
-                            logger.warning(f"Error processing example in {path}: {ex}")
-                            continue
-                except Exception as stream_ex:
-                    logger.error(f"Error while streaming from batch {path}: {stream_ex}")
-                    continue
-        else:
-            logger.info("Streaming dataset without batching")
-            try:
-                if self.subset:
-                    ds = load_dataset(
-                        self.dataset_name, 
-                        name=self.subset[0] if isinstance(self.subset, list) else self.subset, 
-                        split=self.split, 
-                        streaming=True,
-                        features=FEATURES if self.use_features else None
-                    )
-                else:
-                    ds = load_dataset(
-                        self.dataset_name, 
-                        split=self.split, 
-                        streaming=True,
-                        features=FEATURES if self.use_features else None
-                    )
-                    
-                for example in tqdm(ds, desc="Streaming examples", unit="docs"):
-                    text = example.get(self.text_field, "")
-                    if text:
-                        if self.tokenizer:
-                            yield self.tokenizer.tokenize(text)
-                        else:
-                            yield simple_preprocess(clean_html(text.lower()))
-                        count += 1
-                        if self.max_sentences and count >= self.max_sentences:
-                            break
-                            
-            except Exception as ds_exception:
-                logger.error(f"Failed to load dataset: {ds_exception}")
-                return
-
-
 class HFStreamingCorpus:
     def __init__(self, 
                  dataset_name, 
@@ -355,6 +165,7 @@ class HFStreamingCorpus:
         self.tokenizer = tokenizer
         self.use_features = use_features
         self.disable_caching = disable_caching
+        
         if self.disable_caching:
             datasets.disable_caching()
         else:
@@ -428,10 +239,6 @@ class HFStreamingCorpus:
 
         logger.info(f"Created {len(batches)} total batches")
         
-        # Debug: Print all batches
-        for batch_name, batch_info in batches.items():
-            logger.info(f"Batch {batch_name}: {batch_info['subset']} - {len(batch_info['files'])} files")
-        
         return batches
 
     def get_default_cache_info(self):
@@ -453,7 +260,7 @@ class HFStreamingCorpus:
         count = 0
         if self.batches:
             for path, batch in self.batches.items():
-                logger.info(f"Streaming batch from path: {path}")
+                logger.info(f"Streaming batch: {path}")
                 try:
                     ds = load_dataset(
                         self.dataset_name,
@@ -462,10 +269,11 @@ class HFStreamingCorpus:
                         streaming=True,
                         data_files={self.split: batch['files']},
                         revision=self.revision,
-                        features=FEATURES if self.use_features else None
+                        features=FEATURES if self.use_features else None,
+                        keep_in_memory=True if self.disable_caching else False,
                     )
                 except Exception as ds_exception:
-                    logger.error(f"Failed to load batch from {path}: {ds_exception}") 
+                    logger.error(f"Failed to load batch {path}, from {batch['subset']} with files\n: {batch['files']}: {ds_exception}") 
                     continue
                     
                 try:
@@ -495,14 +303,16 @@ class HFStreamingCorpus:
                         name=self.subset[0] if isinstance(self.subset, list) else self.subset, 
                         split=self.split, 
                         streaming=True,
-                        features=FEATURES if self.use_features else None
+                        features=FEATURES if self.use_features else None,
+                        keep_in_memory=True if self.disable_caching else False,
                     )
                 else:
                     ds = load_dataset(
                         self.dataset_name, 
                         split=self.split, 
                         streaming=True,
-                        features=FEATURES if self.use_features else None
+                        features=FEATURES if self.use_features else None,
+                        keep_in_memory=True if self.disable_caching else False,
                     )
                     
                 for example in tqdm(ds, desc="Streaming examples", unit="docs"):
@@ -554,9 +364,9 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         # Dataset is now in memory, safe to delete cache files
                         import shutil
                         hf_cache_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
-                        datasets_cache = os.path.join(hf_cache_home, 'datasets')
+                        datasets_cache = os.path.join(hf_cache_home, 'datasets') ## don't needed right now, want to delete all
                         
-                        if os.path.exists(datasets_cache):
+                        if os.path.exists(hf_cache_home):
                             try:
                                 # Calculate size before deletion
                                 cache_size = sum(f.stat().st_size for f in Path(hf_cache_home).rglob('*') if f.is_file()) / (1024**2)
@@ -816,9 +626,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     logger.info("[Consumer] All batches processed")
                     break
                 path, ds = item
-                processed_datasets.append(ds)
-                logger.info(f"[Consumer] Processing batch from {path}")
-                
+                logger.info(f"[Consumer] iterating over batch {path}")
                 batch_sentence_count = 0  # Track sentences per batch
                 
                 try:
@@ -851,27 +659,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 
         except Exception as e:
             logger.error(f"[Consumer] Unexpected error during iteration: {e}")
-        finally:
-            # Clean up any remaining datasets
-            for ds in processed_datasets:
-                try:
-                    deleted_mb = self._cleanup_dataset_files_only(ds)
-                    total_deleted_mb += deleted_mb
-                    del ds
-                except:
-                    pass
-            
-            logger.info(f"[Consumer] Total disk space freed: {total_deleted_mb:.1f}MB")
-            
-            # Always wait for producer to finish properly
-            if producer_thread.is_alive():
-                logger.info("[Consumer] Waiting for producer thread to finish...")
-                self._stop_event.set()
-                producer_thread.join(timeout=30)
-                if producer_thread.is_alive():
-                    logger.warning("[Consumer] Producer thread did not finish in time")
-                else:
-                    logger.info("[Consumer] Producer thread finished successfully")
 
     def __del__(self):
         """Destructor to ensure cleanup"""

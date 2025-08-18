@@ -188,10 +188,6 @@ def main(dataset, subset, max_sentences, max_files, buffer_size, use_features, d
         # Set global reference for signal handler
         corpus_instance = corpus
         
-        logger.info(f"Created HFCorpusBuffered with {len(corpus.batches)} batches")
-        for batch_name, batch_info in corpus.batches.items():
-            logger.info(f"  Batch: {batch_name} - {len(batch_info['files'])} files")
-        
         # Monitor after corpus creation
         monitor_system(cache_dir, "AFTER CORPUS CREATION", disable_caching)
         
