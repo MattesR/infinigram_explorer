@@ -214,32 +214,46 @@ class HFStreamingCorpus:
                     logger.info(f"  Files: {[f.split('/')[-1] for f in chunk]}")  # Show just filenames
                     batch_counter += 1
         else:
-            # Original logic for when no subset is specified
             files = [f for f in all_files if f.startswith(self.data_dir)]
             logger.info(f"Total files under `{self.data_dir}/`: {len(files)}")
-
-            # Get subset name from first file
-            if files:
-                subset_name = PurePosixPath(files[0]).parts[1] if len(PurePosixPath(files[0]).parts) > 1 else "unknown"
-            else:
-                subset_name = "unknown"
             
-            # Create batches
-            for i in range(0, len(files), self.max_files_per_stream):
-                chunk = files[i:i + self.max_files_per_stream]
+            # Group files by subset
+            subset_groups = {}
+            for file_path in files:
+                # Extract subset from file path: data/subset/... -> subset
+                path_parts = PurePosixPath(file_path).parts
+                if len(path_parts) > 1:
+                    subset_name = path_parts[1]  # e.g., "wiki", "algebraic-stack"
+                else:
+                    subset_name = "unknown"
                 
-                batch_name = f"batch_{batch_counter:04d}_{subset_name}"
-                batches[batch_name] = {
-                    'files': chunk,
-                    'subset': subset_name
-                }
+                if subset_name not in subset_groups:
+                    subset_groups[subset_name] = []
+                subset_groups[subset_name].append(file_path)
+            
+            logger.info(f"Found subsets: {list(subset_groups.keys())}")
+            
+            # Create batches for each subset
+            for subset_name, subset_files in subset_groups.items():
+                logger.info(f'Processing auto-detected subset: {subset_name} ({len(subset_files)} files)')
                 
-                logger.info(f"Created batch '{batch_name}' with {len(chunk)} files")
-                batch_counter += 1
-
-        logger.info(f"Created {len(batches)} total batches")
+                # Create batches for this subset
+                for i in range(0, len(subset_files), self.max_files_per_stream):
+                    chunk = subset_files[i:i + self.max_files_per_stream]
+                    
+                    batch_name = f"batch_{batch_counter:04d}_{subset_name}"
+                    batches[batch_name] = {
+                        'files': chunk,
+                        'subset': subset_name
+                    }
+                    
+                    logger.info(f"Created batch '{batch_name}' with {len(chunk)} files from subset '{subset_name}'")
+                    logger.info(f"  Files: {[f.split('/')[-1] for f in chunk]}")  # Show just filenames
+                    batch_counter += 1
         
+        logger.info(f"Created {len(batches)} total batches")
         return batches
+
 
     def get_default_cache_info(self):
         """Get information about the default HuggingFace cache directory"""
