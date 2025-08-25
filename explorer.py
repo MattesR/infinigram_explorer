@@ -48,21 +48,6 @@ WORDSTART_SYMBOL = '▁'
 LINEBREAK_TOKEN = '<0x0A>'
 
 
-
-
-def get_span_probability_from_span(span, unigram_probability, tokenizer=tokenizer, ids=False):
-    if not ids:
-        ids = tokenizer.encode(span, add_special_tokens=False)
-    else: # means that the span is already ids, maybe that code is weird..
-        ids = span
-    return prod([unigram_probability[token] for token in ids])
-    
-
-
-
-
-
-
 def query_infinigram(query_type='count', string_query=False, query='', added_payload={}, index=INDEX):
     """Counts the number of occurences of 'query' in 'index'.
     :param query_type: which api endpoint to request
@@ -114,11 +99,6 @@ def get_all_ngrams(query=TEST_OUTPUT, tokenizer=TOKENIZER, min_len=2, max_len=No
             else:
                 result.append(sublist)
     return result
-
-
-def create_token_prob_table(query, tokenizer=TOKENIZER, probabilities, min_len=2, max_len=None, olmotrace_criterion=True):
-    sublists = get_all_ngrams(query, tokenizer,min_len,max_len,olmotrace_criterion)
-    lists_and_probs = [{'sublist': sublist, 'prob', get
 
 
 def get_all_docs(query, string_query=True, index=INDEX, delay=0.2, max_docs=1000000, output_dir=None, overwrite=True, dry=False):
