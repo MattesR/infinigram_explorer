@@ -1,37 +1,4 @@
 import os
-
-# HPC-friendly cache setup
-if 'SLURM_JOB_ID' in os.environ:
-    # Use job-specific temp directory
-    job_id = os.environ['SLURM_JOB_ID']
-    user = os.environ.get('USER', 'user')
-    
-    # Try these locations in order
-    cache_candidates = [
-        os.environ.get('TMPDIR'),           # Slurm temp
-        os.environ.get('SLURM_TMPDIR'),     # Alternative temp
-        f"/tmp/{user}",                     # User temp
-        f"/scratch/{user}",                 # Scratch space
-        f"/local_scratch/{user}",           # Local scratch
-    ]
-    
-    for cache_base in cache_candidates:
-        if cache_base and os.path.exists(cache_base) and os.access(cache_base, os.W_OK):
-            hf_cache = os.path.join(cache_base, f'hf_cache_{job_id}')
-            os.makedirs(hf_cache, exist_ok=True)
-            
-            # Set HF environment variables
-            os.environ['HF_HOME'] = hf_cache
-            os.environ['HF_DATASETS_CACHE'] = os.path.join(hf_cache, 'datasets')
-            os.environ['TRANSFORMERS_CACHE'] = os.path.join(hf_cache, 'transformers')
-            
-            print(f"Using HPC cache: {hf_cache}")
-            break
-    else:
-        print("Warning: Could not find suitable cache directory")
-
-
-
 import json
 from transformers import AutoTokenizer
 import datasets
@@ -393,7 +360,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     break
                     
                 logger.info(f"[Producer] Starting download of batch {path} (queue size: {self.queue.qsize()}/{self.buffer_size})")
-                logger.info(f'subset is {batch["subset"]}\n files are: {batch["files"]}')
                 ds = None
                 try:
                     ds = load_dataset(
