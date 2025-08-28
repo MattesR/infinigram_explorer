@@ -680,7 +680,16 @@ class HFCorpusBuffered(HFStreamingCorpus):
 
             pass
 
-def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200, window=5, min_count=5, workers=4, epochs=5, **kwargs):
+def train_word2vec_model(
+        corpus_iterable=None, 
+        output_dir=None, 
+        vector_size=200, 
+        window=5, 
+        min_count=5, 
+        workers=4, 
+        epochs=5,
+        tokenizer=None,
+        **kwargs):
     if isinstance(output_dir,str):
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -697,15 +706,31 @@ def train_word2vec_model(corpus_iterable=None, output_dir=None, vector_size=200,
     gensim_logger.setLevel(logging.INFO)
     gensim_logger.handlers.clear()
     gensim_logger.addHandler(LoguruHandler())
-    logger.info("Starting Word2Vec training")
-    model = Word2Vec(
-        sentences=corpus_iterable,
-        vector_size=vector_size,
-        window=window,
-        min_count=min_count,
-        workers=workers,
-        epochs=epochs,
+    if tokenizer:
+        vocab = list(tokenizer.get_vocab().keys())
+        logger.info(f'built vocab from tokenizer, length {len(vocab)}')
+        model = Word2Vec(
+            vector_size=vector_size,
+            window=window,
+            min_count=1,  # Set to 1 since we're using fixed vocab
+            workers=workers,
+            sg=kwargs.get('sg', 0),  # Add sg parameter if in kwargs
         )
+        model.build_vocab([vocab]) #needs to be a list of list > [vocab]
+        logger.info("Starting Word2Vec training")
+        model.train(corpus_iterable, 
+            total_examples=3_080_000_000, ## this is hardcoded the amount of docs in olmo_mix, change if necessary
+            epochs=epochs)
+    else:
+        logger.info("Starting Word2Vec training")
+        model = Word2Vec(
+            sentences=corpus_iterable,
+            vector_size=vector_size,
+            window=window,
+            min_count=min_count,
+            workers=workers,
+            epochs=epochs,
+            )
 
     # Save model
     if output_dir:
@@ -727,13 +752,14 @@ def read_config(config_path: str) -> dict:
     "workers": 4,
     "sg": 0,
     "epochs": 5,
-    "batch_words": 10000,
-    "tokenizer": None,
+    "batch_words": 10_000,
+    "tokenizer_name": None,
     'buffered': False,
     'revision': None,
     'use_features': False,
     'max_files_per_stream': 4,
-    'disable_caching': False
+    'disable_caching': False,
+    'total_examples': 3_08_000_000
     }
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
@@ -745,6 +771,12 @@ def read_config(config_path: str) -> dict:
         if key not in config:
             config[key] = default_value
             logger.warning(f"Config key '{key}' missing; using default value: {default_value}")
+    if config['tokenizer_name']:
+        logger.info(f'load tokenizer, {config["tokenizer_name"]}')
+        tokenizer = AutoTokenizer.from_pretrained(config['tokenizer_name'], token=HF_TOKEN)
+        config['tokenizer'] = tokenizer
+    else:
+        config['tokenizer'] = None
     
     if 'path' in user_config:
         config['corpus_iterable'] = MyJsonCorpus(user_config['path'])
@@ -759,6 +791,7 @@ def read_config(config_path: str) -> dict:
             "use_features": config.get("use_features", False),  # PASS THE PARAMETER
             "max_files_per_stream": config.get("max_files_per_stream", 4),
             "disable_caching": config.get("disable_caching", False),
+            "tokenizer": config.get("tokenizer", None)
         }
         if config['buffered']:
             config['corpus_iterable'] = HFCorpusBuffered(**hf_kwargs)      
