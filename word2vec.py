@@ -282,7 +282,6 @@ class HFStreamingCorpus:
                         data_files={self.split: batch['files']},
                         revision=self.revision,
                         features=FEATURES if self.use_features else None,
-                        keep_in_memory=True if self.disable_caching else False,
                     )
                 except Exception as ds_exception:
                     logger.error(f"Failed to load batch {path}, from {batch['subset']} with files\n: {batch['files']}: {ds_exception}") 
@@ -316,7 +315,6 @@ class HFStreamingCorpus:
                         split=self.split, 
                         streaming=True,
                         features=FEATURES if self.use_features else None,
-                        keep_in_memory=True if self.disable_caching else False,
                     )
                 else:
                     ds = load_dataset(
@@ -324,7 +322,6 @@ class HFStreamingCorpus:
                         split=self.split, 
                         streaming=True,
                         features=FEATURES if self.use_features else None,
-                        keep_in_memory=True if self.disable_caching else False,
                     )
                     
                 for example in tqdm(ds, desc="Streaming examples", unit="docs"):
@@ -349,7 +346,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
         self.buffer_size = buffer_size
         self.queue = Queue(maxsize=buffer_size)
         self._stop_event = threading.Event()
-        self._downloaded_datasets = []  # Track datasets for cleanup
                     
     def _producer(self):
         """Producer thread that downloads and queues batches"""
@@ -405,7 +401,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
                             pass
                         break
                     # Track this dataset for later cleanup
-                    self._downloaded_datasets.append(ds)
                     self.queue.put((path, ds)) 
                 except Exception as e:
                     logger.error(f"[Producer] Failed to load batch {path}: {e}")
@@ -534,31 +529,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 logger.error(f"[Cleanup] Failed to clean dataset for {path}: {e}")
                 return 0
 
-    def cleanup_all_datasets(self):
-        """Clean up all downloaded datasets and their cache files"""
-        logger.info("[Cleanup] Starting cleanup of dataset objects and cache files")
-        
-        total_deleted_mb = 0
-        
-        # Clean up any remaining datasets and their cache files
-        if self._downloaded_datasets:
-            for ds in self._downloaded_datasets:
-                try:
-                    deleted_mb = self._cleanup_dataset_files_only(ds)
-                    total_deleted_mb += deleted_mb
-                    del ds
-                except:
-                    pass
-            self._downloaded_datasets.clear()
-        else:
-            logger.warning('cleanup all datasets does not do stuff')
-        
-        # Force garbage collection
-        gc.collect()
-        
-        logger.info(f"[Cleanup] Dataset cleanup completed, freed {total_deleted_mb:.1f}MB from disk")
-        
-        return total_deleted_mb
     
     def _cleanup_dataset_files_only(self, ds):
         """Helper to clean up just the cache files of a dataset"""
@@ -672,14 +642,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
         except Exception as e:
             logger.error(f"[Consumer] Unexpected error during iteration: {e}")
 
-    def __del__(self):
-        """Destructor to ensure cleanup"""
-        try:
-            self.cleanup_all_datasets()
-        except:
-
-            pass
-
 def train_word2vec_model(
         corpus_iterable=None, 
         output_dir=None, 
@@ -715,6 +677,7 @@ def train_word2vec_model(
             min_count=1,  # Set to 1 since we're using fixed vocab
             workers=workers,
             sg=kwargs.get('sg', 0),  # Add sg parameter if in kwargs
+            sample=1e-05 ## more downsampling of frequent words 
         )
         model.build_vocab([vocab]) #needs to be a list of list > [vocab]
         logger.info("Starting Word2Vec training")
@@ -730,6 +693,7 @@ def train_word2vec_model(
             min_count=min_count,
             workers=workers,
             epochs=epochs,
+            sample=1e-05,
             )
 
     # Save model
