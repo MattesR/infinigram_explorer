@@ -38,15 +38,16 @@ def cooccurrence_to_distance_chunked(df, chunk_size=1000):
         chunk = mat[i:end_i, :]
         chunk_diag = diag[i:end_i]
         
-        # Calculate for this chunk
         # numerator: c_ij + c_ji for rows i:end_i
-        numerator = chunk + mat.T[:, i:end_i].T
+        numerator = chunk + mat[:, i:end_i].T
         
         # denominator: c_ii + c_jj
         denominator = chunk_diag[:, None] + diag[None, :]
         
-        # Store result
-        distance_mat[i:end_i, :] = 1 - (numerator / denominator)
+        result_chunk = 1 - (numerator / denominator)
+
+        distance_mat[i:end_i, :] = result_chunk
+        distance_mat[:, i:end_i] = result_chunk.T
     
     return pd.DataFrame(distance_mat, index=df.index, columns=df.columns)
 
