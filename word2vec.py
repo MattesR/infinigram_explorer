@@ -61,7 +61,6 @@ FEATURES = Features({
 })
 
 
-
 HF_TOKEN = get_token('HF_TOKEN')
 login(HF_TOKEN)
 INDEX='v4_olmo-2-0325-32b-instruct_llama'
@@ -69,76 +68,9 @@ TOKENIZER_NAME='meta-llama/Llama-2-7b-hf'
 ## TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
 
 
-class MyJsonCorpus:
-    """
-    An iterator over a directory of JSON files.
-    For each file, prep_text_file() is called, the result is lowercased,
-    tokenized, and yielded as a list of tokens.
-    """
-
-    def __init__(self, dir_path, max_sentences=None):
-        self.dir_path = Path(dir_path)
-        self.max_sentences = max_sentences
-
-    def __iter__(self):
-        files = list(self.dir_path.glob("*.json"))
-        count = 0
-        for file_path in tqdm(files, desc="Processing files"):
-            try:
-                text = self.prep_text_file(file_path)
-                text = text.lower()
-                count += 1
-                if self.max_sentences and count > self.max_sentences:
-                    break
-                yield simple_preprocess(clean_html(text))
-            except Exception as e:
-                print(f"Error processing {file_path}: {e}")
-    
-    def prep_text_file(self, file: str) -> str:
-        with open(file) as f:
-            json_file = json.load(f)
-        if isinstance(json_file, list): # this is the output that I expect from infinigram
-            text_file = ' '.join(element[0] for element in json_file)
-        else:
-            print(f'no list in {json_file}')
-            return ''
-        return text_file
-
-    
-
-    def search_string(self, query: str, expand=0) -> list[str] | list[tuple[str, str]]:
-        """
-        Return a list of filenames where the lowercase text contains the given query.
-        If `expand` > 0, return a tuple of (filename, surrounding text) for the first match.
-        Also prints the number of matches.
-        """
-        query = query.lower()
-        results = []
-    
-        for file_path in self.dir_path.glob("*.json"):
-            try:
-                text = self.prep_text_file(file_path)
-                text_lower = text.lower()
-                match_index = text_lower.find(query)
-    
-                if match_index != -1:
-                    if expand > 0:
-                        start = max(0, match_index - expand)
-                        end = min(len(text), match_index + len(query) + expand)
-                        snippet = text[start:end].replace('\n', ' ').strip()
-                        results.append((file_path.name, snippet))
-                    else:
-                        results.append(file_path.name)
-            except Exception as e:
-                print(f"Error processing {file_path}: {e}")
-    
-        print(f"Found {len(results)} occurrences")
-        return results
-
-
 class HFStreamingCorpus:
     def __init__(self, 
-                 dataset_name, 
+                 dataset_name='allenai/olmo-mix-1124', 
                  split="train", 
                  text_field="text", 
                  subset=None,
@@ -148,7 +80,9 @@ class HFStreamingCorpus:
                  revision=None,
                  tokenizer=None,
                  use_features=False,
-                 disable_caching=False
+                 disable_caching=False,
+                 yield_style='raw',
+                 return_metadata=False
                 ):
         
         self.dataset_name = dataset_name
@@ -163,6 +97,10 @@ class HFStreamingCorpus:
         self.tokenizer = tokenizer
         self.use_features = use_features
         self.disable_caching = disable_caching
+        if yield_style not in ['preproc', 'ids', 'raw', 'tokenize']:
+            raise ValueError(f'no matching yield_style, must be preproc, ids, raw or tokenize, found {yield_style}')
+        self.yield_style = yield_style  
+        self.return_metadata = return_metadata
         
         if self.disable_caching:
             datasets.disable_caching()
@@ -292,10 +230,15 @@ class HFStreamingCorpus:
                         try:
                             text = example.get(self.text_field, "")
                             if text:
-                                if self.tokenizer:
-                                    yield self.tokenizer.tokenize(text)
-                                else:
-                                    yield simple_preprocess(clean_html(text.lower()))
+                                match self.yield_style:
+                                    case 'tokenize':
+                                        yield self.tokenizer.tokenize(text)
+                                    case 'ids':
+                                        yield self.tokenizer.encode(text, add_special_tokens=False)
+                                    case 'raw':
+                                        yield text
+                                    case 'preproc':
+                                        yield simple_preprocess(clean_html(text.lower()))
                                 count += 1
                                 if self.max_sentences and count >= self.max_sentences:
                                     return
@@ -327,10 +270,15 @@ class HFStreamingCorpus:
                 for example in tqdm(ds, desc="Streaming examples", unit="docs"):
                     text = example.get(self.text_field, "")
                     if text:
-                        if self.tokenizer:
-                            yield self.tokenizer.tokenize(text)
-                        else:
-                            yield simple_preprocess(clean_html(text.lower()))
+                        match self.yield_style:
+                            case 'tokenize':
+                                yield self.tokenizer.tokenize(text)
+                            case 'ids':
+                                yield self.tokenizer.encode(text, add_special_tokens=False)
+                            case 'raw':
+                                yield text
+                            case 'preproc':
+                                yield simple_preprocess(clean_html(text.lower()))
                         count += 1
                         if self.max_sentences and count >= self.max_sentences:
                             break
@@ -339,14 +287,90 @@ class HFStreamingCorpus:
                 logger.error(f"Failed to load dataset: {ds_exception}")
                 return
 
+    def iter_batches(self):
+        """Yield one generator per batch (and its metadata)."""
+        for batch_name, batch_info in self.batches.items():
+            try:
+                yield self._stream_batch(batch_name, batch_info)
+            except Exception as batch_iter_exception:
+                logger.error(f"Error preparing batch {batch_name}: {batch_iter_exception}")
+                continue
+
+
+    def _stream_batch(self, batch_name, batch_info):
+        """Stream one batch and collect metadata."""
+        start = time.time()
+        num_examples = 0
+
+        try:
+            ds = load_dataset(
+                self.dataset_name,
+                name=batch_info["subset"],
+                split=self.split,
+                streaming=True,
+                data_files={self.split: batch_info["files"]},
+                revision=self.revision,
+                features=FEATURES if self.use_features else None,
+            )
+        except Exception as ds_exception:
+            logger.error(
+                f"Failed to load batch {batch_name} from subset '{batch_info['subset']}' "
+                f"with files: {batch_info['files']}\nError: {ds_exception}"
+            )
+            return None  # Skip this batch entirely if dataset fails
+
+        def gen():
+            nonlocal num_examples
+            try:
+                for example in tqdm(ds, desc=f"Streaming from {batch_name}", unit="docs"):
+                    try:
+                        text = example.get(self.text_field, "")
+                        if not text:
+                            continue
+
+                        match self.yield_style:
+                            case 'tokenize':
+                                yield self.tokenizer.tokenize(text)
+                            case 'ids':
+                                yield self.tokenizer.encode(text, add_special_tokens=False)
+                            case 'raw':
+                                yield text
+                            case 'preproc':
+                                yield simple_preprocess(clean_html(text.lower()))
+
+                        num_examples += 1
+                        if self.max_sentences and num_examples >= self.max_sentences:
+                            return
+                    except Exception as ex:
+                        logger.warning(f"Error processing example in {batch_name}: {ex}")
+                        continue
+
+            except Exception as stream_ex:
+                logger.error(f"Error while streaming from batch {batch_name}: {stream_ex}")
+
+        # Return generator + metadata accessor
+        return {
+            "batch_name": batch_name,
+            "subset": batch_info["subset"],
+            "files": batch_info["files"],
+            "start_time": start,
+            "gen": gen,
+            "meta": lambda: {
+                "batch_name": batch_name,
+                "subset": batch_info["subset"],
+                "files": batch_info["files"],
+                "num_examples": num_examples,
+                "duration_sec": time.time() - start,
+            },
+        }
 
 class HFCorpusBuffered(HFStreamingCorpus):
-    def __init__(self, *args, buffer_size=2, **kwargs):
+    def __init__(self, *args, buffer_size=2, yield_batch_size=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.buffer_size = buffer_size
         self.queue = Queue(maxsize=buffer_size)
         self._stop_event = threading.Event()
-                    
+        self.yield_batch_size = yield_batch_size
     def _producer(self):
         """Producer thread that downloads and queues batches"""
         try:
@@ -586,6 +610,86 @@ class HFCorpusBuffered(HFStreamingCorpus):
             logger.debug(f"[Cleanup] Traceback: {traceback.format_exc()}")
             return 0
 
+
+    def iter_batches(self):
+        """Yield one generator per *pre-downloaded* batch (and its metadata)."""
+        # Start producer thread in background
+        producer_thread = threading.Thread(target=self._producer, daemon=False)
+        producer_thread.start()
+
+        while True:
+            logger.info(f"[Consumer] Waiting for next dataset (queue: {self.queue.qsize()}/{self.buffer_size})")
+            item = self.queue.get()
+
+            # Stop signals
+            if item is None or item is self.stop_signal:
+                logger.info("[Consumer] All batches processed, stopping iter_batches()")
+                break
+
+            batch_name, ds = item
+            batch_info = self.batches[batch_name]
+            start_time = time.time()
+            num_examples = 0
+
+            logger.info(f"[Consumer] Starting iteration for batch {batch_name} ({len(ds)} examples)")
+
+            def gen(ds=ds):
+                nonlocal num_examples
+                try:
+                    # Iterate dataset in small HF batches
+                    for batch in tqdm(
+                        ds.iter(batch_size=self.yield_batch_size),
+                        desc=f"Processing {batch_name} from iter_batch",
+                        unit="batches",
+                    ):
+                        # HF returns dict of lists (e.g. {"text": ["doc1", "doc2", ...]})
+                        texts = batch.get("text", [])
+                        if not texts:
+                            continue
+
+                        match self.yield_style:
+                            case "raw":
+                                yield texts
+                            case "preproc":
+                                yield [simple_preprocess(clean_html(t.lower())) for t in texts]
+                            case "tokenize":
+                                yield [self.tokenizer.tokenize(t) for t in texts]
+                            case "ids":
+                                yield [self.tokenizer.encode(t, add_special_tokens=False) for t in texts]
+
+                        num_examples += len(texts)
+                        if self.max_sentences and num_examples >= self.max_sentences:
+                            logger.info(f"[Consumer] Reached max_sentences={self.max_sentences} for {batch_name}")
+                            break
+
+                except Exception as e:
+                    logger.error(f"[Consumer] Error iterating {batch_name}: {e}")
+                finally:
+                    try:
+                        del ds
+                        gc.collect()
+                    except Exception:
+                        pass
+
+            # yield batch descriptor
+            yield {
+                "batch_name": batch_name,
+                "subset": batch_info["subset"],
+                "files": batch_info["files"],
+                "start_time": start_time,
+                "gen": gen,
+                "meta": lambda: {
+                    "batch_name": batch_name,
+                    "subset": batch_info["subset"],
+                    "files": batch_info["files"],
+                    "num_examples": num_examples,
+                    "duration_sec": time.time() - start_time,
+                },
+            }
+
+            logger.info("[Consumer] iter_batches() finished all datasets")  
+
+
     def __iter__(self):
         """Iterator that processes downloaded batches"""
         # Start background producer thread
@@ -593,7 +697,6 @@ class HFCorpusBuffered(HFStreamingCorpus):
         producer_thread.start()
 
         count = 0
-        processed_datasets = []
         total_deleted_mb = 0
         
         try:
@@ -612,14 +715,18 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 batch_sentence_count = 0  # Track sentences per batch
                 
                 try:
-                    for example in tqdm(ds, desc=f"Processing {path}", unit="docs"):
+                    for batch in tqdm(ds.iter(batch_size=self.yield_batch_size), desc=f"Processing {path}", unit="batches"):
                         try:
-                            text = example.get(self.text_field, "")
-                            if text:
-                                if self.tokenizer:
-                                    yield self.tokenizer.tokenize(text)
-                                else:
-                                    yield simple_preprocess(clean_html(text.lower()))
+                            if 'text' in batch.keys():
+                                match self.yield_style:
+                                    case 'tokenize':
+                                        yield self.tokenizer.tokenize(batch['text']) # this might be wrong, idk whether it works with a list of text like that
+                                    case 'ids':
+                                        yield self.tokenizer.encode(batch['text'], add_special_tokens=False) ## This migth be wrong
+                                    case 'raw':
+                                        yield batch['text']
+                                    case 'preproc':
+                                        yield [simple_preprocess(clean_html(text.lower())) for text in batch['text']] # this screws up the earlier training pipeline I guess
                                 count += 1
                                 batch_sentence_count += 1
                                 
@@ -694,6 +801,7 @@ def train_word2vec_model(
             workers=workers,
             epochs=epochs,
             sample=1e-05,
+            batch_words=kwargs.get('batch_words', 10_000)
             )
 
     # Save model
