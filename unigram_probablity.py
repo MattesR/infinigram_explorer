@@ -7,7 +7,8 @@ DEFAULT_UNI_PROB= 'token_unigram_probabilities_olmo-mix.csv'
 def get_span_probability_from_span(span, unigram_probability=None, tokenizer=tokenizer, ids=False):
     if unigram_probability is None:
         print(f'reading default unigram_prob file {DEFAULT_UNI_PROB}')
-        unigram_probability = pd.read_csv(DEFAULT_UNI_PROB, index_col=0)
+        unigram_df = pd.read_csv(DEFAULT_UNI_PROB, index_col=0)
+        unigram_probability= unigram_df['prob']
     if not ids:
         ids = tokenizer.encode(span, add_special_tokens=False)
     else: # means that the span is already ids, maybe that code is weird..
