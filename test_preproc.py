@@ -60,6 +60,7 @@ def main():
         yield_style="raw",
         yield_batch_size=args.yield_batch_size,
         max_files_per_stream=args.max_files_per_stream,
+        disable_caching=True ## I think that's needed for not making it IO bound
     )
 
     # Run the preprocessing
