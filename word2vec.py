@@ -75,7 +75,7 @@ class HFStreamingCorpus:
                  text_field="text", 
                  subset=None,
                  max_sentences=None, 
-                 max_files_per_stream=100,
+                 max_files_per_stream=10,
                  data_dir="data",
                  revision=None,
                  tokenizer=None,
