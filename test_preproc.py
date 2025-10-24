@@ -52,7 +52,7 @@ def main():
     print(f"  Output directory:  {args.out_dir}")
     print(f"  Split processes:   {args.split_processes}")
     print(f"  Yield batch size:  {args.yield_batch_size}")
-    print(f"  Max files per stream: {args.max_file_per_stream}")
+    print(f"  Max files per stream: {args.max_files_per_stream}")
 
     # Initialize the corpus
     corpus = HFCorpusBuffered(
