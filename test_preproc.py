@@ -30,6 +30,12 @@ def main():
         default=1000,
         help="Batch size for dataset iteration."
     )
+    parser.add_argument(
+        "--max_files_per_stream",
+        type=int,
+        default=10,
+        help="Maximum number of files to stream simultaneously per dataset batch (default: 10)."
+    )
 
     args = parser.parse_args()
 
@@ -41,17 +47,19 @@ def main():
         else:
             args.out_dir = f"{'_'.join(subset)}_shards"
 
-    print(f"🔧 Configuration:")
+    print(f"  Configuration:")
     print(f"  Subset(s):         {args.subset}")
     print(f"  Output directory:  {args.out_dir}")
     print(f"  Split processes:   {args.split_processes}")
     print(f"  Yield batch size:  {args.yield_batch_size}")
+    print(f"  Max files per stream: {args.max_file_per_stream}")
 
     # Initialize the corpus
     corpus = HFCorpusBuffered(
         subset=args.subset if len(args.subset) > 1 else args.subset[0],
         yield_style="raw",
         yield_batch_size=args.yield_batch_size,
+        max_files_per_stream=args.max_files_per_stream,
     )
 
     # Run the preprocessing
