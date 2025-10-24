@@ -1,10 +1,65 @@
+import argparse
 from word2vec import HFCorpusBuffered
 import corpus_preprocessing
+import os
 
-def test():
-    corpus = HFCorpusBuffered(subset='wiki', yield_style='raw', yield_batch_size=1000)
-    corpus_preprocessing.shards_from_corpus(corpus,out_dir='wiki_shard', split_processes=3)
+def main():
+    parser = argparse.ArgumentParser(description="Preprocess Hugging Face corpus into shards.")
+    parser.add_argument(
+        "--subset",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Subset name(s) — can be a single string or a list of subsets."
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Output directory for shards. Defaults to '<subset>_shards' or joined name if multiple subsets."
+    )
+    parser.add_argument(
+        "--split_processes",
+        type=int,
+        default=None,
+        help="Number of processes to use for sentence splitting (None = auto / disable parallelization)."
+    )
+    parser.add_argument(
+        "--yield_batch_size",
+        type=int,
+        default=1000,
+        help="Batch size for dataset iteration."
+    )
 
+    args = parser.parse_args()
+
+    # Derive output directory name if not provided
+    subset = args.subset if len(args.subset) > 1 else args.subset[0]
+    if args.out_dir is None:
+        if isinstance(subset, str):
+            args.out_dir = f"{subset}_shards"
+        else:
+            args.out_dir = f"{'_'.join(subset)}_shards"
+
+    print(f"🔧 Configuration:")
+    print(f"  Subset(s):         {args.subset}")
+    print(f"  Output directory:  {args.out_dir}")
+    print(f"  Split processes:   {args.split_processes}")
+    print(f"  Yield batch size:  {args.yield_batch_size}")
+
+    # Initialize the corpus
+    corpus = HFCorpusBuffered(
+        subset=args.subset if len(args.subset) > 1 else args.subset[0],
+        yield_style="raw",
+        yield_batch_size=args.yield_batch_size,
+    )
+
+    # Run the preprocessing
+    corpus_preprocessing.shards_from_corpus(
+        corpus,
+        out_dir=args.out_dir,
+        split_processes=args.split_processes,
+    )
 
 if __name__ == "__main__":
-    test()
+    main()
