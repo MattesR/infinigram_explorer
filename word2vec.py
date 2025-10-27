@@ -27,6 +27,14 @@ os.environ['DATASETS_DOWNLOAD_TIMEOUT'] = '3600'  # 1 hour timeout
 os.environ['HF_DATASETS_CACHE_MAX_SIZE'] = '50GB'  # Limit cache size
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = 'false'  # Keep progress bars for debugging
 
+import signal, sys
+def _handle_interrupt(signum, frame):
+    logger.warning(f"⚠️ Received signal {signum} — shutting down gracefully...")
+    sys.exit(130)
+signal.signal(signal.SIGINT, _handle_interrupt)
+signal.signal(signal.SIGTERM, _handle_interrupt)
+
+
 class LoguruHandler(logging.Handler):
     def emit(self, record):
         # Use Loguru to handle logs from gensim
@@ -359,16 +367,19 @@ class HFStreamingCorpus:
         }
 
 class HFCorpusBuffered(HFStreamingCorpus):
-    def __init__(self, *args, buffer_size=1, yield_batch_size=1, **kwargs):
+    def __init__(self, *args, buffer_size=1, yield_batch_size=1, batch_offest=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.buffer_size = buffer_size
         self.queue = Queue(maxsize=buffer_size)
         self._stop_event = threading.Event()
         self.yield_batch_size = yield_batch_size
+        self.batch_offset = batch_offest
     def _producer(self):
         """Producer thread that downloads and queues batches"""
         try:
-            for path, batch in self.batches.items():
+            for batch_i, (path, batch) in enumerate(self.batches.items()):
+                if batch_i < self.batch_offset:
+                    continue
                 if self._stop_event.is_set():
                     logger.info("[Producer] Stop event set, ending early")
                     break
@@ -459,6 +470,9 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         logger.warning(f"[Producer] Failed to clean temp files: {temp_cleanup_e}")
                     
                     continue
+        except KeyboardInterrupt:
+            logger.warning("[Producer] Interrupted — setting stop event")
+            self._stop_event.set()
         except Exception as e:
             logger.error(f"[Producer] Unexpected error: {e}")
         finally:
@@ -655,7 +669,10 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         if self.max_sentences and num_examples >= self.max_sentences:
                             logger.info(f"[Consumer] Reached max_sentences={self.max_sentences} for {batch_name}")
                             break
-
+                except KeyboardInterrupt:
+                    logger.warning("[Consumer] Interrupted by user — stopping")
+                    self._stop_event.set()
+                    self.queue.put(None)
                 except Exception as e:
                     logger.error(f"[Consumer] Error iterating {batch_name}: {e}")
                 finally:
@@ -664,6 +681,8 @@ class HFCorpusBuffered(HFStreamingCorpus):
                         gc.collect()
                     except Exception:
                         pass
+                    producer_thread.join(timeout=5)
+                    logger.info("[Consumer] Cleanup complete — exiting")
 
             # yield batch descriptor
             yield {

@@ -49,33 +49,45 @@ def shards_from_corpus(
     out_dir="shards",
     max_tokens_per_shard=int(5 * 1024**3 / 2),  # ≈ 2.68B uint16 tokens (~5 GB)
     split_processes=1,
-    chunk_size=1000
+    chunk_size=1000,
+    check_dir = '.',
 ):
+    """
+    Stream the corpus batch by batch, tokenize, and write fixed-size (~5 GB) shards to disk.
+    Skips batches where shard files already exist.
+    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    check_dir = Path(check_dir)
 
-    for batch in corpus.iter_batches():
-        if batch is None:
+    for i, batch in enumerate(corpus.iter_batches()):
+        batch_name = batch['batch_name']
+        logger.info(f"🔍 Checking batch {batch_name}...")
+
+        # Check if this batch is already fully processed
+        existing_shards = sorted(check_dir.glob(f"**/{batch_name}_shard_*.npy"))
+        if existing_shards:
+            logger.info(f"⏩ Skipping {batch_name} — {len(existing_shards)//2} shard(s) already exist.")
             continue
 
-        logger.info(f"⚙️ Starting batch {batch['batch_name']} ({len(batch['files'])} files)...")
+        logger.info(f"🚀 Starting batch {batch_name} with {len(batch['files'])} source files...")
         gen = batch["gen"]()
-
         shard_index = 0
-        ids_arr = np.empty(max_tokens_per_shard, dtype=np.uint16)
 
+        ids_arr = np.empty(max_tokens_per_shard, dtype=np.uint16)
         offset_capacity = 50_000_000
         offset_arr = np.empty(offset_capacity, dtype=np.int64)
         offset_arr[0] = 0
-        offset_pos = 1
         pos = 0
+        offset_pos = 1
         total_tokens = 0
 
         def flush_shard():
             nonlocal shard_index, pos, offset_pos, total_tokens
             if pos == 0:
                 return
-            shard_prefix = out_path / f"{batch['batch_name']}_shard_{shard_index:05d}"
+            shard_prefix = out_path / f"{batch_name}_shard_{shard_index:05d}"
+
             np.save(f"{shard_prefix}_ids.npy", ids_arr[:pos])
             np.save(f"{shard_prefix}_offsets.npy", offset_arr[:offset_pos])
 
@@ -90,8 +102,7 @@ def shards_from_corpus(
                 json.dump(meta, f, indent=2)
 
             logger.info(
-                f"🧩 Saved {shard_prefix.name}: "
-                f"{pos:,} tokens, {meta['num_examples']} docs"
+                f"💾 Saved {shard_prefix.name}: {pos:,} tokens, {meta['num_examples']} docs"
             )
 
             shard_index += 1
@@ -100,45 +111,41 @@ def shards_from_corpus(
             offset_arr[0] = 0
             total_tokens = 0
 
-        # Iterate through generator
         batch_idx = 0
+        # Process batches
         for text_batch in gen:
-            batch_idx += 1
             t0 = time.perf_counter()
-
+            batch_idx += 1
             try:
                 new_ids, new_offsets = process_text_batch(
-                    text_batch,
-                    total_offset=offset_arr[offset_pos - 1],
+                    text_batch, total_offset=offset_arr[offset_pos - 1],
                     split_processes=split_processes,
                     chunk_size=chunk_size
                 )
-            except Exception as e:
-                logger.warning(f"Error processing document in {batch['batch_name']}: {e}")
-                continue
+                n_ids = len(new_ids)
+                if pos + n_ids >= max_tokens_per_shard:
+                    flush_shard()
+                ids_arr[pos:pos + n_ids] = new_ids
+                n_offsets = len(new_offsets)
+                if offset_pos + n_offsets > offset_capacity:
+                    new_cap = int(offset_capacity * 1.5)
+                    offset_arr = np.resize(offset_arr, new_cap)
+                    offset_capacity = new_cap
+                offset_arr[offset_pos:offset_pos + n_offsets] = new_offsets
+                pos += n_ids
+                offset_pos += n_offsets
+                total_tokens += n_ids
 
+            except Exception as e:
+                logger.warning(f"⚠️ Error processing document in {batch_name}: {e}")
+                continue
             elapsed = time.perf_counter() - t0
             logger.info(
-                f"⏱️ Batch {batch_idx}: split_processes={split_processes}, "
+                f"⏱️ Batch {batch_name}:{batch_idx} | split_processes={split_processes}, "
                 f"{len(text_batch):,} docs → {len(new_ids):,} tokens in {elapsed:.2f}s "
                 f"({len(new_ids) / max(elapsed,1e-6):,.0f} tok/s)"
             )
 
-            n_ids = len(new_ids)
-            if pos + n_ids >= max_tokens_per_shard:
-                flush_shard()
-
-            ids_arr[pos:pos + n_ids] = new_ids
-            n_offsets = len(new_offsets)
-            if offset_pos + n_offsets > offset_capacity:
-                new_cap = int(offset_capacity * 1.5)
-                offset_arr = np.resize(offset_arr, new_cap)
-                offset_capacity = new_cap
-            offset_arr[offset_pos:offset_pos + n_offsets] = new_offsets
-            pos += n_ids
-            offset_pos += n_offsets
-            total_tokens += n_ids
-
         flush_shard()
 
-        logger.info(f"✅ Finished batch {batch['batch_name']}")
+        logger.info(f"✅ Finished batch {batch_name}")

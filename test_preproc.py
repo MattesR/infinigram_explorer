@@ -35,6 +35,18 @@ def main():
         default=10,
         help="Maximum number of files to stream simultaneously per dataset batch (default: 10)."
     )
+    parser.add_argument(
+        "--check_dir",
+        type=str,
+        default='.',
+        help="Where to check for existing shards (default: '.')"
+    )
+    parser.add_argument(
+        "--batch_offset",
+        type=int,
+        default=0,
+        help="offset to start batching from (default: 0)"
+    )    
 
     args = parser.parse_args()
 
@@ -59,7 +71,8 @@ def main():
         yield_style="raw",
         yield_batch_size=args.yield_batch_size,
         max_files_per_stream=args.max_files_per_stream,
-        disable_caching=False ## I think that's needed for not making it IO bound
+        disable_caching=False, ## I think that's needed for not making it IO bound
+        batch_offest=args.batch_offset
     )
     chunk_size = max(1000, args.yield_batch_size // args.split_processes)
 
@@ -68,7 +81,8 @@ def main():
         corpus,
         out_dir=args.out_dir,
         split_processes=args.split_processes,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
+        check_dir = args.check_dir,
     )
 
 if __name__ == "__main__":
