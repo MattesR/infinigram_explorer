@@ -1,19 +1,13 @@
 import os
-import json
-from transformers import AutoTokenizer
 import datasets
 from datasets import load_dataset, Features, Value
 import time
 from tqdm import tqdm
 from pathlib import Path, PurePosixPath
-from collections import defaultdict
 import click
 import yaml
 from gensim.models import Word2Vec
-from gensim.test.utils import datapath
-from gensim import utils
 from gensim.utils import simple_preprocess
-from typing import Iterator
 from utils import get_token, clean_html
 from loguru import logger
 import logging
@@ -365,7 +359,7 @@ class HFStreamingCorpus:
         }
 
 class HFCorpusBuffered(HFStreamingCorpus):
-    def __init__(self, *args, buffer_size=2, yield_batch_size=1, **kwargs):
+    def __init__(self, *args, buffer_size=1, yield_batch_size=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.buffer_size = buffer_size
         self.queue = Queue(maxsize=buffer_size)
@@ -427,7 +421,7 @@ class HFCorpusBuffered(HFStreamingCorpus):
                     # Track this dataset for later cleanup
                     self.queue.put((path, ds)) 
                 except Exception as e:
-                    logger.error(f"[Producer] Failed to load batch {path}: {e}")
+                    logger.exception(f"[Producer] ❌ Failed to load batch {path}")
                     
                     # Clean up any partial downloads from failed batch
                     if ds is not None:
@@ -845,13 +839,14 @@ def read_config(config_path: str) -> dict:
             logger.warning(f"Config key '{key}' missing; using default value: {default_value}")
     if config['tokenizer_name']:
         logger.info(f'load tokenizer, {config["tokenizer_name"]}')
+        from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(config['tokenizer_name'], token=HF_TOKEN)
         config['tokenizer'] = tokenizer
     else:
         config['tokenizer'] = None
     
     if 'path' in user_config:
-        config['corpus_iterable'] = MyJsonCorpus(user_config['path'])
+        pass
     elif 'huggingface_url' in user_config:
         hf_kwargs = {
             "dataset_name": user_config["huggingface_url"],

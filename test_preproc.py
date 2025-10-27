@@ -1,7 +1,6 @@
 import argparse
 from word2vec import HFCorpusBuffered
 import corpus_preprocessing
-import os
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess Hugging Face corpus into shards.")
@@ -60,14 +59,16 @@ def main():
         yield_style="raw",
         yield_batch_size=args.yield_batch_size,
         max_files_per_stream=args.max_files_per_stream,
-        disable_caching=True ## I think that's needed for not making it IO bound
+        disable_caching=False ## I think that's needed for not making it IO bound
     )
+    chunk_size = max(1000, args.yield_batch_size // args.split_processes)
 
     # Run the preprocessing
     corpus_preprocessing.shards_from_corpus(
         corpus,
         out_dir=args.out_dir,
         split_processes=args.split_processes,
+        chunk_size=chunk_size
     )
 
 if __name__ == "__main__":

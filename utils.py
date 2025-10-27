@@ -6,6 +6,8 @@ from huggingface_hub import HfApi
 from spacy.lang.en import English
 import multiprocessing as mp
 import os 
+import re
+
 def clean_html(text):
     # Decode HTML entities (e.g., &lt;, &amp;, &nbsp;)
     text = html.unescape(text)
