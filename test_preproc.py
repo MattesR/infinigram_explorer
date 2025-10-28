@@ -1,5 +1,5 @@
 import argparse
-from word2vec import HFCorpusBuffered
+from hf_corpus import HFCorpusBuffered
 import corpus_preprocessing
 
 def main():
@@ -46,7 +46,13 @@ def main():
         type=int,
         default=0,
         help="offset to start batching from (default: 0)"
-    )    
+    )
+    parser.add_argument(
+        "--disable_caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable Hugging Face dataset caching (default: True). Use --no-disable_caching to enable caching."
+    )
 
     args = parser.parse_args()
 
@@ -64,6 +70,7 @@ def main():
     print(f"  Split processes:   {args.split_processes}")
     print(f"  Yield batch size:  {args.yield_batch_size}")
     print(f"  Max files per stream: {args.max_files_per_stream}")
+    print(f"  Disable caching:     {args.disable_caching}")
 
     # Initialize the corpus
     corpus = HFCorpusBuffered(
@@ -71,7 +78,7 @@ def main():
         yield_style="raw",
         yield_batch_size=args.yield_batch_size,
         max_files_per_stream=args.max_files_per_stream,
-        disable_caching=False, ## I think that's needed for not making it IO bound
+        disable_caching=args.disable_caching, 
         batch_offest=args.batch_offset
     )
     chunk_size = max(1000, args.yield_batch_size // args.split_processes)
