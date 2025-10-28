@@ -71,6 +71,7 @@ def main():
     print(f"  Yield batch size:  {args.yield_batch_size}")
     print(f"  Max files per stream: {args.max_files_per_stream}")
     print(f"  Disable caching:     {args.disable_caching}")
+    print(f"  Batch Offeset:     {args.batch_offset}")
 
     # Initialize the corpus
     corpus = HFCorpusBuffered(

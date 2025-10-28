@@ -346,10 +346,11 @@ class HFCorpusBuffered(HFStreamingCorpus):
                 ordered_batches = batch_items
             else:
                 # Split batches into those divisible by offset (n, 2n, 3n, …)
-                divisible = [b for i, b in enumerate(batch_items, start=1) if i % self.batch_offset == 0]
+                divisible = [b for i, b in enumerate(batch_items[1:], start=1) if i % self.batch_offset == 0]
+                divisible.append(batch_items[0])
                 rest = [b for i, b in enumerate(batch_items, start=1) if i % self.batch_offset != 0]
                 ordered_batches = divisible + rest
-            for path, batch in enumerate(ordered_batches):
+            for path, batch in ordered_batches:
                 if self._stop_event.is_set():
                     logger.info("[Producer] Stop event set, ending early")
                     break   
