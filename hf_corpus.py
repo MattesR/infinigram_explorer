@@ -12,11 +12,6 @@ import threading
 from queue import Queue
 import gc
 
-# Set HuggingFace timeout and cache settings
-os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '3600'  # 1 hour timeout
-os.environ['DATASETS_DOWNLOAD_TIMEOUT'] = '3600'  # 1 hour timeout
-os.environ['HF_DATASETS_CACHE_MAX_SIZE'] = '50GB'  # Limit cache size
-os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = 'false'  # Keep progress bars for debugging
 
 
 FEATURES = Features({

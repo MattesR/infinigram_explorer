@@ -45,11 +45,12 @@ def train_word2vec_model(
     gensim_logger.handlers.clear()
     gensim_logger.addHandler(LoguruHandler())
     if tokenizer:
-        vocab = list(tokenizer.get_vocab().keys())
+        vocab = [i for i,_ in enumerate(tokenizer.get_vocab().keys())]
         logger.info(f'built vocab from tokenizer, length {len(vocab)}')
         model = Word2Vec(
             vector_size=vector_size,
             window=window,
+            batch_words=50000,
             min_count=1,  # Set to 1 since we're using fixed vocab
             workers=workers,
             sg=kwargs.get('sg', 0),  # Add sg parameter if in kwargs
@@ -84,84 +85,105 @@ def train_word2vec_model(
 def read_config(config_path: str) -> dict:
     """
     Reads a YAML config file and fills omitted values with defaults.
-    Logs warnings for each defaulted value.
+    Logs warnings for each defaulted value and constructs the corpus object
+    depending on 'corpus_type' (hf_stream, hf_buffered, token_shards).
     """
     DEFAULT_CONFIG = {
-    "vector_size": 100,
-    "window": 5,
-    "min_count": 5,
-    "workers": 4,
-    "sg": 0,
-    "epochs": 5,
-    "batch_words": 10_000,
-    "tokenizer_name": None,
-    'buffered': False,
-    'revision': None,
-    'use_features': False,
-    'max_files_per_stream': 4,
-    'disable_caching': False,
-    'total_examples': 3_08_000_000
+        "vector_size": 100,
+        "window": 5,
+        "min_count": 5,
+        "workers": 4,
+        "sg": 0,
+        "epochs": 5,
+        "batch_words": 10_000,
+        "tokenizer_name": None,
+        "corpus_type": "hf_stream",   # new unified corpus selector
+        "revision": None,
+        "use_features": False,
+        "max_files_per_stream": 4,
+        "disable_caching": False,
+        "total_examples": 3_080_000_000,
+        "shard_root": None,            # for token_shards mode
+        "batch_size": 1
     }
+
     config_path = Path(config_path)
     with open(config_path / 'config.yml', 'r') as f:
         user_config = yaml.safe_load(f) or {}
 
-    config = user_config.copy()  # start with all user keys (including extras)
+    config = user_config.copy()
 
+    # === Fill defaults ===
     for key, default_value in DEFAULT_CONFIG.items():
         if key not in config:
             config[key] = default_value
             logger.warning(f"Config key '{key}' missing; using default value: {default_value}")
-    if config['tokenizer_name']:
-        logger.info(f'load tokenizer, {config["tokenizer_name"]}')
+
+    # === Tokenizer handling ===
+    if config["tokenizer_name"]:
+        logger.info(f"Loading tokenizer: {config['tokenizer_name']}")
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(config['tokenizer_name'], token=get_token('HF_TOKEN'))
-        config['tokenizer'] = tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_name"], token=get_token("HF_TOKEN"))
+        config["tokenizer"] = tokenizer
     else:
-        config['tokenizer'] = None
-    
-    if 'path' in user_config:
-        pass
-    elif 'huggingface_url' in user_config:
+        config["tokenizer"] = None
+
+    # === Corpus setup ===
+    corpus_type = config["corpus_type"].lower()
+    logger.info(f"Initializing corpus of type '{corpus_type}'")
+
+    if corpus_type in ("hf_stream", "hf_buffered"):
+        if "huggingface_url" not in user_config:
+            raise ValueError("Config must contain 'huggingface_url' when using hf_stream or hf_buffered corpus types")
+
         hf_kwargs = {
             "dataset_name": user_config["huggingface_url"],
             "split": user_config.get("split", "train"),
             "text_field": user_config.get("text_field", "text"),
-            "subset": user_config.get("subset"), 
+            "subset": user_config.get("subset"),
             "max_sentences": user_config.get("max_sentences", None),
             "revision": user_config.get("revision", None),
-            "use_features": config.get("use_features", False),  # PASS THE PARAMETER
+            "use_features": config.get("use_features", False),
             "max_files_per_stream": config.get("max_files_per_stream", 4),
             "disable_caching": config.get("disable_caching", False),
-            "tokenizer": config.get("tokenizer", None)
+            "tokenizer": config.get("tokenizer", None),
         }
-        if config['buffered']:
+
+        if corpus_type == "hf_buffered":
             from hf_corpus import HFCorpusBuffered
-            config['corpus_iterable'] = HFCorpusBuffered(**hf_kwargs)      
+            config["corpus_iterable"] = HFCorpusBuffered(**hf_kwargs)
         else:
             from hf_corpus import HFStreamingCorpus
-            config['corpus_iterable'] = HFStreamingCorpus(**hf_kwargs)
+            config["corpus_iterable"] = HFStreamingCorpus(**hf_kwargs)
+
+    elif corpus_type == "token_shards":
+        shard_root = config.get("shard_root")
+        if not shard_root:
+            raise ValueError("For corpus_type='token_shards', 'shard_root' must be specified in config.yml")
+        from token_corpus import TokenCorpus
+        config["corpus_iterable"] = TokenCorpus(shard_root, batch_size=config['batch_size'], max_sentences=user_config.get("max_sentences", None))
     else:
-        raise ValueError("Config must contain either 'path' or 'huggingface_url'")
-    print(config)
-    if 'outpath' not in config:
-        config['output_dir'] = Path(config_path)
-        print('adding outpath')
-        logger.warning(f'adding default outpath {config["output_dir"]} to config')
-    
-    if isinstance(config['workers'], str):
+        raise ValueError(f"Invalid corpus_type '{corpus_type}'. Must be one of: hf_stream, hf_buffered, token_shards")
+
+    # === Output path ===
+    if "outpath" not in config:
+        config["output_dir"] = Path(config_path)
+        logger.warning(f"Adding default output_dir={config['output_dir']} to config")
+
+    # === Worker handling ===
+    if isinstance(config["workers"], str):
         total_cpus = multiprocessing.cpu_count()
-        if config['workers'].lower() == "all":
-            config['workers'] = max(1, total_cpus - 1)
-            logger.info(f"setting workers to {config['workers']} (all)")
-        elif config['workers'].lower() == 'max':
-            config['workers'] = max(1, total_cpus)
-            logger.info(f"setting workers to {config['workers']} (max)")
+        workers_str = config["workers"].lower()
+        if workers_str == "all":
+            config["workers"] = max(1, total_cpus - 1)
+            logger.info(f"Setting workers to {config['workers']} (all cores minus one)")
+        elif workers_str == "max":
+            config["workers"] = max(1, total_cpus)
+            logger.info(f"Setting workers to {config['workers']} (all cores)")
         else:
-            raise ValueError(f'malformed workers count, must be an int, ALL or MAX, got {config["workers"]}')
+            raise ValueError(f"Malformed workers count, must be int, 'ALL', or 'MAX'; got '{config['workers']}'")
 
     return config
-
 
 def model_from_config(config_dir):
     if isinstance(config_dir,str):
