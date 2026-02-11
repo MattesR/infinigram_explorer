@@ -122,8 +122,8 @@ def benchmark_expand_wk_grid(
 
 def main():
     ap = argparse.ArgumentParser(description="Grid benchmark for beam_search.expand_wk (w,k).")
-    ap.add_argument("--index", required=True, default="/home/mruc/first_index/")
-    ap.add_argument("--model", required=True, default = "meta-llama/Llama-2-7b-hf")
+    ap.add_argument("--index", default="/home/mruc/first_index/")
+    ap.add_argument("--model", default = "meta-llama/Llama-2-7b-hf")
     ap.add_argument("--query", default="", help="Prompt")
     ap.add_argument("--ws", default="5,8,10,12", help="Comma list, e.g. 5,10,20")
     ap.add_argument("--ks", default="5,8,10,12", help="Comma list, e.g. 1,3,5")
