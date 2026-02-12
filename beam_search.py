@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+from infini_gram.engine import InfiniGramEngine
+from transformers import AutoTokenizer
 
 # infini-gram docs:
 # - InfiniGramEngine(index_dir=..., eos_token_id=...)
@@ -107,6 +109,14 @@ def expand_wk(
     # Optional: sort best-first by logprob (highest = best)
     results.sort(key=lambda r: r["logprob"], reverse=True)
     return results
+
+
+def load_default_enginge():
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", add_bos_token=False, add_eos_token=False)
+    engine = InfiniGramEngine(index_dir='/home/mruc/first_index/', eos_token_id=tokenizer.eos_token_id)
+    return tokenizer,engine
+                                              
+                                              
 
 
 # Example usage:
