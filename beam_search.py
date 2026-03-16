@@ -2,13 +2,130 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 from infini_gram.engine import InfiniGramEngine
 from transformers import AutoTokenizer
 import numpy as np
+from sentence_transformers import SentenceTransformer
+import torch
 
 Evaluator = Callable[[Tuple[int, ...]], float]
+
+
+def next_token_semantic_delta(
+    engine,
+    tokenizer,
+    st_model,  # preloaded SentenceTransformer
+    query: str,
+    reference_text: str,
+    *,
+    use_infgram: bool = True,
+    max_support: Optional[int] = None,
+    normalize: bool = True,
+    prefix_text: str = "",
+    ban_token_ids: Optional[set[int]] = None,
+    top_n: Optional[int] = None,
+    batch_size: int = 64,
+) -> List[Dict[str, Union[int, float, str]]]:
+    """
+    For a given query (string), compute the next-token distribution using infinigram,
+    and for each candidate next token return:
+      - token_id
+      - token_str (decoded)
+      - prob
+      - base_sim: cosine(query, reference)
+      - new_sim: cosine(query+token, reference)
+      - delta_sim: new_sim - base_sim
+
+    Notes:
+    - Uses SentenceTransformer encode in batch for efficiency.
+    - If normalize=True, cosine similarity is just dot product of normalized embeddings.
+    - top_n optionally truncates to the top_n tokens by probability before semantic scoring.
+    """
+    # --- next-token distribution ---
+    prompt_ids = tokenizer.encode(query, add_special_tokens=False)
+    fn = engine.infgram_ntd if use_infgram else engine.ntd
+    kwargs = {} if max_support is None else {"max_support": max_support}
+    out = fn(prompt_ids=prompt_ids, **kwargs)
+
+    dist = out.get("result_by_token_id", {}) or {}
+    if not dist:
+        return []
+
+    banned = ban_token_ids or set()
+
+    # Collect candidates (token_id, prob), filter banned/zero
+    cands = [
+        (int(tok), float(info.get("prob", 0.0)))
+        for tok, info in dist.items()
+        if float(info.get("prob", 0.0)) > 0.0 and int(tok) not in banned
+    ]
+    cands.sort(key=lambda x: x[1], reverse=True)
+    if top_n is not None:
+        cands = cands[:top_n]
+
+    # --- semantic baseline ---
+    ref_emb = st_model.encode(reference_text, normalize_embeddings=normalize)
+    ref_emb = np.asarray(ref_emb, dtype=np.float32)
+
+    base_text = prefix_text + query
+    base_emb = st_model.encode(base_text, normalize_embeddings=normalize)
+    base_emb = np.asarray(base_emb, dtype=np.float32)
+
+    if normalize:
+        base_sim = float(np.dot(base_emb, ref_emb))
+    else:
+        denom = float(np.linalg.norm(base_emb) * np.linalg.norm(ref_emb))
+        base_sim = float(np.dot(base_emb, ref_emb) / denom) if denom > 0 else float("-inf")
+
+    # --- build texts for each next token (batch) ---
+    # decode each token by itself (not necessarily a standalone "word")
+    token_strs = [tokenizer.decode([tok_id]) for tok_id, _ in cands]
+
+    # text after appending token (tokenizer-aware)
+    # Use decode(prompt_ids + [tok]) so spacing matches tokenizer behavior.
+    full_texts = [prefix_text + tokenizer.decode(prompt_ids + [tok_id]) for tok_id, _ in cands]
+
+    embs = st_model.encode(full_texts, normalize_embeddings=normalize, batch_size=batch_size, show_progress_bar=False)
+    embs = np.asarray(embs, dtype=np.float32)
+
+    # --- compute similarities and deltas ---
+    results: List[Dict[str, Union[int, float, str]]] = []
+    if normalize:
+        sims = embs @ ref_emb
+        for (tok_id, prob), tok_str, new_sim in zip(cands, token_strs, sims):
+            new_sim = float(new_sim)
+            results.append(
+                {
+                    "token_id": tok_id,
+                    "token_str": tok_str,
+                    "prob": prob,
+                    "base_sim": base_sim,
+                    "new_sim": new_sim,
+                    "delta_sim": new_sim - base_sim,
+                }
+            )
+    else:
+        ref_norm = float(np.linalg.norm(ref_emb))
+        sims = []
+        for e in embs:
+            denom = float(np.linalg.norm(e) * ref_norm)
+            sims.append(float(np.dot(e, ref_emb) / denom) if denom > 0 else float("-inf"))
+        for (tok_id, prob), tok_str, new_sim in zip(cands, token_strs, sims):
+            results.append(
+                {
+                    "token_id": tok_id,
+                    "token_str": tok_str,
+                    "prob": prob,
+                    "base_sim": base_sim,
+                    "new_sim": new_sim,
+                    "delta_sim": new_sim - base_sim,
+                }
+            )
+
+    return results
+
 
 
 @dataclass(frozen=True)
@@ -79,6 +196,26 @@ def make_semantic_cosine_evaluator(
         return float(np.dot(emb, ref_emb) / denom) if denom > 0 else float("-inf")
 
     return evaluator
+
+
+def make_semantic_batch_scorer(tokenizer, st_model, reference_text, *, normalize=True, prefix_text=""):
+    ref_emb = st_model.encode(reference_text, normalize_embeddings=normalize)
+    ref_emb = np.asarray(ref_emb, dtype=np.float32)
+
+    def score_batch(token_id_seqs):
+        texts = [prefix_text + tokenizer.decode(list(ids)) for ids in token_id_seqs]
+        embs = st_model.encode(texts, normalize_embeddings=normalize, batch_size=64, show_progress_bar=False)
+        embs = np.asarray(embs, dtype=np.float32)
+        if normalize:
+            return [float(np.dot(e, ref_emb)) for e in embs]
+        ref_norm = np.linalg.norm(ref_emb)
+        out = []
+        for e in embs:
+            denom = (np.linalg.norm(e) * ref_norm)
+            out.append(float(np.dot(e, ref_emb) / denom) if denom > 0 else float("-inf"))
+        return out
+
+    return score_batch
 
 
 def score_semantic_batch(
@@ -247,7 +384,11 @@ def beam_search_delayed_prune(
     return results, total_created
 
 
-def load_default_engine():
+def load_default_engine(with_embedding_model=True):
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", add_bos_token=False, add_eos_token=False)
     engine = InfiniGramEngine(index_dir="/home/mruc/first_index/", eos_token_id=tokenizer.eos_token_id)
+    if with_embedding_model:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_id = "google/embeddinggemma-300M"
+        model = SentenceTransformer(model_id).to(device=device)
     return tokenizer, engine
