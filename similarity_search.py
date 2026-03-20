@@ -174,21 +174,32 @@ def similarity_search(
 
         # Step 4: Encode with SPLADE and rank (batched to avoid OOM)
         print(f"Step 4/4: Encoding {len(valid_strings)} candidates with SPLADE and ranking...")
-        print(f"  Encoding in batches of {batch_size}...")
-
-        all_scores = []
-        for i in tqdm(range(0, len(valid_strings), batch_size), desc="Encoding"):
-            batch_strings = valid_strings[i:i + batch_size]
-            batch_embeddings = model.encode_document(
-                batch_strings,
-                batch_size=batch_size,
-                show_progress_bar=False,
-            )
-            batch_scores = model.similarity(ref_embedding, batch_embeddings)[0]
-            all_scores.append(batch_scores.cpu())
-            del batch_embeddings
+        encode_chunk_size = min(batch_size, 5000)
+        print(f"  Encoding in chunks of {encode_chunk_size}...")
 
         import torch
+
+        # Move reference to CPU for scoring
+        ref_cpu = ref_embedding.cpu() if hasattr(ref_embedding, 'cpu') else ref_embedding
+
+        all_scores = []
+        for i in tqdm(range(0, len(valid_strings), encode_chunk_size), desc="Encoding"):
+            batch_strings = valid_strings[i:i + encode_chunk_size]
+            batch_embeddings = model.encode_document(
+                batch_strings,
+                batch_size=256,  # small forward pass batch
+                show_progress_bar=False,
+                convert_to_tensor=True,
+            )
+            # Move to CPU immediately and score there
+            batch_embeddings_cpu = batch_embeddings.cpu()
+            del batch_embeddings
+            torch.cuda.empty_cache()
+
+            batch_scores = model.similarity(ref_cpu, batch_embeddings_cpu)[0]
+            all_scores.append(batch_scores)
+            del batch_embeddings_cpu
+
         scores = torch.cat(all_scores)
         top_k = min(max_candidates_per_query, len(valid_strings))
         top_indices = scores.argsort(descending=True)[:top_k].tolist()
