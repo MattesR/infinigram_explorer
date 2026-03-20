@@ -9,7 +9,213 @@ from tqdm.auto import tqdm
 import copy
 
 
+def add_text_and_children_str(
+    out_data: Dict[Tuple[int, ...], Dict[str, Any]],
+    tokenizer,
+    in_place: bool = True,
+) -> Dict[Tuple[int, ...], Dict[str, Any]]:
+    target = out_data if in_place else copy.deepcopy(out_data)
 
+    for k, v in tqdm(target.items(), desc="Adding text and children_str", unit="node"):
+        # Decoded text for this node
+        v['text'] = tokenizer.decode(list(k))
+
+        # Children as a dict of {token_id: decoded_string}
+        v['children_str'] = {
+            child_id: tokenizer.decode([child_id])
+            for child_id in tqdm(v.get('children', []), desc=f"children of {k}", leave=False, unit="child")
+        }
+
+    return target
+
+
+import pandas as pd
+
+def get_leaf_df_from_out_data(out_data):
+    leaves = {k: v for k, v in out_data.items() if not v.get('children')}
+    rows = []
+    for leaf_key in leaves:
+        # reconstruct path: (), (t1,), (t1,t2,), ...
+        path_keys = [leaf_key[:i] for i in range(len(leaf_key) + 1)]
+        for node_key in path_keys:
+            node = out_data.get(node_key)
+            if node is None:
+                continue
+            rows.append({
+                'leaf_id':       leaf_key,
+                'node_key':      node_key,
+                'depth':         node['depth'],
+                'gemma_cos_sim':       node.get('gemma_cos_sim'),
+                'gemma_delta_cos_sim': node.get('delta_gemma_cos_sim'),
+                'qwen_small_cos_sim':       node.get('qwen_small_cos_sim'),
+                'qwen_small_delta_cos_sim': node.get('delta_qwen_small_cos_sim'),
+                'text':          node.get('text', ''),
+            })
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.pyplot as plt
+
+
+def plot_cos_sim_analysis(df, outpath, prefix):
+    """
+    Plot cos_sim and delta_cos_sim analysis for a given model prefix.
+
+    Args:
+        df:      DataFrame with columns {prefix}_cos_sim, {prefix}_delta_cos_sim, depth, leaf_id
+        outpath: filepath for the output PDF (e.g. 'analysis_gemma.pdf')
+        prefix:  column prefix, e.g. 'gemma' or 'qwen_small'
+    """
+    cos_col   = f"{prefix}_cos_sim"
+    delta_col = f"{prefix}_delta_cos_sim"
+
+    with PdfPages(outpath) as pdf:
+
+        # 1. Mean cos_sim by depth
+        fig, ax = plt.subplots()
+        df.groupby('depth')[cos_col].mean().plot(ax=ax)
+        ax.set_title(f'[{prefix}] Mean cos_sim by depth')
+        ax.set_xlabel('Depth')
+        ax.set_ylabel('cos_sim')
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 2. Mean delta_cos_sim by depth
+        fig, ax = plt.subplots()
+        df.groupby('depth')[delta_col].mean().plot(ax=ax)
+        ax.set_title(f'[{prefix}] Mean delta_cos_sim by depth')
+        ax.set_xlabel('Depth')
+        ax.set_ylabel('delta_cos_sim')
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 3. Distribution of cos_sim per depth (boxplot)
+        fig, ax = plt.subplots()
+        df.boxplot(column=cos_col, by='depth', ax=ax)
+        ax.set_title(f'[{prefix}] cos_sim distribution by depth')
+        fig.suptitle('')
+        ax.set_xlabel('Depth')
+        ax.set_ylabel('cos_sim')
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 4. Distribution of delta_cos_sim per depth (boxplot)
+        fig, ax = plt.subplots()
+        df.boxplot(column=delta_col, by='depth', ax=ax)
+        ax.set_title(f'[{prefix}] delta_cos_sim distribution by depth')
+        fig.suptitle('')
+        ax.set_xlabel('Depth')
+        ax.set_ylabel('delta_cos_sim')
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 5. Overall distribution of cos_sim (histogram + KDE)
+        fig, ax = plt.subplots()
+        df[cos_col].dropna().plot.hist(bins=50, density=True, alpha=0.6, ax=ax)
+        df[cos_col].dropna().plot.kde(ax=ax)
+        ax.set_title(f'[{prefix}] Overall cos_sim distribution')
+        ax.set_xlabel('cos_sim')
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 6. Overall distribution of delta_cos_sim (histogram + KDE)
+        fig, ax = plt.subplots()
+        df[delta_col].dropna().plot.hist(bins=50, density=True, alpha=0.6, ax=ax)
+        df[delta_col].dropna().plot.kde(ax=ax)
+        ax.set_title(f'[{prefix}] Overall delta_cos_sim distribution')
+        ax.set_xlabel('delta_cos_sim')
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        pdf.infodict().update({'Title': f'Cosine Similarity Analysis — {prefix}'})
+
+    print(f"Saved {outpath}")
+
+
+def plot_top_leaves_trajectories(df, outpath, prefix, top_ns=(100, 1000, 10000)):
+    cos_col = f"{prefix}_cos_sim"
+
+    leaf_final = (
+        df[df['leaf_id'].notna() & (df['depth'] > 0)]
+        .loc[lambda x: x.groupby('leaf_id')['depth'].transform('max') == x['depth']]
+        .set_index('leaf_id')[cos_col]
+        .sort_values(ascending=False)
+    )
+
+    with PdfPages(outpath) as pdf:
+        for n in top_ns:
+            if n > len(leaf_final):
+                print(f"Skipping top-{n}: only {len(leaf_final)} leaves available")
+                continue
+
+            top_leaves = leaf_final.iloc[:n].index
+            subset = df[df['leaf_id'].isin(top_leaves)]
+            all_traj = df.groupby('depth')[cos_col].mean()
+            traj = subset.groupby('depth')[cos_col].agg(['mean', 'std', 'median'])
+
+            # 1. Mean/median trajectory with std band
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(traj.index, traj['mean'],   label='mean',   color='steelblue')
+            ax.plot(traj.index, traj['median'], label='median', color='orange', linestyle='--')
+            ax.fill_between(
+                traj.index,
+                traj['mean'] - traj['std'],
+                traj['mean'] + traj['std'],
+                alpha=0.2, color='steelblue', label='±1 std'
+            )
+            ax.set_title(f'[{prefix}] cos_sim trajectory — top {n} leaves')
+            ax.set_xlabel('Depth')
+            ax.set_ylabel('cos_sim')
+            ax.legend()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            # 2. Boxplot per depth
+            fig, ax = plt.subplots(figsize=(8, 5))
+            subset.boxplot(column=cos_col, by='depth', ax=ax)
+            ax.set_title(f'[{prefix}] cos_sim spread by depth — top {n} leaves')
+            fig.suptitle('')
+            ax.set_xlabel('Depth')
+            ax.set_ylabel('cos_sim')
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            # 3. Top-n vs all leaves
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(all_traj.index, all_traj.values, label='all leaves',      color='grey',      linestyle='--')
+            ax.plot(traj.index,     traj['mean'],     label=f'top {n} leaves', color='steelblue')
+            ax.set_title(f'[{prefix}] Top {n} vs all leaves — mean cos_sim by depth')
+            ax.set_xlabel('Depth')
+            ax.set_ylabel('cos_sim')
+            ax.legend()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            # 4. Quantile bands
+            quantiles = (
+                subset.groupby('depth')[cos_col]
+                .quantile([0.1, 0.25, 0.5, 0.75, 0.9])
+                .unstack(level=-1)
+            )
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(quantiles.index, quantiles[0.5], label='median (p50)', color='steelblue', linewidth=2)
+            ax.fill_between(quantiles.index, quantiles[0.25], quantiles[0.75],
+                            alpha=0.3, color='steelblue', label='p25–p75')
+            ax.fill_between(quantiles.index, quantiles[0.1],  quantiles[0.9],
+                            alpha=0.15, color='steelblue', label='p10–p90')
+            ax.set_title(f'[{prefix}] Quantile bands — top {n} leaves')
+            ax.set_xlabel('Depth')
+            ax.set_ylabel('cos_sim')
+            ax.legend()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        pdf.infodict().update({'Title': f'Top Leaves Trajectory Analysis — {prefix}'})
+
+    print(f"Saved {outpath}")
 
 
 def add_cos_sim_to_out_data_batched(
@@ -23,6 +229,7 @@ def add_cos_sim_to_out_data_batched(
     batch_size: int = 128,
     in_place: bool = True,
     model_prefix = None,
+    sparse_model = False
 ) -> Dict[Tuple[int, ...], Dict[str, Any]]:
     """
     Post-hoc: add cos_sim + delta_cos_sim to out_data, but encode in batches.
@@ -40,8 +247,11 @@ def add_cos_sim_to_out_data_batched(
     target = out_data if in_place else copy.deepcopy(out_data)
     cos_sim_prefix = f'{model_prefix}_cos_sim' if model_prefix else 'cos_sim'
     # reference embedding once
-    ref = st_model.encode(reference_text, normalize_embeddings=normalize_embeddings, show_progress_bar=False)
-    ref = np.asarray(ref, dtype=np.float32)
+    if not sparse_model:
+        ref = st_model.encode(reference_text, normalize_embeddings=normalize_embeddings, show_progress_bar=False)
+        ref = np.asarray(ref, dtype=np.float32)
+    else:
+        ref = st_model.encode(reference_text, show_progress_bar=False)
 
     # sort keys so parents come before children (by length)
     keys = sorted(target.keys(), key=len)
@@ -53,15 +263,18 @@ def add_cos_sim_to_out_data_batched(
 
     # helper: compute cosine scores from embeddings
     def cos_from_embs(embs: np.ndarray) -> np.ndarray:
-        if normalize_embeddings:
+        if sparse_model:
+            return embs @ ref
+        elif normalize_embeddings:
             # normalized vectors -> cosine = dot with normalized ref (already normalized by st_model)
             return embs @ ref
-        ref_norm = np.linalg.norm(ref)
-        emb_norms = np.linalg.norm(embs, axis=1)
-        denom = emb_norms * ref_norm
-        # avoid divide-by-zero
-        denom = np.where(denom == 0, 1e-12, denom)
-        return (embs @ ref) / denom
+        else:
+            ref_norm = np.linalg.norm(ref)
+            emb_norms = np.linalg.norm(embs, axis=1)
+            denom = emb_norms * ref_norm
+            # avoid divide-by-zero
+            denom = np.where(denom == 0, 1e-12, denom)
+            return (embs @ ref) / denom
 
     pbar = tqdm(sorted(by_len.items()), desc="cos_sim by length", unit="len")
     for _, layer_keys in pbar:
@@ -223,3 +436,30 @@ def collect_infgram_ntd_tree(
         pbar.close()
 
     return out_data
+
+
+def get_tokens_from_splade(sparse_embedding, tokenizer):
+    """Extract tokens and weights from a SPLADE sparse embedding.
+    
+    Args:
+        sparse_embedding: PyTorch sparse tensor (e.g. shape [1, vocab_size])
+        tokenizer: the matching tokenizer (e.g. from naver/splade-cocondenser-ensembledistil)
+    
+    Returns:
+        List of (token, weight) tuples sorted by weight descending.
+    """
+    sparse = sparse_embedding.coalesce()
+    indices = sparse.indices()
+    values = sparse.values()
+
+    # indices shape is [ndim, nnz] — grab the vocab dimension (last row)
+    token_ids = indices[-1].tolist()
+    weights = values.tolist()
+
+    token_weight_pairs = [
+        (tokenizer.convert_ids_to_tokens(tid), w)
+        for tid, w in zip(token_ids, weights)
+    ]
+
+    token_weight_pairs.sort(key=lambda x: -x[1])
+    return token_weight_pairs
