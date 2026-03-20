@@ -18,8 +18,8 @@ Usage:
         query_len=len(input_ids),
         ext_len=3,
     )
-    # extensions is a numpy array of shape (total_occurrences, ext_len)
-    # each row is the ext_len token IDs following the query
+    # extensions is a numpy array of shape (total_occurrences, query_len + ext_len)
+    # each row is the query token IDs followed by ext_len extension token IDs
 """
 
 import mmap
@@ -56,13 +56,15 @@ def get_extensions(
 
     Returns:
         Tuple of:
-        - np.ndarray of shape (N, ext_len). Rows truncated by document
-          boundaries are right-padded with pad_token_id.
+        - np.ndarray of shape (N, query_len + ext_len). Each row contains the
+          query tokens followed by the extension tokens. Rows truncated by
+          document boundaries are right-padded with pad_token_id.
         - int: number of rows that were truncated.
     """
     index_dir = Path(index_dir)
     all_extensions = []
     total_truncated = 0
+    total_len = query_len + ext_len
 
     for s, (start, end) in enumerate(segment_by_shard):
         n = end - start
@@ -94,15 +96,13 @@ def get_extensions(
                 sa_padded[:, :sa_entry_bytes] = sa_raw
                 byte_offsets = np.frombuffer(sa_padded.tobytes(), dtype="<u8").reshape(n)
 
-                # For each byte offset, read ext_len tokens starting after the query
-                skip_bytes = query_len * token_width
-                max_read_bytes = ext_len * token_width
+                # For each byte offset, read query + ext_len tokens
+                max_read_bytes = total_len * token_width
                 dtype = np.dtype(f"<u{token_width}")
 
-                extensions = np.full((n, ext_len), pad_token_id, dtype=dtype)
+                extensions = np.full((n, total_len), pad_token_id, dtype=dtype)
                 for i in tqdm(range(n), desc=f"Shard {s}", leave=False):
                     occurrence_pos = int(byte_offsets[i])
-                    ext_start = occurrence_pos + skip_bytes
 
                     # Find the end of the enclosing document
                     doc_idx = np.searchsorted(doc_offsets, occurrence_pos, side="right") - 1
@@ -112,15 +112,15 @@ def get_extensions(
                         doc_end = tok_size
 
                     # Clamp read to document boundary and file boundary
-                    available_bytes = min(doc_end, tok_size) - ext_start
+                    available_bytes = min(doc_end, tok_size) - occurrence_pos
                     read_bytes = min(max_read_bytes, max(0, available_bytes))
                     n_tokens = read_bytes // token_width
 
                     if n_tokens > 0:
-                        raw = tok_mm[ext_start : ext_start + n_tokens * token_width]
+                        raw = tok_mm[occurrence_pos : occurrence_pos + n_tokens * token_width]
                         extensions[i, :n_tokens] = np.frombuffer(raw, dtype=dtype)
 
-                    if n_tokens < ext_len:
+                    if n_tokens < total_len:
                         total_truncated += 1
 
                 all_extensions.append(extensions)
@@ -129,6 +129,86 @@ def get_extensions(
                 tok_mm.close()
 
     return np.concatenate(all_extensions, axis=0), total_truncated
+
+
+def get_extensions_cnf(
+    index_dir: str,
+    ptrs_by_shard: list,
+    read_len: int = 100,
+    token_width: int = 2,
+    pad_token_id: int = 0,
+) -> tuple[np.ndarray, int]:
+    """
+    Extract token sequences from CNF query pointers by reading the tokenized
+    corpus directly. The pointers are already byte offsets into tokenized.{s},
+    so no suffix array lookup is needed.
+
+    Args:
+        index_dir: Path to the infini-gram index directory.
+        ptrs_by_shard: List of pointer lists from engine.find_cnf()['ptrs_by_shard'].
+        read_len: Number of tokens to read starting at each pointer.
+        token_width: Bytes per token in the tokenized file (2 for 16-bit).
+        pad_token_id: Token ID used to pad rows truncated by document boundaries.
+
+    Returns:
+        Tuple of:
+        - np.ndarray of shape (N, read_len). Each row is read_len tokens
+          starting from the pointer position, clamped to document boundaries.
+        - int: number of rows that were truncated.
+    """
+    index_dir = Path(index_dir)
+    all_sequences = []
+    total_truncated = 0
+
+    for s, ptrs in enumerate(ptrs_by_shard):
+        n = len(ptrs)
+        if n == 0:
+            continue
+
+        tok_path = index_dir / f"tokenized.{s}"
+        off_path = index_dir / f"offset.{s}"
+        tok_size = tok_path.stat().st_size
+
+        doc_offsets = np.memmap(off_path, dtype="<u8", mode="r")
+
+        with open(tok_path, "rb") as tok_f:
+            tok_mm = mmap.mmap(tok_f.fileno(), 0, access=mmap.ACCESS_READ)
+
+            try:
+                max_read_bytes = read_len * token_width
+                dtype = np.dtype(f"<u{token_width}")
+
+                sequences = np.full((n, read_len), pad_token_id, dtype=dtype)
+                for i, ptr in enumerate(tqdm(ptrs, desc=f"Shard {s}", leave=False)):
+                    ptr = int(ptr)
+
+                    # Find the end of the enclosing document
+                    doc_idx = np.searchsorted(doc_offsets, ptr, side="right") - 1
+                    if doc_idx + 1 < len(doc_offsets):
+                        doc_end = int(doc_offsets[doc_idx + 1])
+                    else:
+                        doc_end = tok_size
+
+                    # Also find the start of the document so we read from doc start
+                    doc_start = int(doc_offsets[doc_idx]) if doc_idx >= 0 else 0
+
+                    # Read from doc_start, clamped to document boundary
+                    available_bytes = min(doc_end, tok_size) - doc_start
+                    read_bytes = min(max_read_bytes, max(0, available_bytes))
+                    n_tokens = read_bytes // token_width
+
+                    if n_tokens > 0:
+                        raw = tok_mm[doc_start : doc_start + n_tokens * token_width]
+                        sequences[i, :n_tokens] = np.frombuffer(raw, dtype=dtype)
+
+                    if n_tokens < read_len:
+                        total_truncated += 1
+
+                all_sequences.append(sequences)
+            finally:
+                tok_mm.close()
+
+    return np.concatenate(all_sequences, axis=0), total_truncated
 
 
 def count_extensions(
@@ -169,21 +249,3 @@ def count_extensions(
     if top_k:
         return Counter(dict(counts.most_common(top_k))), truncated
     return counts, truncated
-
-
-
-def get_ranks(query, embeddings, model, batch_size=10_000):
-    """
-    Rank embeddings by similarity to query using a SparseEncoder model.
-
-    Args:
-        query: Query embedding tensor, shape (vocab_size,) or (1, vocab_size).
-        embeddings: Document embeddings tensor, shape (N, vocab_size).
-        model: SparseEncoder model with a .similarity() method.
-        batch_size: Batch size for similarity computation.
-
-    Returns:
-        List of indices sorted by descending similarity score.
-    """
-    scores = model.similarity(query, embeddings)[0]
-    return scores.argsort(descending=True).cpu().tolist()
