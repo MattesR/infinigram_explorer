@@ -27,15 +27,20 @@ def _is_cnf_query(query):
     """
     Distinguish between a simple keyword query (list of ints) and a CNF query
     (list of lists of lists of ints).
+
+    Simple keyword: [tok1, tok2, ...]           — list of ints
+    CNF:            [[[tok1, tok2], [tok3]], ...] — list of list of list of ints
     """
     if not query:
         return False
     first = query[0]
-    # CNF: [[clause1_option1, clause1_option2], [clause2_option1, ...]]
-    # each clause is a list of token ID lists
-    if isinstance(first, list):
-        return True
-    return False
+    if not isinstance(first, list):
+        return False
+    # CNF needs triple nesting: first element is a clause (list),
+    # and the clause's first element is an alternative (also a list)
+    if not first:
+        return False
+    return isinstance(first[0], list)
 
 
 def similarity_search(
@@ -102,6 +107,10 @@ def similarity_search(
             if max_clause_freq is not None:
                 find_kwargs["max_clause_freq"] = max_clause_freq
             find_result = engine.find_cnf(**find_kwargs)
+            if "error" in find_result:
+                print(f"  ERROR from engine: {find_result['error']}")
+                results[q_idx] = []
+                continue
             print(f"  Found {find_result['cnt']} matches (approx={find_result['approx']})")
             total_ptrs = sum(len(p) for p in find_result['ptrs_by_shard'])
             print(f"  Total pointers across shards: {total_ptrs}")
@@ -163,17 +172,26 @@ def similarity_search(
             results[q_idx] = []
             continue
 
-        # Step 4: Encode with SPLADE and rank
-        print("Step 4/4: Encoding candidates with SPLADE and ranking...")
-        doc_embeddings = model.encode_document(
-            valid_strings,
-            batch_size=batch_size,
-            show_progress_bar=True,
-        )
+        # Step 4: Encode with SPLADE and rank (batched to avoid OOM)
+        print(f"Step 4/4: Encoding {len(valid_strings)} candidates with SPLADE and ranking...")
+        print(f"  Encoding in batches of {batch_size}...")
 
-        scores = model.similarity(ref_embedding, doc_embeddings)[0]
+        all_scores = []
+        for i in tqdm(range(0, len(valid_strings), batch_size), desc="Encoding"):
+            batch_strings = valid_strings[i:i + batch_size]
+            batch_embeddings = model.encode_document(
+                batch_strings,
+                batch_size=batch_size,
+                show_progress_bar=False,
+            )
+            batch_scores = model.similarity(ref_embedding, batch_embeddings)[0]
+            all_scores.append(batch_scores.cpu())
+            del batch_embeddings
+
+        import torch
+        scores = torch.cat(all_scores)
         top_k = min(max_candidates_per_query, len(valid_strings))
-        top_indices = scores.argsort(descending=True)[:top_k].cpu().tolist()
+        top_indices = scores.argsort(descending=True)[:top_k].tolist()
 
         results[q_idx] = [
             {
