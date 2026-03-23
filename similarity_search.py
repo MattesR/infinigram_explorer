@@ -174,7 +174,7 @@ def similarity_search(
 
         # Step 4: Encode with SPLADE and rank
         print(f"Step 4/4: Encoding {len(valid_strings)} candidates with SPLADE and ranking...")
-        doc_embeddings = model.encode(
+        doc_embeddings = model.encode_document(
             valid_strings,
             show_progress_bar=True,
         )

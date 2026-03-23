@@ -45,11 +45,13 @@ def _compute_read_limits(
     tok_size: int,
     total_len: int,
     token_width: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Vectorized: for each byte offset, compute how many tokens can be read
     without crossing a document boundary.
-    Returns array of shape (n,) with clamped token counts.
+    Returns:
+        - n_tokens: array of shape (n,) with clamped token counts.
+        - doc_indices: array of shape (n,) with the document index for each entry.
     """
     doc_indices = np.searchsorted(doc_offsets, byte_offsets, side="right") - 1
     next_doc_indices = doc_indices + 1
@@ -64,7 +66,61 @@ def _compute_read_limits(
     available_bytes = np.maximum(available_bytes, 0)
     max_read_bytes = total_len * token_width
     read_bytes = np.minimum(available_bytes, max_read_bytes)
-    return (read_bytes // token_width).astype(np.int64)
+    n_tokens = (read_bytes // token_width).astype(np.int64)
+    return n_tokens, doc_indices
+
+
+def get_metadata(index_dir: str, shard: int, doc_idx: int) -> str:
+    """
+    Read the metadata string for a single document by index, using
+    metaoff.{s} and metadata.{s}.
+    """
+    index_dir = Path(index_dir)
+    metaoff_path = index_dir / f"metaoff.{shard}"
+    metadata_path = index_dir / f"metadata.{shard}"
+
+    metaoff = np.memmap(metaoff_path, dtype="<u8", mode="r")
+
+    start = int(metaoff[doc_idx])
+    if doc_idx + 1 < len(metaoff):
+        end = int(metaoff[doc_idx + 1])
+    else:
+        end = metadata_path.stat().st_size
+
+    with open(metadata_path, "rb") as f:
+        f.seek(start)
+        return f.read(end - start).decode("utf-8", errors="replace").strip()
+
+
+def get_metadata_batch(index_dir: str, shard: int, doc_indices: np.ndarray) -> list[str]:
+    """
+    Read metadata strings for multiple documents at once.
+    Deduplicates internally to avoid redundant reads.
+    """
+    index_dir = Path(index_dir)
+    metaoff_path = index_dir / f"metaoff.{shard}"
+    metadata_path = index_dir / f"metadata.{shard}"
+    meta_size = metadata_path.stat().st_size
+
+    metaoff = np.memmap(metaoff_path, dtype="<u8", mode="r")
+
+    # Deduplicate doc indices for efficient reading
+    unique_docs, inverse = np.unique(doc_indices, return_inverse=True)
+
+    unique_metadata = []
+    with open(metadata_path, "rb") as f:
+        for doc_idx in unique_docs:
+            start = int(metaoff[doc_idx])
+            if doc_idx + 1 < len(metaoff):
+                end = int(metaoff[doc_idx + 1])
+            else:
+                end = meta_size
+            f.seek(start)
+            meta = f.read(end - start).decode("utf-8", errors="replace").strip()
+            unique_metadata.append(meta)
+
+    # Map back to original order
+    return [unique_metadata[i] for i in inverse]
 
 
 def get_extensions(
@@ -98,10 +154,13 @@ def get_extensions(
         - np.ndarray of shape (N, query_len + ext_len). Each row contains the
           query tokens followed by the extension tokens. Rows truncated by
           document boundaries are right-padded with pad_token_id.
+        - np.ndarray of shape (N, 2), dtype int64. Each row is (shard, doc_index)
+          identifying which document the sequence came from.
         - int: number of rows that were truncated.
     """
     index_dir = Path(index_dir)
     all_extensions = []
+    all_doc_info = []
     total_truncated = 0
     total_len = query_len + ext_len
     dtype = np.dtype(f"<u{token_width}")
@@ -128,10 +187,17 @@ def get_extensions(
                 token_offsets = (byte_offsets // token_width).astype(np.int64)
 
                 print(f"  Shard {s}: computing document boundaries...")
-                n_tokens_per_entry = _compute_read_limits(
+                n_tokens_per_entry, doc_indices = _compute_read_limits(
                     byte_offsets, doc_offsets, tok_size, total_len, token_width
                 )
                 total_truncated += int(np.sum(n_tokens_per_entry < total_len))
+
+                # Store (shard, doc_index) for each entry
+                shard_doc_info = np.column_stack([
+                    np.full(n, s, dtype=np.int64),
+                    doc_indices.astype(np.int64),
+                ])
+                all_doc_info.append(shard_doc_info)
 
                 full_mask = n_tokens_per_entry >= total_len
                 n_full = int(np.sum(full_mask))
@@ -161,7 +227,11 @@ def get_extensions(
             finally:
                 sa_mm.close()
 
-    return np.concatenate(all_extensions, axis=0), total_truncated
+    return (
+        np.concatenate(all_extensions, axis=0),
+        np.concatenate(all_doc_info, axis=0),
+        total_truncated,
+    )
 
 
 def get_extensions_cnf(
@@ -263,7 +333,7 @@ def count_extensions(
     Like get_extensions, but returns a Counter of the most common
     extension tuples instead of the full array.
     """
-    extensions, truncated = get_extensions(
+    extensions, doc_info, truncated = get_extensions(
         index_dir=index_dir,
         segment_by_shard=segment_by_shard,
         query_len=query_len,

@@ -463,3 +463,7 @@ def get_tokens_from_splade(sparse_embedding, tokenizer):
 
     token_weight_pairs.sort(key=lambda x: -x[1])
     return token_weight_pairs
+
+
+def get_text_by_rank(engine, tokenizer, shard,rank,max_display_len=100):
+    return tokenizer.decode(engine.get_doc_by_rank(s=shard, rank=rank, max_disp_len=max_display_len)['token_ids'])
