@@ -122,6 +122,7 @@ class QueryPipeline:
         min_stem_len: int = 5,
         max_queries: int = 50,
         strategy: str = "anchor",
+        use_chunking: bool = False,
         verbose: bool = True,
         dry: bool = False,
     ) -> list[dict]:
@@ -138,6 +139,9 @@ class QueryPipeline:
             min_stem_len: For WordPiece clustering.
             max_queries: Maximum number of CNF queries to return.
             strategy: "anchor", "anchor_plus_common", or "all_pairs".
+            use_chunking: If True, use spaCy to extract multi-word phrases
+                from the original query and merge matching SPLADE tokens
+                into phrase-level entries before clustering.
             verbose: Print intermediate steps.
             dry: If True, just print the queries without hitting the index.
                  Implies verbose=True.
@@ -169,6 +173,23 @@ class QueryPipeline:
         if len(scored) < 2:
             print("  Not enough tokens to form CNF queries")
             return []
+
+        # Step 2b (optional): Phrase extraction and merging
+        if use_chunking:
+            from phrase_extraction import extract_phrases, merge_phrases_into_tokens
+            if verbose:
+                print(f"\nStep 2b: Extracting phrases with spaCy...")
+            phrases = extract_phrases(query, verbose=verbose)
+            if phrases:
+                scored = merge_phrases_into_tokens(
+                    scored, phrases, self.infini_tokenizer, verbose=verbose
+                )
+                if verbose:
+                    print(f"\n  After merging:")
+                    print(f"  {'Token':<25s} {'SPLADE':>8s} {'TUP':>12s} {'Combined':>10s}")
+                    print(f"  {'-'*57}")
+                    for token, splade, tup, combined in scored:
+                        print(f"  {token:<25s} {splade:>8.3f} {tup:>12.2e} {combined:>10.2f}")
 
         # Step 3: Build CNF queries
         if verbose:
