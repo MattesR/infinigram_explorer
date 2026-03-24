@@ -4,14 +4,14 @@ SPLADE × IDF scoring.
 
 Pipeline:
 1. Start with scored SPLADE tokens: (token, splade_score, tup, combined_score)
-2. Cluster by WordPiece stems (OR groups)
-3. Score each cluster by its best token's combined score
-4. Form CNF queries: pairs of clusters (AND between clusters, OR within)
+2. Split into informative (low TUP) and common pool (high TUP)
+3. Cluster informative tokens by WordPiece stems (OR groups)
+4. Form CNF queries: anchor AND informative, optionally with common pool
 5. Score each pair and rank them
 
 Usage:
     from query_construction import build_cnf_queries
-    queries = build_cnf_queries(top_tokens, tokenizer_infini, clusters=None, min_stem_len=5)
+    queries = build_cnf_queries(top_tokens, tokenizer_infini)
 """
 
 import numpy as np
@@ -25,7 +25,7 @@ def score_clusters(clusters, scored_tokens):
 
     Args:
         clusters: List of cluster dicts from cluster_tokens().
-        scored_tokens: Dict mapping token_string -> (splade_score, tup, combined_score).
+        scored_tokens: Dict mapping token_string -> combined_score.
 
     Returns:
         List of cluster dicts with added 'combined_score' field.
@@ -37,7 +37,6 @@ def score_clusters(clusters, scored_tokens):
                 token_scores.append(scored_tokens[token])
             else:
                 token_scores.append(0.0)
-        # Cluster score = max combined score among its tokens
         c["combined_score"] = max(token_scores) if token_scores else 0.0
     return clusters
 
@@ -49,10 +48,19 @@ def build_cnf_queries(
     max_queries: int = 50,
     min_cluster_score: float = 0.0,
     anchor_score: float = 0.9,
+    max_anchor_tup: float = 1e-4,
     strategy: str = "anchor",
 ):
     """
     Build ranked CNF queries from scored SPLADE tokens.
+
+    Tokens are split into three groups:
+    1. Anchors: clusters where at least one token has splade >= anchor_score
+       AND tup <= max_anchor_tup. Always included.
+    2. Informative: clusters with tup <= max_anchor_tup that aren't anchors.
+       Filtered by min_cluster_score.
+    3. Common pool: all tokens with tup > max_anchor_tup are merged into one
+       big OR clause. Can be used as an optional extra AND filter.
 
     Args:
         top_tokens: List of (token, splade_score, tup, combined_score) tuples.
@@ -61,50 +69,64 @@ def build_cnf_queries(
         max_queries: Maximum number of CNF queries to return.
         min_cluster_score: Drop non-anchor clusters below this combined score.
         anchor_score: Minimum raw SPLADE score for a cluster to be an anchor.
-            A cluster is an anchor if any of its tokens has splade_score >= anchor_score.
-            Anchors are always included regardless of min_cluster_score.
+        max_anchor_tup: Maximum TUP for a token to qualify as anchor or informative.
+            Tokens above this go into the common pool.
         strategy: How to form pairs:
-            - "all_pairs": all cluster pairs, ranked by combined score
-            - "anchor": anchor clusters AND each non-anchor cluster
+            - "anchor": anchor AND informative (+ anchor AND anchor)
+            - "anchor_plus_common": same but adds common pool as extra AND clause
+            - "all_pairs": all cluster pairs from anchors + informative
 
     Returns:
         List of query dicts sorted by score, each with:
             - 'cnf': ready-to-use CNF query for engine.find_cnf()
             - 'description': human-readable description
             - 'score': combined score of the pair
-            - 'clusters': the two cluster dicts
+            - 'clusters': the cluster dicts involved
     """
     # Build lookups
-    scored_lookup = {t[0]: t[3] for t in top_tokens}  # token -> combined_score
-    splade_lookup = {t[0]: t[1] for t in top_tokens}  # token -> raw splade_score
+    scored_lookup = {t[0]: t[3] for t in top_tokens}
+    splade_lookup = {t[0]: t[1] for t in top_tokens}
+    tup_lookup = {t[0]: t[2] for t in top_tokens}
 
-    # Cluster tokens (using just token, splade_score for clustering)
-    splade_pairs = [(t[0], t[1]) for t in top_tokens]
-    clusters = cluster_tokens(splade_pairs, min_stem_len=min_stem_len, show_steps=False)
+    # Split into common (high TUP) and informative (low TUP) tokens
+    common_tokens = [(t[0], t[1]) for t in top_tokens if t[2] > max_anchor_tup]
+    informative_tokens = [(t[0], t[1]) for t in top_tokens if t[2] <= max_anchor_tup]
 
-    # Score clusters with combined score
+    print(f"\nToken split (max_anchor_tup={max_anchor_tup:.0e}):")
+    print(f"  Informative (tup <= threshold): {len(informative_tokens)}")
+    print(f"  Common pool (tup > threshold):  {len(common_tokens)}")
+    if common_tokens:
+        print(f"    Common: {', '.join(t for t, s in common_tokens)}")
+
+    if len(informative_tokens) < 2:
+        print("  Not enough informative tokens to cluster")
+        return []
+
+    # Cluster only informative tokens
+    clusters = cluster_tokens(informative_tokens, min_stem_len=min_stem_len, show_steps=False)
     clusters = score_clusters(clusters, scored_lookup)
 
-    # Determine anchor status based on raw SPLADE score
+    # Determine anchor status: high SPLADE + low TUP
     for c in clusters:
         max_splade = max(splade_lookup.get(t, 0.0) for t, s in c["tokens"])
+        min_tup = min(tup_lookup.get(t, 1.0) for t, s in c["tokens"])
         c["max_splade"] = max_splade
-        c["is_anchor"] = max_splade >= anchor_score
+        c["min_tup"] = min_tup
+        c["is_anchor"] = max_splade >= anchor_score and min_tup <= max_anchor_tup
 
-    # Split into anchors and non-anchors
     anchors = [c for c in clusters if c["is_anchor"]]
     others = [c for c in clusters if not c["is_anchor"] and c["combined_score"] >= min_cluster_score]
 
     anchors.sort(key=lambda x: x["max_splade"], reverse=True)
     others.sort(key=lambda x: x["combined_score"], reverse=True)
 
-    print(f"\nAnchors ({len(anchors)} clusters, splade >= {anchor_score}):")
+    print(f"\nAnchors ({len(anchors)} clusters, splade >= {anchor_score}, tup <= {max_anchor_tup:.0e}):")
     for c in anchors:
         tokens_str = " | ".join(f"{t}" for t, s in c["tokens"])
         print(f"  [{c['max_splade']:.2f} splade, {c['combined_score']:.2f} combined] "
               f"{c['stem']:<15s} -> {tokens_str}")
 
-    print(f"\nOther clusters ({len(others)}, combined >= {min_cluster_score}):")
+    print(f"\nInformative clusters ({len(others)}, combined >= {min_cluster_score}):")
     for c in others:
         tokens_str = " | ".join(f"{t}" for t, s in c["tokens"])
         print(f"  [{c['max_splade']:.2f} splade, {c['combined_score']:.2f} combined] "
@@ -113,43 +135,71 @@ def build_cnf_queries(
     # Convert to OR clauses
     anchor_clauses = clusters_to_or_clauses(anchors, tokenizer)
     other_clauses = clusters_to_or_clauses(others, tokenizer)
-    all_clauses = clusters_to_or_clauses(anchors + others, tokenizer)
+    all_informative_clauses = clusters_to_or_clauses(anchors + others, tokenizer)
+
+    # Build common pool OR clause
+    common_clause = None
+    if common_tokens:
+        common_ids = []
+        common_names = []
+        for token, score in common_tokens:
+            clean = token.lstrip("#")
+            ids = tokenizer.encode(clean, add_special_tokens=False)
+            if ids:
+                common_ids.append(ids)
+                common_names.append(token)
+        if common_ids:
+            common_clause = {
+                "clause": common_ids,
+                "tokens": common_names,
+                "max_score": max(splade_lookup.get(t, 0.0) for t in common_names),
+            }
+            print(f"\nCommon pool OR clause: ({' OR '.join(common_names)})")
 
     # Build CNF query pairs
     queries = []
+    use_common = strategy == "anchor_plus_common" and common_clause is not None
 
-    if strategy == "anchor":
-        # Every anchor AND every non-anchor
+    if strategy in ("anchor", "anchor_plus_common"):
+        # Anchor AND informative
         for a in anchor_clauses:
             for b in other_clauses:
                 cnf = [a["clause"], b["clause"]]
-                pair_score = a["max_score"] * b["max_score"]
+                desc = f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})"
+                if use_common:
+                    cnf.append(common_clause["clause"])
+                    desc += f" AND ({' OR '.join(common_clause['tokens'])})"
 
+                pair_score = a["max_score"] * b["max_score"]
                 queries.append({
                     "cnf": cnf,
-                    "description": f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})",
+                    "description": desc,
                     "score": pair_score,
-                    "clusters": [a, b],
+                    "clusters": [a, b] + ([common_clause] if use_common else []),
                 })
 
-        # Also: anchor AND anchor (if multiple anchors)
+        # Anchor AND anchor
         for i, j in combinations(range(len(anchor_clauses)), 2):
             a = anchor_clauses[i]
             b = anchor_clauses[j]
             cnf = [a["clause"], b["clause"]]
-            pair_score = a["max_score"] * b["max_score"]
+            desc = f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})"
+            if use_common:
+                cnf.append(common_clause["clause"])
+                desc += f" AND ({' OR '.join(common_clause['tokens'])})"
 
+            pair_score = a["max_score"] * b["max_score"]
             queries.append({
                 "cnf": cnf,
-                "description": f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})",
+                "description": desc,
                 "score": pair_score,
-                "clusters": [a, b],
+                "clusters": [a, b] + ([common_clause] if use_common else []),
             })
 
     elif strategy == "all_pairs":
-        for i, j in combinations(range(len(all_clauses)), 2):
-            a = all_clauses[i]
-            b = all_clauses[j]
+        for i, j in combinations(range(len(all_informative_clauses)), 2):
+            a = all_informative_clauses[i]
+            b = all_informative_clauses[j]
             cnf = [a["clause"], b["clause"]]
             pair_score = a["max_score"] * b["max_score"]
 
@@ -162,8 +212,6 @@ def build_cnf_queries(
 
     # Sort by score descending
     queries.sort(key=lambda x: x["score"], reverse=True)
-
-    # Truncate
     queries = queries[:max_queries]
 
     print(f"\nTop {len(queries)} CNF queries:")

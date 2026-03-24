@@ -117,6 +117,7 @@ class QueryPipeline:
         query: str,
         min_splade_score: float = 0.3,
         anchor_score: float = 0.9,
+        max_anchor_tup: float = 1e-4,
         min_cluster_score: float = 1.0,
         min_stem_len: int = 5,
         max_queries: int = 50,
@@ -131,17 +132,18 @@ class QueryPipeline:
             query: Natural language query string.
             min_splade_score: Minimum SPLADE score to keep a token.
             anchor_score: Minimum raw SPLADE score for a cluster to be an anchor.
+            max_anchor_tup: Maximum TUP for anchor/informative tokens.
+                Tokens above this go into the common pool.
             min_cluster_score: Minimum combined score for non-anchor clusters.
             min_stem_len: For WordPiece clustering.
             max_queries: Maximum number of CNF queries to return.
-            strategy: "anchor" or "all_pairs".
+            strategy: "anchor", "anchor_plus_common", or "all_pairs".
             verbose: Print intermediate steps.
-            dry: If True, just print the queries without returning CNF data.
+            dry: If True, just print the queries without hitting the index.
                  Implies verbose=True.
 
         Returns:
             List of query dicts with 'cnf', 'description', 'score'.
-            If dry=True, returns the list but skips nothing — just forces verbose.
         """
         if dry:
             verbose = True
@@ -178,6 +180,7 @@ class QueryPipeline:
             max_queries=max_queries,
             min_cluster_score=min_cluster_score,
             anchor_score=anchor_score,
+            max_anchor_tup=max_anchor_tup,
             strategy=strategy,
         )
 
