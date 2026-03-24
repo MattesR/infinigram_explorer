@@ -12,6 +12,7 @@ import tup
 from tup import word_tup
 from wordpiece_cluster import cluster_tokens, clusters_to_or_clauses
 from query_pipeline import QueryPipeline
+from resolve_documents import resolve_all_queries
 print('populating the variables')
 tokenizer,engine = beam_search.load_default_engine(with_embedding_model=False)
 splade = SparseEncoder("naver/splade-cocondenser-ensembledistil")
