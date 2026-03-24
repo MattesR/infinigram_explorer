@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import tup
 from tup import word_tup
+from wordpiece_cluster import cluster_tokens, clusters_to_or_clauses
 print('populating the variables')
 tokenizer,engine = beam_search.load_default_engine(with_embedding_model=False)
 splade = SparseEncoder("naver/splade-cocondenser-ensembledistil")
@@ -17,3 +18,5 @@ first_query = "what makes up a community, including its definitions in various c
 input_ids = tokenizer.encode('community')
 q_query = splade.encode(first_query)
 tokenizer_splade = AutoTokenizer.from_pretrained("naver/splade-cocondenser-ensembledistil")
+probs = np.load('tup.probs.npy')
+counts = np.load('tup.counts.npy')
