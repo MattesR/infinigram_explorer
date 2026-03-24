@@ -22,11 +22,12 @@ q_query = splade.encode(first_query)
 tokenizer_splade = AutoTokenizer.from_pretrained("naver/splade-cocondenser-ensembledistil")
 probs = np.load('tup.probs.npy')
 counts = np.load('tup.counts.npy')
+min_splade_score = 0.3
 rel_tokens = get_tokens_from_splade(q_query, tokenizer_splade)
-
 # Initialize once
 pipeline = QueryPipeline(
     splade_model=splade,
     infini_tokenizer=tokenizer,
     probs=probs,
 )
+top_tokens = pipeline.score_tokens(rel_tokens)

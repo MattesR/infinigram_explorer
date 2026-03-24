@@ -26,6 +26,8 @@ def resolve_all_queries(
     tokenizer=None,
     max_doc_len: int = 200,
     token_width: int = 2,
+    top_splade_filter: int = None,
+    top_tokens: list[tuple] = None,
 ) -> list[dict]:
     """
     Take all queries with ptrs_by_shard, resolve to unique documents,
@@ -37,6 +39,10 @@ def resolve_all_queries(
         tokenizer: If provided, decode tokens to text (infini-gram tokenizer).
         max_doc_len: Maximum number of tokens to read per document.
         token_width: Bytes per token (2 for 16-bit).
+        top_splade_filter: If set, crude-score all documents using the important
+            tokens and only keep this many top-scoring documents.
+        top_tokens: List of (token, splade_score, tup, combined_score) tuples.
+            Required if top_splade_filter is set.
 
     Returns:
         List of document dicts, each with:
@@ -47,6 +53,7 @@ def resolve_all_queries(
             - 'tokens': np.ndarray of token IDs (up to max_doc_len)
             - 'text': decoded text (if tokenizer provided)
             - 'from_queries': list of query indices that found this document
+            - 'crude_score': (if top_splade_filter set) bag-of-words relevance score
     """
     index_dir = Path(index_dir)
     dtype = np.dtype(f"<u{token_width}")
@@ -169,5 +176,36 @@ def resolve_all_queries(
     print(f"\nDone! {len(documents)} unique documents resolved.")
     n_multi = sum(1 for d in documents if len(d["from_queries"]) > 1)
     print(f"  {n_multi} documents found by multiple queries")
+
+    # Crude SPLADE-based filtering
+    if top_splade_filter is not None and top_tokens is not None:
+        print(f"\nStep 4: Crude scoring and filtering to top {top_splade_filter}...")
+
+        # Precompute important token IDs (SPLADE/BERT -> Llama)
+        important_words = []
+        for token, splade_score, tup, combined in top_tokens:
+            clean = token.lstrip("#")
+            ids = tokenizer.encode(clean, add_special_tokens=False)
+            if ids:
+                important_words.append((set(ids), combined))
+
+        # Score each document
+        for doc in tqdm(documents, desc="Scoring"):
+            doc_set = set(doc["tokens"].tolist())
+            doc["crude_score"] = sum(
+                combined
+                for ids, combined in important_words
+                if ids.issubset(doc_set)
+            )
+
+        # Sort and filter
+        documents.sort(key=lambda x: x["crude_score"], reverse=True)
+
+        if len(documents) > 0:
+            print(f"  Score range: {documents[0]['crude_score']:.2f} (best) "
+                  f"-> {documents[-1]['crude_score']:.2f} (worst)")
+
+        documents = documents[:top_splade_filter]
+        print(f"  Kept top {len(documents)} documents")
 
     return documents
