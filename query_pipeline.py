@@ -74,7 +74,69 @@ class QueryPipeline:
             for idx in nonzero_indices
         ]
         tokens.sort(key=lambda x: x[1], reverse=True)
+
+        # Reconstruct WordPiece fragments using the original query
+        tokens = self.reconstruct_wordpieces(tokens, query)
         return tokens
+
+    def reconstruct_wordpieces(
+        self,
+        tokens: list[tuple[str, float]],
+        query: str,
+    ) -> list[tuple[str, float]]:
+        """
+        Merge BERT WordPiece subtokens (##-prefixed) back into full words.
+
+        Tokenizes the original query with the BERT tokenizer to get the
+        correct token order, then glues ##-tokens onto the preceding token.
+        Finally, maps scores from the SPLADE output onto the reconstructed words.
+
+        E.g.: query "vicarious trauma" tokenizes to ['vi', '##car', '##ious', 'trauma']
+              SPLADE has scores for 'vicar' and '##ious'
+              -> reconstructs 'vicarious' with max(score_vicar, score_ious)
+        """
+        if not any(t.startswith("##") for t, _ in tokens):
+            return tokens
+
+        # Build score lookup from SPLADE output
+        score_lookup = {t: s for t, s in tokens}
+
+        # Tokenize the original query with BERT tokenizer to get correct order
+        bert_tokens = self.splade_tokenizer.tokenize(query)
+
+        # Reconstruct words by gluing ## tokens onto previous
+        words = []  # list of (word_string, [constituent_tokens])
+        for bt in bert_tokens:
+            if bt.startswith("##") and words:
+                word, constituents = words[-1]
+                words[-1] = (word + bt[2:], constituents + [bt])
+            else:
+                words.append((bt, [bt]))
+
+        # Map reconstructed words to SPLADE scores
+        merged = []
+        used_tokens = set()
+
+        for word, constituents in words:
+            # Collect scores from constituents that appear in SPLADE output
+            constituent_scores = []
+            for c in constituents:
+                if c in score_lookup:
+                    constituent_scores.append(score_lookup[c])
+                    used_tokens.add(c)
+
+            if constituent_scores:
+                # Use max score among constituents
+                merged.append((word, max(constituent_scores)))
+
+        # Add any SPLADE tokens that weren't part of the query tokenization
+        # (SPLADE can activate tokens not in the original query)
+        for token, score in tokens:
+            if token not in used_tokens and not token.startswith("##"):
+                merged.append((token, score))
+
+        merged.sort(key=lambda x: x[1], reverse=True)
+        return merged
 
     def word_tup(self, word: str) -> float:
         """
