@@ -140,6 +140,45 @@ def merge_phrases_into_tokens(
         clean = token.lstrip("#").lower()
         token_lookup[clean] = i
 
+    # Build reconstructed words from WordPiece sequences.
+    # E.g. ['vicar', '##ious'] -> 'vicarious' mapping to indices [0, 4]
+    # Walk through tokens in order: a non-## token starts a new word,
+    # subsequent ##-prefixed tokens continue it.
+    wordpiece_words = []  # list of (reconstructed_word, [indices])
+    current_word = ""
+    current_indices = []
+    for i, (token, splade, tup, combined) in enumerate(top_tokens):
+        if token.startswith("##"):
+            # Continuation of previous word
+            current_word += token[2:].lower()
+            current_indices.append(i)
+        else:
+            # Save previous word if it was multi-token
+            if len(current_indices) > 1:
+                wordpiece_words.append((current_word, list(current_indices)))
+            # Start new word
+            current_word = token.lower()
+            current_indices = [i]
+    # Don't forget the last word
+    if len(current_indices) > 1:
+        wordpiece_words.append((current_word, list(current_indices)))
+
+    # Also build all pairwise concatenations of adjacent subtokens
+    # since SPLADE doesn't guarantee order matches the original word
+    for i, (tok_a, _, _, _) in enumerate(top_tokens):
+        for j, (tok_b, _, _, _) in enumerate(top_tokens):
+            if i == j:
+                continue
+            if tok_b.startswith("##"):
+                reconstructed = tok_a.lstrip("#").lower() + tok_b[2:].lower()
+                wordpiece_words.append((reconstructed, [i, j]))
+
+    # Deduplicate: keep longest index list per word
+    word_to_indices = {}
+    for word, indices in wordpiece_words:
+        if word not in word_to_indices or len(indices) > len(word_to_indices[word]):
+            word_to_indices[word] = indices
+
     # Also try lemma matching for verbs (e.g. "makes" -> "make")
     nlp = _get_nlp()
 
@@ -150,15 +189,21 @@ def merge_phrases_into_tokens(
         phrase_tokens = phrase["tokens"]
 
         # Check if all tokens in the phrase are present in SPLADE tokens
+        # Try three strategies: direct match, lemma match, WordPiece reconstruction
         indices = []
         for pt in phrase_tokens:
             if pt in token_lookup:
                 indices.append(token_lookup[pt])
+            elif pt in word_to_indices:
+                # Match via reconstructed WordPiece word
+                indices.extend(word_to_indices[pt])
             else:
                 # Try lemma
                 lemma = nlp(pt)[0].lemma_.lower()
                 if lemma in token_lookup:
                     indices.append(token_lookup[lemma])
+                elif lemma in word_to_indices:
+                    indices.extend(word_to_indices[lemma])
                 else:
                     break
         else:
