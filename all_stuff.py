@@ -11,6 +11,7 @@ import numpy as np
 import tup
 from tup import word_tup
 from wordpiece_cluster import cluster_tokens, clusters_to_or_clauses
+from query_pipeline import QueryPipeline
 print('populating the variables')
 tokenizer,engine = beam_search.load_default_engine(with_embedding_model=False)
 splade = SparseEncoder("naver/splade-cocondenser-ensembledistil")
@@ -20,3 +21,11 @@ q_query = splade.encode(first_query)
 tokenizer_splade = AutoTokenizer.from_pretrained("naver/splade-cocondenser-ensembledistil")
 probs = np.load('tup.probs.npy')
 counts = np.load('tup.counts.npy')
+rel_tokens = get_tokens_from_splade(q_query, tokenizer_splade)
+
+# Initialize once
+pipeline = QueryPipeline(
+    splade_model=splade,
+    infini_tokenizer=tokenizer,
+    probs=probs,
+)
