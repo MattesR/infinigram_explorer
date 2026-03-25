@@ -135,6 +135,13 @@ class QueryPipeline:
             if token not in used_tokens and not token.startswith("##"):
                 merged.append((token, score))
 
+        # Deduplicate by word string, keeping highest score
+        deduped = {}
+        for word, score in merged:
+            if word not in deduped or score > deduped[word]:
+                deduped[word] = score
+        merged = [(w, s) for w, s in deduped.items()]
+
         merged.sort(key=lambda x: x[1], reverse=True)
         return merged
 
@@ -274,6 +281,8 @@ class QueryPipeline:
         query: str,
         engine,
         max_clause_freq: int = None,
+        min_retrieved_docs: int = None,
+        lower_query_bound: float = None,
         dry: bool = False,
         **build_kwargs,
     ) -> list[dict]:
@@ -281,10 +290,25 @@ class QueryPipeline:
         Full pipeline including hitting the index.
         If dry=True, prints everything but skips the index queries.
 
+        Args:
+            query: Query text.
+            engine: Infini-gram engine.
+            max_clause_freq: Passed to engine.find_cnf.
+            min_retrieved_docs: Stop executing queries after accumulating
+                this many pointers.
+            lower_query_bound: Skip queries with score below this.
+            dry: Print only, don't execute.
+            **build_kwargs: Passed to build().
+
         Returns:
             List of query dicts with 'cnf', 'description', 'score', 'cnt', etc.
         """
         queries = self.build(query, dry=dry, **build_kwargs)
         if queries and not dry:
-            queries = run_queries(engine, queries, max_clause_freq=max_clause_freq)
+            queries = run_queries(
+                engine, queries,
+                max_clause_freq=max_clause_freq,
+                min_retrieved_docs=min_retrieved_docs,
+                lower_query_bound=lower_query_bound,
+            )
         return queries

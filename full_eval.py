@@ -65,7 +65,7 @@ def run_full_eval(
     run_name: str = "infinigram_splade",
     max_doc_len: int = 200,
     top_splade_filter: int = 100,
-    max_clause_freq: int = 100000,
+    max_clause_freq: int = 7000000,
     use_chunking: bool = True,
     min_splade_score: float = 0.3,
     anchor_score: float = 0.9,

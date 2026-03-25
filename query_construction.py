@@ -210,6 +210,31 @@ def build_cnf_queries(
                 "clusters": [a, b],
             })
 
+    # Filter self-overlapping queries (where one clause's tokens are a
+    # substring of another clause's tokens in the same query)
+    filtered = []
+    for q in queries:
+        clusters = q.get("clusters", [])
+        if len(clusters) >= 2:
+            tokens_a = set(t.lower() for t in clusters[0].get("tokens", []))
+            tokens_b = set(t.lower() for t in clusters[1].get("tokens", []))
+            # Check if any token in A contains any token in B as substring or vice versa
+            overlap = False
+            for ta in tokens_a:
+                for tb in tokens_b:
+                    # "civilized community" contains "community"
+                    if " " in ta and tb in ta.split():
+                        overlap = True
+                    elif " " in tb and ta in tb.split():
+                        overlap = True
+            if overlap:
+                continue
+        filtered.append(q)
+
+    if len(filtered) < len(queries):
+        print(f"  Filtered {len(queries) - len(filtered)} self-overlapping queries")
+    queries = filtered
+
     # Sort by score descending
     queries.sort(key=lambda x: x["score"], reverse=True)
     queries = queries[:max_queries]
@@ -221,22 +246,42 @@ def build_cnf_queries(
     return queries
 
 
-def run_queries(engine, queries, max_clause_freq=None):
+def run_queries(
+    engine,
+    queries,
+    max_clause_freq=None,
+    min_retrieved_docs: int = None,
+    lower_query_bound: float = None,
+):
     """
-    Execute the CNF queries against the engine and add hit counts.
+    Execute CNF queries against the engine, optionally stopping early
+    when enough documents have been retrieved.
 
     Args:
         engine: Infini-gram engine instance.
         queries: List of query dicts from build_cnf_queries().
         max_clause_freq: If set, passed to engine.find_cnf.
+        min_retrieved_docs: If set, stop executing queries once this many
+            total pointers have been accumulated.
+        lower_query_bound: If set, skip queries with score below this.
 
     Returns:
         Same list with added 'cnt', 'approx', 'ptrs_by_shard' fields.
+        Only includes queries that were actually executed.
     """
     from tqdm import tqdm
     import time
 
+    if lower_query_bound is not None:
+        before = len(queries)
+        queries = [q for q in queries if q["score"] >= lower_query_bound]
+        if len(queries) < before:
+            print(f"  Skipping {before - len(queries)} queries below score {lower_query_bound}")
+
     print(f"Running {len(queries)} CNF queries...")
+    total_ptrs = 0
+    executed = []
+
     for q in tqdm(queries, desc="Querying"):
         kwargs = {"cnf": q["cnf"]}
         if max_clause_freq is not None:
@@ -254,14 +299,22 @@ def run_queries(engine, queries, max_clause_freq=None):
             q["cnt"] = result["cnt"]
             q["approx"] = result.get("approx", False)
             q["ptrs_by_shard"] = result.get("ptrs_by_shard", [])
+            total_ptrs += sum(len(p) for p in q["ptrs_by_shard"])
+
+        executed.append(q)
+
+        # Check if we have enough
+        if min_retrieved_docs and total_ptrs >= min_retrieved_docs:
+            print(f"\n  Reached {total_ptrs} pointers after {len(executed)} queries, stopping.")
+            break
 
     # Print summary sorted by count
-    queries.sort(key=lambda x: x["cnt"], reverse=True)
+    executed.sort(key=lambda x: x.get("cnt", 0), reverse=True)
     print(f"\nResults (sorted by count):")
     print(f"{'#':>4s} {'Count':>10s} {'Approx':>6s} {'Score':>8s} {'Query'}")
     print("-" * 80)
-    for i, q in enumerate(queries):
-        approx = "~" if q["approx"] else ""
-        print(f"{i+1:4d} {q['cnt']:>10,d}{approx:>6s} {q['score']:>8.2f} {q['description']}")
+    for i, q in enumerate(executed):
+        approx = "~" if q.get("approx") else ""
+        print(f"{i+1:4d} {q.get('cnt', 0):>10,d}{approx:>6s} {q['score']:>8.2f} {q['description']}")
 
-    return queries
+    return executed
