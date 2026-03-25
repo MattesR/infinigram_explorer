@@ -243,22 +243,13 @@ class QueryPipeline:
             print("  Not enough tokens to form CNF queries")
             return []
 
-        # Step 2b (optional): Phrase extraction and merging
+        # Step 2b (optional): Extract syntactic links from query
+        syntactic_links = None
         if use_chunking:
-            from phrase_extraction import extract_phrases, merge_phrases_into_tokens
+            from phrase_extraction import extract_syntactic_links
             if verbose:
-                print(f"\nStep 2b: Extracting phrases with spaCy...")
-            phrases = extract_phrases(query, verbose=verbose)
-            if phrases:
-                scored = merge_phrases_into_tokens(
-                    scored, phrases, self.infini_tokenizer, verbose=verbose
-                )
-                if verbose:
-                    print(f"\n  After merging:")
-                    print(f"  {'Token':<25s} {'SPLADE':>8s} {'TUP':>12s} {'Combined':>10s}")
-                    print(f"  {'-'*57}")
-                    for token, splade, tup, combined in scored:
-                        print(f"  {token:<25s} {splade:>8.3f} {tup:>12.2e} {combined:>10.2f}")
+                print(f"\nStep 2b: Extracting syntactic links with spaCy...")
+            syntactic_links = extract_syntactic_links(query, verbose=verbose)
 
         # Step 3: Build CNF queries
         if verbose:
@@ -272,6 +263,7 @@ class QueryPipeline:
             anchor_score=anchor_score,
             max_anchor_tup=max_anchor_tup,
             strategy=strategy,
+            syntactic_links=syntactic_links,
         )
 
         return queries

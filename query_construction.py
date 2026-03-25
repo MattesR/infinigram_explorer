@@ -1,17 +1,16 @@
 """
-Construct CNF queries by combining WordPiece clusters with
-SPLADE × IDF scoring.
+Construct CNF queries from SPLADE token clusters and optional syntactic links.
 
-Pipeline:
-1. Start with scored SPLADE tokens: (token, splade_score, tup, combined_score)
-2. Split into informative (low TUP) and common pool (high TUP)
-3. Cluster informative tokens by WordPiece stems (OR groups)
-4. Form CNF queries: anchor AND informative, optionally with common pool
-5. Score each pair and rank them
+When syntactic links are provided (from spaCy), clusters that are linked
+form multi-clause "units". Queries combine units, not individual clusters.
+
+E.g.: spaCy: "civilized" modifies "community"
+      SPLADE clusters: civilized|civilization, community|communities
+      Unit: (civilized OR civilization) AND (community OR communities)
+      Query: Unit AND (polite OR political)
 
 Usage:
-    from query_construction import build_cnf_queries
-    queries = build_cnf_queries(top_tokens, tokenizer_infini)
+    from query_construction import build_cnf_queries, run_queries
 """
 
 import numpy as np
@@ -20,23 +19,9 @@ from wordpiece_cluster import cluster_tokens, clusters_to_or_clauses
 
 
 def score_clusters(clusters, scored_tokens):
-    """
-    Assign each cluster a score based on its tokens' combined scores.
-
-    Args:
-        clusters: List of cluster dicts from cluster_tokens().
-        scored_tokens: Dict mapping token_string -> combined_score.
-
-    Returns:
-        List of cluster dicts with added 'combined_score' field.
-    """
+    """Assign each cluster a score from its tokens' combined scores."""
     for c in clusters:
-        token_scores = []
-        for token, splade_score in c["tokens"]:
-            if token in scored_tokens:
-                token_scores.append(scored_tokens[token])
-            else:
-                token_scores.append(0.0)
+        token_scores = [scored_tokens.get(t, 0.0) for t, s in c["tokens"]]
         c["combined_score"] = max(token_scores) if token_scores else 0.0
     return clusters
 
@@ -50,45 +35,33 @@ def build_cnf_queries(
     anchor_score: float = 0.9,
     max_anchor_tup: float = 1e-4,
     strategy: str = "anchor",
+    syntactic_links: list[dict] = None,
 ):
     """
     Build ranked CNF queries from scored SPLADE tokens.
 
-    Tokens are split into three groups:
-    1. Anchors: clusters where at least one token has splade >= anchor_score
-       AND tup <= max_anchor_tup. Always included.
-    2. Informative: clusters with tup <= max_anchor_tup that aren't anchors.
-       Filtered by min_cluster_score.
-    3. Common pool: all tokens with tup > max_anchor_tup are merged into one
-       big OR clause. Can be used as an optional extra AND filter.
+    If syntactic_links are provided, clusters linked by syntax form
+    multi-clause units. Queries combine units rather than individual clusters.
 
     Args:
         top_tokens: List of (token, splade_score, tup, combined_score) tuples.
-        tokenizer: Infini-gram tokenizer for encoding to token IDs.
+        tokenizer: Infini-gram tokenizer.
         min_stem_len: For WordPiece clustering.
-        max_queries: Maximum number of CNF queries to return.
-        min_cluster_score: Drop non-anchor clusters below this combined score.
-        anchor_score: Minimum raw SPLADE score for a cluster to be an anchor.
-        max_anchor_tup: Maximum TUP for a token to qualify as anchor or informative.
-            Tokens above this go into the common pool.
-        strategy: How to form pairs:
-            - "anchor": anchor AND informative (+ anchor AND anchor)
-            - "anchor_plus_common": same but adds common pool as extra AND clause
-            - "all_pairs": all cluster pairs from anchors + informative
+        max_queries: Max CNF queries to return.
+        min_cluster_score: Min combined score for non-anchor units.
+        anchor_score: Min SPLADE score for anchor status.
+        max_anchor_tup: Max TUP for anchor/informative tokens.
+        strategy: "anchor", "anchor_plus_common", or "all_pairs".
+        syntactic_links: From extract_syntactic_links(). If None, no linking.
 
     Returns:
-        List of query dicts sorted by score, each with:
-            - 'cnf': ready-to-use CNF query for engine.find_cnf()
-            - 'description': human-readable description
-            - 'score': combined score of the pair
-            - 'clusters': the cluster dicts involved
+        List of query dicts sorted by score.
     """
-    # Build lookups
     scored_lookup = {t[0]: t[3] for t in top_tokens}
     splade_lookup = {t[0]: t[1] for t in top_tokens}
     tup_lookup = {t[0]: t[2] for t in top_tokens}
 
-    # Split into common (high TUP) and informative (low TUP) tokens
+    # Split by TUP
     common_tokens = [(t[0], t[1]) for t in top_tokens if t[2] > max_anchor_tup]
     informative_tokens = [(t[0], t[1]) for t in top_tokens if t[2] <= max_anchor_tup]
 
@@ -102,11 +75,11 @@ def build_cnf_queries(
         print("  Not enough informative tokens to cluster")
         return []
 
-    # Cluster only informative tokens
+    # Cluster informative tokens
     clusters = cluster_tokens(informative_tokens, min_stem_len=min_stem_len, show_steps=False)
     clusters = score_clusters(clusters, scored_lookup)
 
-    # Determine anchor status: high SPLADE + low TUP
+    # Mark anchor status on clusters
     for c in clusters:
         max_splade = max(splade_lookup.get(t, 0.0) for t, s in c["tokens"])
         min_tup = min(tup_lookup.get(t, 1.0) for t, s in c["tokens"])
@@ -114,30 +87,55 @@ def build_cnf_queries(
         c["min_tup"] = min_tup
         c["is_anchor"] = max_splade >= anchor_score and min_tup <= max_anchor_tup
 
-    anchors = [c for c in clusters if c["is_anchor"]]
-    others = [c for c in clusters if not c["is_anchor"] and c["combined_score"] >= min_cluster_score]
+    # Build query units
+    if syntactic_links:
+        from phrase_extraction import build_query_units
+        units = build_query_units(syntactic_links, clusters, verbose=True)
+    else:
+        units = []
+        for c in clusters:
+            tokens_str = " OR ".join(t for t, s in c["tokens"])
+            units.append({
+                "clusters": [c],
+                "type": "standalone",
+                "description": f"({tokens_str})",
+                "score": c.get("combined_score", 0),
+            })
+        units.sort(key=lambda x: x["score"], reverse=True)
 
-    anchors.sort(key=lambda x: x["max_splade"], reverse=True)
-    others.sort(key=lambda x: x["combined_score"], reverse=True)
+    # Classify units
+    anchor_units = []
+    other_units = []
+    for u in units:
+        is_anchor = any(c.get("is_anchor", False) for c in u["clusters"])
+        if is_anchor:
+            anchor_units.append(u)
+        elif u["score"] >= min_cluster_score:
+            other_units.append(u)
 
-    print(f"\nAnchors ({len(anchors)} clusters, splade >= {anchor_score}, tup <= {max_anchor_tup:.0e}):")
-    for c in anchors:
-        tokens_str = " | ".join(f"{t}" for t, s in c["tokens"])
-        print(f"  [{c['max_splade']:.2f} splade, {c['combined_score']:.2f} combined] "
-              f"{c['stem']:<15s} -> {tokens_str}")
+    print(f"\nAnchor units ({len(anchor_units)}):")
+    for u in anchor_units:
+        print(f"  [{u['score']:6.2f}] {u['description']}")
 
-    print(f"\nInformative clusters ({len(others)}, combined >= {min_cluster_score}):")
-    for c in others:
-        tokens_str = " | ".join(f"{t}" for t, s in c["tokens"])
-        print(f"  [{c['max_splade']:.2f} splade, {c['combined_score']:.2f} combined] "
-              f"{c['stem']:<15s} -> {tokens_str}")
+    print(f"\nInformative units ({len(other_units)}, score >= {min_cluster_score}):")
+    for u in other_units:
+        print(f"  [{u['score']:6.2f}] {u['description']}")
 
-    # Convert to OR clauses
-    anchor_clauses = clusters_to_or_clauses(anchors, tokenizer)
-    other_clauses = clusters_to_or_clauses(others, tokenizer)
-    all_informative_clauses = clusters_to_or_clauses(anchors + others, tokenizer)
+    # Helper: convert a unit to CNF clauses
+    def unit_to_cnf_clauses(unit):
+        clauses = []
+        for c in unit["clusters"]:
+            or_ids = []
+            for token, score in c["tokens"]:
+                clean = token.lstrip("#")
+                ids = tokenizer.encode(clean, add_special_tokens=False)
+                if ids:
+                    or_ids.append(ids)
+            if or_ids:
+                clauses.append(or_ids)
+        return clauses
 
-    # Build common pool OR clause
+    # Common pool
     common_clause = None
     if common_tokens:
         common_ids = []
@@ -149,93 +147,61 @@ def build_cnf_queries(
                 common_ids.append(ids)
                 common_names.append(token)
         if common_ids:
-            common_clause = {
-                "clause": common_ids,
-                "tokens": common_names,
-                "max_score": max(splade_lookup.get(t, 0.0) for t in common_names),
-            }
-            print(f"\nCommon pool OR clause: ({' OR '.join(common_names)})")
+            common_clause = {"clause": common_ids, "tokens": common_names}
+            print(f"\nCommon pool: ({' OR '.join(common_names)})")
 
-    # Build CNF query pairs
+    # Build queries by combining units
     queries = []
     use_common = strategy == "anchor_plus_common" and common_clause is not None
 
     if strategy in ("anchor", "anchor_plus_common"):
         # Anchor AND informative
-        for a in anchor_clauses:
-            for b in other_clauses:
-                cnf = [a["clause"], b["clause"]]
-                desc = f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})"
+        for a in anchor_units:
+            a_clauses = unit_to_cnf_clauses(a)
+            for b in other_units:
+                b_clauses = unit_to_cnf_clauses(b)
+                cnf = a_clauses + b_clauses
+                desc = f"{a['description']} AND {b['description']}"
                 if use_common:
                     cnf.append(common_clause["clause"])
                     desc += f" AND ({' OR '.join(common_clause['tokens'])})"
 
-                pair_score = a["max_score"] * b["max_score"]
                 queries.append({
                     "cnf": cnf,
                     "description": desc,
-                    "score": pair_score,
-                    "clusters": [a, b] + ([common_clause] if use_common else []),
+                    "score": a["score"] * b["score"],
+                    "units": [a, b],
                 })
 
         # Anchor AND anchor
-        for i, j in combinations(range(len(anchor_clauses)), 2):
-            a = anchor_clauses[i]
-            b = anchor_clauses[j]
-            cnf = [a["clause"], b["clause"]]
-            desc = f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})"
+        for i, j in combinations(range(len(anchor_units)), 2):
+            a, b = anchor_units[i], anchor_units[j]
+            cnf = unit_to_cnf_clauses(a) + unit_to_cnf_clauses(b)
+            desc = f"{a['description']} AND {b['description']}"
             if use_common:
                 cnf.append(common_clause["clause"])
                 desc += f" AND ({' OR '.join(common_clause['tokens'])})"
 
-            pair_score = a["max_score"] * b["max_score"]
             queries.append({
                 "cnf": cnf,
                 "description": desc,
-                "score": pair_score,
-                "clusters": [a, b] + ([common_clause] if use_common else []),
+                "score": a["score"] * b["score"],
+                "units": [a, b],
             })
 
     elif strategy == "all_pairs":
-        for i, j in combinations(range(len(all_informative_clauses)), 2):
-            a = all_informative_clauses[i]
-            b = all_informative_clauses[j]
-            cnf = [a["clause"], b["clause"]]
-            pair_score = a["max_score"] * b["max_score"]
-
+        all_units = anchor_units + other_units
+        for i, j in combinations(range(len(all_units)), 2):
+            a, b = all_units[i], all_units[j]
+            cnf = unit_to_cnf_clauses(a) + unit_to_cnf_clauses(b)
             queries.append({
                 "cnf": cnf,
-                "description": f"({' OR '.join(a['tokens'])}) AND ({' OR '.join(b['tokens'])})",
-                "score": pair_score,
-                "clusters": [a, b],
+                "description": f"{a['description']} AND {b['description']}",
+                "score": a["score"] * b["score"],
+                "units": [a, b],
             })
 
-    # Filter self-overlapping queries (where one clause's tokens are a
-    # substring of another clause's tokens in the same query)
-    filtered = []
-    for q in queries:
-        clusters = q.get("clusters", [])
-        if len(clusters) >= 2:
-            tokens_a = set(t.lower() for t in clusters[0].get("tokens", []))
-            tokens_b = set(t.lower() for t in clusters[1].get("tokens", []))
-            # Check if any token in A contains any token in B as substring or vice versa
-            overlap = False
-            for ta in tokens_a:
-                for tb in tokens_b:
-                    # "civilized community" contains "community"
-                    if " " in ta and tb in ta.split():
-                        overlap = True
-                    elif " " in tb and ta in tb.split():
-                        overlap = True
-            if overlap:
-                continue
-        filtered.append(q)
-
-    if len(filtered) < len(queries):
-        print(f"  Filtered {len(queries) - len(filtered)} self-overlapping queries")
-    queries = filtered
-
-    # Sort by score descending
+    # Sort and truncate
     queries.sort(key=lambda x: x["score"], reverse=True)
     queries = queries[:max_queries]
 
@@ -254,20 +220,17 @@ def run_queries(
     lower_query_bound: float = None,
 ):
     """
-    Execute CNF queries against the engine, optionally stopping early
-    when enough documents have been retrieved.
+    Execute CNF queries, optionally stopping early.
 
     Args:
-        engine: Infini-gram engine instance.
-        queries: List of query dicts from build_cnf_queries().
-        max_clause_freq: If set, passed to engine.find_cnf.
-        min_retrieved_docs: If set, stop executing queries once this many
-            total pointers have been accumulated.
-        lower_query_bound: If set, skip queries with score below this.
+        engine: Infini-gram engine.
+        queries: From build_cnf_queries().
+        max_clause_freq: Passed to engine.find_cnf.
+        min_retrieved_docs: Stop after accumulating this many pointers.
+        lower_query_bound: Skip queries below this score.
 
     Returns:
-        Same list with added 'cnt', 'approx', 'ptrs_by_shard' fields.
-        Only includes queries that were actually executed.
+        List of executed query dicts with cnt, approx, ptrs_by_shard.
     """
     from tqdm import tqdm
     import time
@@ -303,12 +266,11 @@ def run_queries(
 
         executed.append(q)
 
-        # Check if we have enough
         if min_retrieved_docs and total_ptrs >= min_retrieved_docs:
             print(f"\n  Reached {total_ptrs} pointers after {len(executed)} queries, stopping.")
             break
 
-    # Print summary sorted by count
+    # Print summary
     executed.sort(key=lambda x: x.get("cnt", 0), reverse=True)
     print(f"\nResults (sorted by count):")
     print(f"{'#':>4s} {'Count':>10s} {'Approx':>6s} {'Score':>8s} {'Query'}")

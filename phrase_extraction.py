@@ -1,22 +1,23 @@
 """
-Lightweight phrase extraction using spaCy to recombine SPLADE tokens
-into multi-word expressions for stronger index queries.
+Extract syntactic relationships from the query using spaCy and combine
+with SPLADE token clusters to form structural query units.
 
-SPLADE atomizes queries into individual tokens, losing multi-word
-expressions like "make up", "civilized community", "grassroots organizations".
-This module extracts those phrases from the original query and cross-references
-them with the SPLADE token list to create combined phrase queries.
+Two distinct concerns:
+1. SPLADE expansion: civilized -> civilized|civilization (synonym clusters)
+2. spaCy syntax: "civilized" modifies "community" (AND constraints)
+
+Combined: (civilized OR civilization) AND (community OR communities)
+This forms one "unit" that can be AND'd with other clusters in CNF queries.
 
 Usage:
-    from phrase_extraction import extract_phrases, merge_phrases_into_tokens
+    from phrase_extraction import extract_syntactic_links, build_query_units
 
-    phrases = extract_phrases(query_text)
-    merged_tokens = merge_phrases_into_tokens(top_tokens, phrases, tokenizer)
+    links = extract_syntactic_links(query_text)
+    units = build_query_units(links, clusters)
 """
 
 import spacy
 
-# Load once, reuse
 _nlp = None
 
 
@@ -27,230 +28,180 @@ def _get_nlp():
     return _nlp
 
 
-def extract_phrases(query: str, verbose: bool = False) -> list[dict]:
+def extract_syntactic_links(query: str, verbose: bool = False) -> list[dict]:
     """
-    Extract multi-word expressions from a query using spaCy.
+    Extract syntactic relationships between words in the query.
 
-    Extracts:
-    - Noun chunks (e.g. "civilized community", "grassroots organizations")
-    - Phrasal verbs (e.g. "makes up")
-    - Compound nouns (e.g. "nation building")
-    - Adjective + noun pairs (e.g. "civilized community")
+    Returns links between words that should be AND'd together:
+    - amod: adjective + noun ("civilized community")
+    - compound: compound noun ("grassroots organization")
+    - prt: phrasal verb ("make up")
+    - nsubj/dobj: subject/object relations for tight coupling
 
     Args:
         query: Original query text.
-        verbose: Print extracted phrases.
+        verbose: Print extracted links.
 
     Returns:
-        List of phrase dicts, each with:
-            - 'text': the phrase as a string
-            - 'tokens': list of lowercase token strings
-            - 'type': phrase type (noun_chunk, phrasal_verb, compound, amod)
+        List of link dicts, each with:
+            - 'words': list of lowercase word strings that belong together
+            - 'type': relationship type
+            - 'text': the phrase as it appears in the query
     """
     nlp = _get_nlp()
     doc = nlp(query)
-    phrases = []
+    links = []
     seen = set()
 
-    # Noun chunks (filter out single-word and determiner-only chunks)
-    for chunk in doc.noun_chunks:
-        # Remove leading determiners/pronouns
-        tokens = [t for t in chunk if t.pos_ not in ("DET", "PRON")]
-        if len(tokens) >= 2:
-            text = " ".join(t.text.lower() for t in tokens)
-            if text not in seen:
-                seen.add(text)
-                phrases.append({
-                    "text": text,
-                    "tokens": [t.text.lower() for t in tokens],
-                    "type": "noun_chunk",
-                })
-
-    # Phrasal verbs (verb + particle)
-    for token in doc:
-        if token.dep_ == "prt":
-            text = f"{token.head.lemma_.lower()} {token.text.lower()}"
-            if text not in seen:
-                seen.add(text)
-                phrases.append({
-                    "text": text,
-                    "tokens": [token.head.lemma_.lower(), token.text.lower()],
-                    "type": "phrasal_verb",
-                })
-
-    # Compound nouns
-    for token in doc:
-        if token.dep_ == "compound":
-            text = f"{token.text.lower()} {token.head.text.lower()}"
-            if text not in seen:
-                seen.add(text)
-                phrases.append({
-                    "text": text,
-                    "tokens": [token.text.lower(), token.head.text.lower()],
-                    "type": "compound",
-                })
-
-    # Adjective modifiers (amod)
+    # Adjective modifiers: "civilized community"
     for token in doc:
         if token.dep_ == "amod":
-            text = f"{token.text.lower()} {token.head.text.lower()}"
-            if text not in seen:
-                seen.add(text)
-                phrases.append({
-                    "text": text,
-                    "tokens": [token.text.lower(), token.head.text.lower()],
+            key = (token.lemma_.lower(), token.head.lemma_.lower())
+            if key not in seen:
+                seen.add(key)
+                links.append({
+                    "words": [token.lemma_.lower(), token.head.lemma_.lower()],
                     "type": "amod",
+                    "text": f"{token.text} {token.head.text}",
+                })
+
+    # Compound nouns: "grassroots organization", "nation building"
+    for token in doc:
+        if token.dep_ == "compound":
+            key = (token.lemma_.lower(), token.head.lemma_.lower())
+            if key not in seen:
+                seen.add(key)
+                links.append({
+                    "words": [token.lemma_.lower(), token.head.lemma_.lower()],
+                    "type": "compound",
+                    "text": f"{token.text} {token.head.text}",
+                })
+
+    # Phrasal verbs: "make up", "cope with"
+    for token in doc:
+        if token.dep_ == "prt":
+            key = (token.head.lemma_.lower(), token.lemma_.lower())
+            if key not in seen:
+                seen.add(key)
+                links.append({
+                    "words": [token.head.lemma_.lower(), token.lemma_.lower()],
+                    "type": "prt",
+                    "text": f"{token.head.text} {token.text}",
                 })
 
     if verbose:
-        print(f"Extracted {len(phrases)} phrases from query:")
-        for p in phrases:
-            print(f"  [{p['type']:<15s}] {p['text']}")
+        print(f"Extracted {len(links)} syntactic links:")
+        for link in links:
+            print(f"  [{link['type']:<10s}] {link['text']:<30s} -> {link['words']}")
 
-    return phrases
+    return links
 
 
-def merge_phrases_into_tokens(
-    top_tokens: list[tuple],
-    phrases: list[dict],
-    tokenizer,
+def build_query_units(
+    links: list[dict],
+    clusters: list[dict],
     verbose: bool = False,
-) -> list[tuple]:
+) -> list[dict]:
     """
-    Cross-reference extracted phrases with SPLADE tokens. Where multiple
-    SPLADE tokens form a known phrase, merge them into a single entry
-    with combined score and the full phrase as the token string.
+    Combine syntactic links with SPLADE clusters to form query units.
 
-    Merged tokens get their input_ids from tokenizing the full phrase,
-    which means engine.find() will search for the contiguous sequence.
+    A query unit is one or more clusters that are AND'd together because
+    spaCy says they modify each other. Clusters not involved in any link
+    remain standalone units.
 
     Args:
-        top_tokens: List of (token, splade_score, tup, combined_score).
-        phrases: From extract_phrases().
-        tokenizer: Infini-gram tokenizer for encoding phrases.
-        verbose: Print merge decisions.
+        links: From extract_syntactic_links().
+        clusters: From wordpiece_cluster.cluster_tokens(), each with
+            'stem', 'tokens' list of (word, score), 'combined_score'.
 
     Returns:
-        Updated top_tokens list where merged tokens replace their
-        constituents. Unmerged tokens are kept as-is.
+        List of unit dicts, each with:
+            - 'clusters': list of cluster dicts that form this unit
+            - 'type': 'linked' or 'standalone'
+            - 'description': human-readable description
+            - 'score': unit score
     """
-    # Build lookup: lowercase token -> index in top_tokens
-    token_lookup = {}
-    for i, (token, splade, tup, combined) in enumerate(top_tokens):
-        clean = token.lstrip("#").lower()
-        token_lookup[clean] = i
+    # Build lookup: word -> cluster index
+    word_to_cluster = {}
+    for i, c in enumerate(clusters):
+        for token, score in c["tokens"]:
+            word_to_cluster[token.lower()] = i
+        # Also map the stem
+        word_to_cluster[c["stem"].lower()] = i
 
-    # Build reconstructed words from WordPiece sequences.
-    # E.g. ['vicar', '##ious'] -> 'vicarious' mapping to indices [0, 4]
-    # Walk through tokens in order: a non-## token starts a new word,
-    # subsequent ##-prefixed tokens continue it.
-    wordpiece_words = []  # list of (reconstructed_word, [indices])
-    current_word = ""
-    current_indices = []
-    for i, (token, splade, tup, combined) in enumerate(top_tokens):
-        if token.startswith("##"):
-            # Continuation of previous word
-            current_word += token[2:].lower()
-            current_indices.append(i)
-        else:
-            # Save previous word if it was multi-token
-            if len(current_indices) > 1:
-                wordpiece_words.append((current_word, list(current_indices)))
-            # Start new word
-            current_word = token.lower()
-            current_indices = [i]
-    # Don't forget the last word
-    if len(current_indices) > 1:
-        wordpiece_words.append((current_word, list(current_indices)))
-
-    # Also build all pairwise concatenations of adjacent subtokens
-    # since SPLADE doesn't guarantee order matches the original word
-    for i, (tok_a, _, _, _) in enumerate(top_tokens):
-        for j, (tok_b, _, _, _) in enumerate(top_tokens):
-            if i == j:
-                continue
-            if tok_b.startswith("##"):
-                reconstructed = tok_a.lstrip("#").lower() + tok_b[2:].lower()
-                wordpiece_words.append((reconstructed, [i, j]))
-
-    # Deduplicate: keep longest index list per word
-    word_to_indices = {}
-    for word, indices in wordpiece_words:
-        if word not in word_to_indices or len(indices) > len(word_to_indices[word]):
-            word_to_indices[word] = indices
-
-    # Also try lemma matching for verbs (e.g. "makes" -> "make")
+    # Try to also match via lemma
     nlp = _get_nlp()
 
-    merged_indices = set()
-    merged_entries = []
+    # Find which clusters are linked together
+    linked_groups = []  # list of sets of cluster indices
+    used_clusters = set()
 
-    for phrase in phrases:
-        phrase_tokens = phrase["tokens"]
-
-        # Check if all tokens in the phrase are present in SPLADE tokens
-        # Try three strategies: direct match, lemma match, WordPiece reconstruction
-        indices = []
-        for pt in phrase_tokens:
-            if pt in token_lookup:
-                indices.append(token_lookup[pt])
-            elif pt in word_to_indices:
-                # Match via reconstructed WordPiece word
-                indices.extend(word_to_indices[pt])
+    for link in links:
+        cluster_indices = set()
+        for word in link["words"]:
+            # Direct match
+            if word in word_to_cluster:
+                cluster_indices.add(word_to_cluster[word])
             else:
                 # Try lemma
-                lemma = nlp(pt)[0].lemma_.lower()
-                if lemma in token_lookup:
-                    indices.append(token_lookup[lemma])
-                elif lemma in word_to_indices:
-                    indices.extend(word_to_indices[lemma])
-                else:
+                lemma = nlp(word)[0].lemma_.lower()
+                if lemma in word_to_cluster:
+                    cluster_indices.add(word_to_cluster[lemma])
+
+        if len(cluster_indices) >= 2:
+            # Check if this overlaps with an existing group
+            merged = False
+            for group in linked_groups:
+                if group & cluster_indices:
+                    group.update(cluster_indices)
+                    merged = True
                     break
-        else:
-            # All tokens found — merge them
-            if len(indices) < 2:
-                continue
-
-            # Aggregate scores
-            constituents = [top_tokens[i] for i in indices]
-            max_splade = max(s for _, s, _, _ in constituents)
-            min_tup_val = min(t for _, _, t, _ in constituents)
-            sum_combined = sum(c for _, _, _, c in constituents)
-
-            # Encode the full phrase for index queries
-            phrase_text = phrase["text"]
-            phrase_ids = tokenizer.encode(phrase_text, add_special_tokens=False)
-
-            if not phrase_ids:
-                continue
-
-            merged_entry = (
-                phrase_text,       # token string is now the full phrase
-                max_splade,        # use max splade of constituents
-                min_tup_val,       # use min tup (most discriminative)
-                sum_combined,      # sum combined scores
-            )
-            merged_entries.append(merged_entry)
-            merged_indices.update(indices)
+            if not merged:
+                linked_groups.append(cluster_indices)
+            used_clusters.update(cluster_indices)
 
             if verbose:
-                parts = " + ".join(f"{t[0]}({t[3]:.1f})" for t in constituents)
-                print(f"  Merged: {parts} -> '{phrase_text}' "
-                      f"(splade={max_splade:.2f}, combined={sum_combined:.2f})")
+                cluster_names = [clusters[i]["stem"] for i in cluster_indices]
+                print(f"  Link [{link['type']}] '{link['text']}' "
+                      f"-> clusters: {cluster_names}")
 
-    # Build new token list: merged entries + unmerged originals
-    new_tokens = list(merged_entries)
-    for i, entry in enumerate(top_tokens):
-        if i not in merged_indices:
-            new_tokens.append(entry)
+    # Build units
+    units = []
 
-    # Sort by combined score descending
-    new_tokens.sort(key=lambda x: x[3], reverse=True)
+    # Linked units (multi-cluster)
+    for group in linked_groups:
+        group_clusters = [clusters[i] for i in sorted(group)]
+        parts = []
+        for c in group_clusters:
+            tokens_str = " OR ".join(t for t, s in c["tokens"])
+            parts.append(f"({tokens_str})")
+        description = " AND ".join(parts)
+        score = sum(c.get("combined_score", 0) for c in group_clusters)
+
+        units.append({
+            "clusters": group_clusters,
+            "type": "linked",
+            "description": description,
+            "score": score,
+        })
+
+    # Standalone units (single cluster)
+    for i, c in enumerate(clusters):
+        if i not in used_clusters:
+            tokens_str = " OR ".join(t for t, s in c["tokens"])
+            units.append({
+                "clusters": [c],
+                "type": "standalone",
+                "description": f"({tokens_str})",
+                "score": c.get("combined_score", 0),
+            })
+
+    units.sort(key=lambda x: x["score"], reverse=True)
 
     if verbose:
-        n_merged = len(merged_entries)
-        n_consumed = len(merged_indices)
-        print(f"\n  {n_merged} phrases merged, consuming {n_consumed} tokens")
-        print(f"  {len(top_tokens)} tokens -> {len(new_tokens)} tokens")
+        print(f"\nQuery units ({len(units)}):")
+        for u in units:
+            marker = "* " if u["type"] == "linked" else "  "
+            print(f"  {marker}[{u['score']:6.2f}] {u['description']}")
 
-    return new_tokens
+    return units
