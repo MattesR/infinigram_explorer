@@ -65,7 +65,7 @@ def run_full_eval(
     run_name: str = "infinigram_splade",
     max_doc_len: int = 200,
     top_splade_filter: int = 100,
-    max_clause_freq: int = 7000000,
+    max_clause_freq: int = 100000,
     use_chunking: bool = True,
     min_splade_score: float = 0.3,
     anchor_score: float = 0.9,
@@ -73,6 +73,8 @@ def run_full_eval(
     min_cluster_score: float = 1.0,
     strategy: str = "anchor",
     max_queries_per_topic: int = 50,
+    min_retrieved_docs: int = None,
+    lower_query_bound: float = None,
     max_topics: int = None,
     score_field: str = "crude_score",
 ):
@@ -91,13 +93,15 @@ def run_full_eval(
         max_doc_len: Max tokens to read per document.
         top_splade_filter: How many docs to keep after crude scoring.
         max_clause_freq: Passed to engine.find_cnf.
-        use_chunking: Use spaCy phrase extraction.
+        use_chunking: Use spaCy syntactic linking.
         min_splade_score: Min SPLADE score for token filtering.
         anchor_score: Min SPLADE score for anchor clusters.
         max_anchor_tup: Max TUP for anchor/informative tokens.
-        min_cluster_score: Min combined score for non-anchor clusters.
+        min_cluster_score: Min combined score for non-anchor units.
         strategy: CNF query construction strategy.
         max_queries_per_topic: Max CNF queries per topic.
+        min_retrieved_docs: Stop executing queries after this many pointers.
+        lower_query_bound: Skip queries with score below this.
         max_topics: If set, only process this many topics.
         score_field: Which score to use for ranking in the run file.
 
@@ -112,6 +116,10 @@ def run_full_eval(
     print(f"Output: {run_path}")
     print(f"Settings: use_chunking={use_chunking}, top_splade_filter={top_splade_filter}, "
           f"max_clause_freq={max_clause_freq}, strategy={strategy}")
+    if min_retrieved_docs:
+        print(f"  min_retrieved_docs={min_retrieved_docs}")
+    if lower_query_bound:
+        print(f"  lower_query_bound={lower_query_bound}")
     print(f"{'='*70}\n")
 
     timings = []
@@ -144,6 +152,8 @@ def run_full_eval(
                 engine=engine,
                 use_chunking=use_chunking,
                 max_clause_freq=max_clause_freq,
+                min_retrieved_docs=min_retrieved_docs,
+                lower_query_bound=lower_query_bound,
                 min_splade_score=min_splade_score,
                 anchor_score=anchor_score,
                 max_anchor_tup=max_anchor_tup,
