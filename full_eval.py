@@ -77,6 +77,9 @@ def run_full_eval(
     lower_query_bound: float = None,
     max_topics: int = None,
     score_field: str = "crude_score",
+    adaptive: bool = False,
+    max_standalone: int = 10000,
+    max_refined: int = 20000,
 ):
     """
     Run the full pipeline on all topics, write a TREC run file, and evaluate.
@@ -114,8 +117,10 @@ def run_full_eval(
 
     print(f"Loaded {len(topics)} topics from {topics_path}")
     print(f"Output: {run_path}")
-    print(f"Settings: use_chunking={use_chunking}, top_splade_filter={top_splade_filter}, "
-          f"max_clause_freq={max_clause_freq}, strategy={strategy}")
+    print(f"Settings: adaptive={adaptive}, use_chunking={use_chunking}, "
+          f"top_splade_filter={top_splade_filter}, max_clause_freq={max_clause_freq}")
+    if adaptive:
+        print(f"  max_standalone={max_standalone}, max_refined={max_refined}")
     if min_retrieved_docs:
         print(f"  min_retrieved_docs={min_retrieved_docs}")
     if lower_query_bound:
@@ -134,35 +139,55 @@ def run_full_eval(
         timing = {"qid": qid}
 
         try:
-            # Step 1: Score tokens
-            t0 = time.perf_counter()
-            all_tokens = pipeline.encode_query(query_text)
-            scored = pipeline.score_tokens(all_tokens, min_splade_score=min_splade_score)
-            timing["encode"] = time.perf_counter() - t0
+            if adaptive:
+                # Adaptive pipeline: encode + score + build + execute in one call
+                t0 = time.perf_counter()
+                queries, scored = pipeline.build_and_run_adaptive(
+                    query_text,
+                    engine=engine,
+                    min_splade_score=min_splade_score,
+                    anchor_score=anchor_score,
+                    max_anchor_tup=max_anchor_tup,
+                    min_cluster_score=min_cluster_score,
+                    max_standalone=max_standalone,
+                    max_refined=max_refined,
+                    max_queries=max_queries_per_topic,
+                    max_clause_freq=max_clause_freq,
+                    min_retrieved_docs=min_retrieved_docs,
+                    verbose=False,
+                )
+                timing["encode"] = 0  # included in query_build_run
+                timing["query_build_run"] = time.perf_counter() - t0
 
-            if len(scored) < 2:
-                print(f"  [{qid}] Skipping: only {len(scored)} tokens after filtering")
-                failed.append((qid, "too_few_tokens"))
-                continue
+            else:
+                # Original pipeline
+                t0 = time.perf_counter()
+                all_tokens = pipeline.encode_query(query_text)
+                scored = pipeline.score_tokens(all_tokens, min_splade_score=min_splade_score)
+                timing["encode"] = time.perf_counter() - t0
 
-            # Step 2: Build and run queries
-            t0 = time.perf_counter()
-            queries = pipeline.build_and_run(
-                query_text,
-                engine=engine,
-                use_chunking=use_chunking,
-                max_clause_freq=max_clause_freq,
-                min_retrieved_docs=min_retrieved_docs,
-                lower_query_bound=lower_query_bound,
-                min_splade_score=min_splade_score,
-                anchor_score=anchor_score,
-                max_anchor_tup=max_anchor_tup,
-                min_cluster_score=min_cluster_score,
-                strategy=strategy,
-                max_queries=max_queries_per_topic,
-                verbose=False,
-            )
-            timing["query_build_run"] = time.perf_counter() - t0
+                if len(scored) < 2:
+                    print(f"  [{qid}] Skipping: only {len(scored)} tokens after filtering")
+                    failed.append((qid, "too_few_tokens"))
+                    continue
+
+                t0 = time.perf_counter()
+                queries = pipeline.build_and_run(
+                    query_text,
+                    engine=engine,
+                    use_chunking=use_chunking,
+                    max_clause_freq=max_clause_freq,
+                    min_retrieved_docs=min_retrieved_docs,
+                    lower_query_bound=lower_query_bound,
+                    min_splade_score=min_splade_score,
+                    anchor_score=anchor_score,
+                    max_anchor_tup=max_anchor_tup,
+                    min_cluster_score=min_cluster_score,
+                    strategy=strategy,
+                    max_queries=max_queries_per_topic,
+                    verbose=False,
+                )
+                timing["query_build_run"] = time.perf_counter() - t0
 
             if not queries:
                 print(f"  [{qid}] Skipping: no queries generated")

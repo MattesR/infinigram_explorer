@@ -304,3 +304,103 @@ class QueryPipeline:
                 lower_query_bound=lower_query_bound,
             )
         return queries
+
+    def build_and_run_adaptive(
+        self,
+        query: str,
+        engine,
+        min_splade_score: float = 0.3,
+        anchor_score: float = 0.9,
+        max_anchor_tup: float = 1e-4,
+        min_cluster_score: float = 1.0,
+        min_stem_len: int = 5,
+        max_standalone: int = 10000,
+        max_refined: int = 20000,
+        max_queries: int = 50,
+        max_clause_freq: int = 100000,
+        min_retrieved_docs: int = None,
+        verbose: bool = True,
+    ) -> tuple[list[dict], list[tuple]]:
+        """
+        Full adaptive pipeline: query string -> count-adaptive queries -> executed results.
+
+        Handles encoding, scoring, adaptive query building, and execution
+        in one call.
+
+        Args:
+            query: Natural language query string.
+            engine: Infini-gram engine.
+            min_splade_score: Min SPLADE score for token filtering.
+            anchor_score: Min SPLADE score for anchor clusters.
+            max_anchor_tup: Max TUP for anchor/informative tokens.
+            min_cluster_score: Min combined score for non-anchor clusters.
+            min_stem_len: For WordPiece clustering.
+            max_standalone: Max count for direct find() queries.
+            max_refined: Max count before adding more AND clauses.
+            max_queries: Max total queries.
+            max_clause_freq: For CNF sampling.
+            min_retrieved_docs: Stop executing after enough pointers.
+            verbose: Print intermediate steps.
+
+        Returns:
+            Tuple of (executed_queries, scored_tokens).
+            scored_tokens is the list of (token, splade, tup, combined) for crude scoring.
+        """
+        from adaptive_queries import build_adaptive_queries, run_adaptive
+
+        # Step 1: SPLADE encode
+        if verbose:
+            print(f"Query: {query}")
+            print(f"\nStep 1: SPLADE encoding...")
+        all_tokens = self.encode_query(query)
+        if verbose:
+            print(f"  {len(all_tokens)} non-zero tokens in SPLADE embedding")
+
+        # Step 2: Filter and score
+        if verbose:
+            print(f"\nStep 2: Filtering (min_splade={min_splade_score}) and scoring...")
+        scored = self.score_tokens(all_tokens, min_splade_score=min_splade_score)
+        if verbose:
+            print(f"  {len(scored)} tokens after filtering")
+            print(f"\n  {'Token':<20s} {'SPLADE':>8s} {'TUP':>12s} {'Combined':>10s}")
+            print(f"  {'-'*52}")
+            for token, splade, tup, combined in scored:
+                print(f"  {token:<20s} {splade:>8.3f} {tup:>12.2e} {combined:>10.2f}")
+
+        if len(scored) < 1:
+            print("  Not enough tokens")
+            return [], scored
+
+        # Step 3: Build adaptive queries (peeks at counts)
+        if verbose:
+            print(f"\nStep 3: Building adaptive queries...")
+        queries = build_adaptive_queries(
+            scored,
+            self.infini_tokenizer,
+            engine,
+            query_text=query,
+            min_stem_len=min_stem_len,
+            anchor_score=anchor_score,
+            max_anchor_tup=max_anchor_tup,
+            max_standalone=max_standalone,
+            max_refined=max_refined,
+            min_cluster_score=min_cluster_score,
+            max_queries=max_queries,
+            max_clause_freq=max_clause_freq,
+            verbose=verbose,
+        )
+
+        if not queries:
+            return [], scored
+
+        # Step 4: Execute queries
+        if verbose:
+            print(f"\nStep 4: Executing queries...")
+        executed = run_adaptive(
+            engine, queries,
+            max_clause_freq=max_clause_freq,
+            min_retrieved_docs=min_retrieved_docs,
+            verbose=verbose,
+        )
+
+        return executed, scored
