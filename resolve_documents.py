@@ -62,12 +62,49 @@ def resolve_all_queries(
     print("Step 1: Collecting pointers from all queries...")
     # shard -> list of (ptr, query_idx)
     shard_ptrs = {}
+
+    # Handle CNF queries (ptrs_by_shard)
     for q_idx, q in enumerate(queries):
         ptrs_by_shard = q.get("ptrs_by_shard", [])
         for s, ptrs in enumerate(ptrs_by_shard):
             if s not in shard_ptrs:
                 shard_ptrs[s] = []
             for ptr in ptrs:
+                shard_ptrs[s].append((int(ptr), q_idx))
+
+    # Handle simple find() queries (segment_by_shard)
+    # Convert rank ranges to byte pointers via the suffix array
+    sa_entry_bytes = 5
+    for q_idx, q in enumerate(queries):
+        segments = q.get("segment_by_shard", [])
+        if not segments:
+            continue
+        for s, seg in enumerate(segments):
+            if not isinstance(seg, (list, tuple)) or len(seg) < 2:
+                continue
+            start, end = int(seg[0]), int(seg[1])
+            n = end - start
+            if n <= 0:
+                continue
+
+            # Read SA entries to get byte pointers
+            sa_path = index_dir / f"table.{s}"
+            with open(sa_path, "rb") as sa_f:
+                import mmap as mmap_module
+                sa_mm = mmap_module.mmap(sa_f.fileno(), 0, access=mmap_module.ACCESS_READ)
+                try:
+                    sa_offset = start * sa_entry_bytes
+                    sa_bytes = sa_mm[sa_offset: sa_offset + n * sa_entry_bytes]
+                    sa_raw = np.frombuffer(sa_bytes, dtype=np.uint8).reshape(n, sa_entry_bytes)
+                    sa_padded = np.zeros((n, 8), dtype=np.uint8)
+                    sa_padded[:, :sa_entry_bytes] = sa_raw
+                    byte_ptrs = np.frombuffer(sa_padded.tobytes(), dtype="<u8").reshape(n)
+                finally:
+                    sa_mm.close()
+
+            if s not in shard_ptrs:
+                shard_ptrs[s] = []
+            for ptr in byte_ptrs:
                 shard_ptrs[s].append((int(ptr), q_idx))
 
     total_ptrs = sum(len(v) for v in shard_ptrs.values())
