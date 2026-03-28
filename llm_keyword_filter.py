@@ -190,13 +190,17 @@ def load_and_filter(
     """
     Load keyword expansions for a query and filter+validate them.
 
+    Supports two formats:
+    - Flat: {"core": [...], "expansion": [...]}
+    - Faceted: {"CORE: concept": [...], "AUX: aspect": [...], ...}
+
     Args:
         qid: Query ID.
-        expansions_path: Path to keyword_expansions.json.
+        expansions_path: Path to expansions file (JSON or JSONL).
         tokenizer: Infini-gram tokenizer.
         engine: Infini-gram engine.
         max_count: Skip phrases above this count.
-        use_core_only: If True, only use core keywords (skip expansion).
+        use_core_only: If True, only use CORE facets (skip AUX).
         verbose: Print details.
 
     Returns:
@@ -210,13 +214,33 @@ def load_and_filter(
             print(f"  No expansions found for {qid}")
         return []
 
-    keywords = list(data.get("core", []))
-    if not use_core_only:
-        keywords.extend(data.get("expansion", []))
+    # Detect format and extract keywords
+    keywords = []
+    n_core = 0
+    n_aux = 0
+
+    if "core" in data and isinstance(data["core"], list):
+        # Flat format: {"core": [...], "expansion": [...]}
+        keywords.extend(data["core"])
+        n_core = len(data["core"])
+        if not use_core_only:
+            keywords.extend(data.get("expansion", []))
+            n_aux = len(data.get("expansion", []))
+    else:
+        # Faceted format: {"CORE: x": [...], "AUX: y": [...], ...}
+        for key, values in data.items():
+            if not isinstance(values, list):
+                continue
+            is_core = key.upper().startswith("CORE")
+            if is_core:
+                keywords.extend(values)
+                n_core += len(values)
+            elif not use_core_only:
+                keywords.extend(values)
+                n_aux += len(values)
 
     if verbose:
-        print(f"  Query {qid}: {len(data.get('core', []))} core + "
-              f"{len(data.get('expansion', []))} expansion keywords")
+        print(f"  Query {qid}: {n_core} core + {n_aux} aux keywords")
 
     return filter_and_validate_keywords(
         keywords, tokenizer, engine,
@@ -224,15 +248,46 @@ def load_and_filter(
     )
 
 
+def load_faceted_keywords(qid: str, expansions_path: str) -> dict:
+    """
+    Load faceted keywords preserving the facet structure.
+
+    Returns:
+        Dict with 'core_facets' and 'aux_facets', each mapping
+        facet_name -> list of keywords.
+    """
+    expansions = load_all_expansions(expansions_path)
+    data = expansions.get(qid, {})
+
+    core_facets = {}
+    aux_facets = {}
+
+    for key, values in data.items():
+        if not isinstance(values, list):
+            continue
+        # Strip prefix for clean facet name
+        if key.upper().startswith("CORE:"):
+            clean = key.split(":", 1)[1].strip()
+            core_facets[clean] = values
+        elif key.upper().startswith("AUX:"):
+            clean = key.split(":", 1)[1].strip()
+            aux_facets[clean] = values
+        else:
+            # No prefix — treat as aux
+            aux_facets[key] = values
+
+    return {"core_facets": core_facets, "aux_facets": aux_facets}
+
+
 def load_all_expansions(expansions_path: str) -> dict:
     """
     Load keyword expansions from JSON or JSONL file.
 
-    JSON: {"qid": {"core": [...], "expansion": [...]}, ...}
-    JSONL: one {"qid": "...", "core": [...], "expansion": [...]} per line
+    JSON: {"qid": {...}, ...}
+    JSONL: one {"qid": "...", ...} per line
 
     Returns:
-        Dict mapping qid -> {"core": [...], "expansion": [...]}.
+        Dict mapping qid -> keyword data dict.
     """
     if expansions_path.endswith(".jsonl"):
         expansions = {}
