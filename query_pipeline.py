@@ -404,3 +404,86 @@ class QueryPipeline:
         )
 
         return executed, scored
+
+    def build_and_run_llm_adaptive(
+        self,
+        query: str,
+        qid: str,
+        engine,
+        expansions_path: str,
+        min_splade_score: float = 0.3,
+        max_standalone: int = 10000,
+        max_refined: int = 50000,
+        max_count: int = 500000,
+        max_queries: int = 50,
+        max_clause_freq: int = 100000,
+        min_retrieved_docs: int = None,
+        use_core_only: bool = False,
+        verbose: bool = True,
+    ) -> tuple[list[dict], list[tuple]]:
+        """
+        Full LLM-keyword-driven pipeline:
+        query -> SPLADE encode (for scoring) -> LLM keywords -> adaptive queries -> execute.
+
+        Args:
+            query: Natural language query string.
+            qid: Query ID (for looking up LLM expansions).
+            engine: Infini-gram engine.
+            expansions_path: Path to LLM keyword expansions JSONL.
+            min_splade_score: Min SPLADE score for token filtering (scoring only).
+            max_standalone: Max count for direct find() queries.
+            max_refined: Max count for AND-refined queries.
+            max_count: Skip terms above this entirely.
+            max_queries: Max total queries.
+            max_clause_freq: For CNF sampling.
+            min_retrieved_docs: Stop executing after enough pointers.
+            use_core_only: Only use core facets from LLM keywords.
+            verbose: Print intermediate steps.
+
+        Returns:
+            Tuple of (executed_queries, scored_tokens).
+        """
+        from llm_adaptive_queries import build_llm_adaptive_queries, run_llm_adaptive
+
+        # Step 1: SPLADE encode for crude scoring
+        if verbose:
+            print(f"Query: [{qid}] {query}")
+            print(f"\nStep 1: SPLADE encoding (for scoring)...")
+        all_tokens = self.encode_query(query)
+        scored = self.score_tokens(all_tokens, min_splade_score=min_splade_score)
+        if verbose:
+            print(f"  {len(scored)} scored tokens")
+
+        # Step 2: Build queries from LLM keywords
+        if verbose:
+            print(f"\nStep 2: Building queries from LLM keywords...")
+        queries, all_validated = build_llm_adaptive_queries(
+            qid=qid,
+            expansions_path=expansions_path,
+            tokenizer=self.infini_tokenizer,
+            engine=engine,
+            max_standalone=max_standalone,
+            max_refined=max_refined,
+            max_count=max_count,
+            max_queries=max_queries,
+            max_clause_freq=max_clause_freq,
+            use_core_only=use_core_only,
+            verbose=verbose,
+        )
+
+        if not queries:
+            if verbose:
+                print("  No queries generated!")
+            return [], scored
+
+        # Step 3: Execute queries
+        if verbose:
+            print(f"\nStep 3: Executing {len(queries)} queries...")
+        executed = run_llm_adaptive(
+            engine, queries,
+            max_clause_freq=max_clause_freq,
+            min_retrieved_docs=min_retrieved_docs,
+            verbose=verbose,
+        )
+
+        return executed, scored

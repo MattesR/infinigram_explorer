@@ -80,6 +80,10 @@ def run_full_eval(
     adaptive: bool = False,
     max_standalone: int = 10000,
     max_refined: int = 20000,
+    llm_adaptive: bool = False,
+    expansions_path: str = None,
+    max_count: int = 500000,
+    use_core_only: bool = False,
 ):
     """
     Run the full pipeline on all topics, write a TREC run file, and evaluate.
@@ -117,9 +121,13 @@ def run_full_eval(
 
     print(f"Loaded {len(topics)} topics from {topics_path}")
     print(f"Output: {run_path}")
-    print(f"Settings: adaptive={adaptive}, use_chunking={use_chunking}, "
-          f"top_splade_filter={top_splade_filter}, max_clause_freq={max_clause_freq}")
-    if adaptive:
+    mode = "llm_adaptive" if llm_adaptive else ("adaptive" if adaptive else "static")
+    print(f"Settings: mode={mode}, top_splade_filter={top_splade_filter}, "
+          f"max_clause_freq={max_clause_freq}")
+    if llm_adaptive:
+        print(f"  expansions_path={expansions_path}")
+        print(f"  max_standalone={max_standalone}, max_refined={max_refined}, max_count={max_count}")
+    elif adaptive:
         print(f"  max_standalone={max_standalone}, max_refined={max_refined}")
     if min_retrieved_docs:
         print(f"  min_retrieved_docs={min_retrieved_docs}")
@@ -139,7 +147,30 @@ def run_full_eval(
         timing = {"qid": qid}
 
         try:
-            if adaptive:
+            if llm_adaptive:
+                # LLM keyword-driven adaptive pipeline
+                if not expansions_path:
+                    raise ValueError("llm_adaptive requires expansions_path")
+                t0 = time.perf_counter()
+                queries, scored = pipeline.build_and_run_llm_adaptive(
+                    query_text,
+                    qid=qid,
+                    engine=engine,
+                    expansions_path=expansions_path,
+                    min_splade_score=min_splade_score,
+                    max_standalone=max_standalone,
+                    max_refined=max_refined,
+                    max_count=max_count,
+                    max_queries=max_queries_per_topic,
+                    max_clause_freq=max_clause_freq,
+                    min_retrieved_docs=min_retrieved_docs,
+                    use_core_only=use_core_only,
+                    verbose=False,
+                )
+                timing["encode"] = 0
+                timing["query_build_run"] = time.perf_counter() - t0
+
+            elif adaptive:
                 # Adaptive pipeline: encode + score + build + execute in one call
                 t0 = time.perf_counter()
                 queries, scored = pipeline.build_and_run_adaptive(
