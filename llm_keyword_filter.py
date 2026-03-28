@@ -202,8 +202,7 @@ def load_and_filter(
     Returns:
         List of validated keyword dicts.
     """
-    with open(expansions_path) as f:
-        expansions = json.load(f)
+    expansions = load_all_expansions(expansions_path)
 
     data = expansions.get(qid, {})
     if not data:
@@ -226,6 +225,26 @@ def load_and_filter(
 
 
 def load_all_expansions(expansions_path: str) -> dict:
-    """Load the full expansions dict."""
-    with open(expansions_path) as f:
-        return json.load(f)
+    """
+    Load keyword expansions from JSON or JSONL file.
+
+    JSON: {"qid": {"core": [...], "expansion": [...]}, ...}
+    JSONL: one {"qid": "...", "core": [...], "expansion": [...]} per line
+
+    Returns:
+        Dict mapping qid -> {"core": [...], "expansion": [...]}.
+    """
+    if expansions_path.endswith(".jsonl"):
+        expansions = {}
+        with open(expansions_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                qid = entry.pop("qid")
+                expansions[qid] = entry
+        return expansions
+    else:
+        with open(expansions_path) as f:
+            return json.load(f)
