@@ -28,21 +28,24 @@ def resolve_all_queries(
     token_width: int = 2,
     top_splade_filter: int = None,
     top_tokens: list[tuple] = None,
+    scoring_terms: list[dict] = None,
 ) -> list[dict]:
     """
-    Take all queries with ptrs_by_shard, resolve to unique documents,
-    and fetch metadata + token sequences.
+    Take all queries with ptrs_by_shard/segment_by_shard, resolve to unique
+    documents, and fetch metadata + token sequences.
 
     Args:
-        queries: List of query dicts from run_queries(), each with 'ptrs_by_shard'.
+        queries: List of query dicts, each with 'ptrs_by_shard' and/or 'segment_by_shard'.
         index_dir: Path to the infini-gram index directory.
         tokenizer: If provided, decode tokens to text (infini-gram tokenizer).
         max_doc_len: Maximum number of tokens to read per document.
         token_width: Bytes per token (2 for 16-bit).
-        top_splade_filter: If set, crude-score all documents using the important
-            tokens and only keep this many top-scoring documents.
-        top_tokens: List of (token, splade_score, tup, combined_score) tuples.
-            Required if top_splade_filter is set.
+        top_splade_filter: If set, score all documents and keep this many top-scoring.
+        top_tokens: SPLADE scored tokens for crude scoring.
+            List of (token, splade_score, tup, combined_score).
+        scoring_terms: LLM validated keywords for crude scoring.
+            List of dicts with 'phrase', 'input_ids', 'count'.
+            Takes precedence over top_tokens if both provided.
 
     Returns:
         List of document dicts, each with:
@@ -53,7 +56,7 @@ def resolve_all_queries(
             - 'tokens': np.ndarray of token IDs (up to max_doc_len)
             - 'text': decoded text (if tokenizer provided)
             - 'from_queries': list of query indices that found this document
-            - 'crude_score': (if top_splade_filter set) bag-of-words relevance score
+            - 'crude_score': (if filtering set) relevance score
     """
     index_dir = Path(index_dir)
     dtype = np.dtype(f"<u{token_width}")
@@ -214,17 +217,35 @@ def resolve_all_queries(
     n_multi = sum(1 for d in documents if len(d["from_queries"]) > 1)
     print(f"  {n_multi} documents found by multiple queries")
 
-    # Crude SPLADE-based filtering
-    if top_splade_filter is not None and top_tokens is not None:
+    # Crude scoring and filtering
+    if top_splade_filter is not None and (top_tokens is not None or scoring_terms is not None):
         print(f"\nStep 4: Crude scoring and filtering to top {top_splade_filter}...")
 
-        # Precompute important token IDs (SPLADE/BERT -> Llama)
-        important_words = []
-        for token, splade_score, tup, combined in top_tokens:
-            clean = token.lstrip("#")
-            ids = tokenizer.encode(clean, add_special_tokens=False)
-            if ids:
-                important_words.append((set(ids), combined))
+        if scoring_terms is not None:
+            # LLM keyword scoring: score by keyword overlap
+            # scoring_terms is a list of dicts with 'phrase', 'input_ids', 'count'
+            # Score = sum of (1/log(count+2)) for each matching term
+            # Lower count terms are more specific → higher weight
+            import math
+            important_words = []
+            for term in scoring_terms:
+                ids = set(term["input_ids"])
+                # Weight: more specific terms (lower count) score higher
+                weight = 1.0 / math.log(term["count"] + 2)
+                important_words.append((ids, weight))
+
+            print(f"  Scoring with {len(important_words)} LLM keywords")
+
+        elif top_tokens is not None:
+            # SPLADE scoring: score by token overlap weighted by combined score
+            important_words = []
+            for token, splade_score, tup, combined in top_tokens:
+                clean = token.lstrip("#")
+                ids = tokenizer.encode(clean, add_special_tokens=False)
+                if ids:
+                    important_words.append((set(ids), combined))
+
+            print(f"  Scoring with {len(important_words)} SPLADE tokens")
 
         # Score each document
         for doc in tqdm(documents, desc="Scoring"):

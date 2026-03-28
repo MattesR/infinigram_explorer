@@ -147,12 +147,14 @@ def run_full_eval(
         timing = {"qid": qid}
 
         try:
+            scoring_terms_q = None
+
             if llm_adaptive:
                 # LLM keyword-driven adaptive pipeline
                 if not expansions_path:
                     raise ValueError("llm_adaptive requires expansions_path")
                 t0 = time.perf_counter()
-                queries, scored = pipeline.build_and_run_llm_adaptive(
+                queries, scored, scoring_terms_q = pipeline.build_and_run_llm_adaptive(
                     query_text,
                     qid=qid,
                     engine=engine,
@@ -227,14 +229,19 @@ def run_full_eval(
 
             # Step 3: Resolve documents
             t0 = time.perf_counter()
-            docs = resolve_all_queries(
-                queries=queries,
-                index_dir=index_dir,
-                tokenizer=tokenizer,
-                max_doc_len=max_doc_len,
-                top_splade_filter=top_splade_filter,
-                top_tokens=scored,
-            )
+            resolve_kwargs = {
+                "queries": queries,
+                "index_dir": index_dir,
+                "tokenizer": tokenizer,
+                "max_doc_len": max_doc_len,
+                "top_splade_filter": top_splade_filter,
+            }
+            if llm_adaptive and scoring_terms_q:
+                resolve_kwargs["scoring_terms"] = scoring_terms_q
+            else:
+                resolve_kwargs["top_tokens"] = scored
+
+            docs = resolve_all_queries(**resolve_kwargs)
             timing["resolve"] = time.perf_counter() - t0
             timing["n_docs"] = len(docs)
             total_docs += len(docs)

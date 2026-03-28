@@ -441,14 +441,16 @@ class QueryPipeline:
             verbose: Print intermediate steps.
 
         Returns:
-            Tuple of (executed_queries, scored_tokens).
+            Tuple of (executed_queries, scored_tokens, all_validated).
+            scored_tokens: SPLADE tokens for fallback scoring.
+            all_validated: LLM keyword dicts for LLM-based scoring.
         """
         from llm_adaptive_queries import build_llm_adaptive_queries, run_llm_adaptive
 
-        # Step 1: SPLADE encode for crude scoring
+        # Step 1: SPLADE encode for fallback scoring
         if verbose:
             print(f"Query: [{qid}] {query}")
-            print(f"\nStep 1: SPLADE encoding (for scoring)...")
+            print(f"\nStep 1: SPLADE encoding (for fallback scoring)...")
         all_tokens = self.encode_query(query)
         scored = self.score_tokens(all_tokens, min_splade_score=min_splade_score)
         if verbose:
@@ -474,7 +476,7 @@ class QueryPipeline:
         if not queries:
             if verbose:
                 print("  No queries generated!")
-            return [], scored
+            return [], scored, all_validated
 
         # Step 3: Execute queries
         if verbose:
@@ -486,4 +488,4 @@ class QueryPipeline:
             verbose=verbose,
         )
 
-        return executed, scored
+        return executed, scored, all_validated
