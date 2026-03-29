@@ -136,8 +136,8 @@ def compare_recall_ceiling(
     engine,
     tokenizer,
     index_dir: str = "../msmarco_segmented_index/",
-    expansions_path: str = None,
-    modes: list[str] = None,
+    expansions_paths: dict = None,
+    include_splade: bool = True,
     max_topics: int = None,
     max_standalone: int = 10000,
     max_refined: int = 50000,
@@ -148,11 +148,27 @@ def compare_recall_ceiling(
     Compare raw retrieval recall across pipeline modes.
 
     Args:
-        modes: List of modes to compare. Default: all available.
-            Options: "llm_adaptive", "splade_adaptive", "static"
+        expansions_paths: Dict mapping label -> JSONL path.
+            e.g. {"llm_v1": "kw_v1.jsonl", "llm_v2": "kw_v2.jsonl"}
+            Each becomes an llm_adaptive mode with that label.
+        include_splade: If True, also run splade_adaptive for comparison.
+        max_topics: Limit number of topics.
     """
-    if modes is None:
-        modes = ["llm_adaptive", "splade_adaptive"] if expansions_path else ["splade_adaptive", "static"]
+    # Build modes list
+    modes = []
+    mode_expansions = {}  # mode_name -> expansions_path
+
+    if expansions_paths:
+        for label, path in expansions_paths.items():
+            modes.append(label)
+            mode_expansions[label] = path
+
+    if include_splade:
+        modes.append("splade_adaptive")
+
+    if not modes:
+        print("No modes to compare!")
+        return {}
 
     topics = load_topics(topics_path)
     if max_topics:
@@ -160,11 +176,11 @@ def compare_recall_ceiling(
 
     qrels = load_qrels(qrels_path)
 
-    print(f"Comparing retrieval recall ceiling across modes: {modes}")
+    print(f"Comparing retrieval recall ceiling")
+    print(f"Modes: {modes}")
     print(f"Topics: {len(topics)}")
     print(f"{'='*80}\n")
 
-    # Results per mode
     all_results = {mode: [] for mode in modes}
 
     for qid, query_text in tqdm(topics, desc="Topics"):
@@ -175,13 +191,17 @@ def compare_recall_ceiling(
                 "max_queries": max_queries,
                 "max_clause_freq": max_clause_freq,
             }
-            if mode == "llm_adaptive":
-                kwargs["expansions_path"] = expansions_path
+
+            if mode in mode_expansions:
+                actual_mode = "llm_adaptive"
+                kwargs["expansions_path"] = mode_expansions[mode]
+            else:
+                actual_mode = mode
 
             try:
                 result = retrieval_recall(
                     qid, query_text, qrels, pipeline, engine, tokenizer,
-                    index_dir=index_dir, mode=mode, **kwargs,
+                    index_dir=index_dir, mode=actual_mode, **kwargs,
                 )
                 if result:
                     all_results[mode].append(result)
@@ -190,14 +210,14 @@ def compare_recall_ceiling(
 
     # Print comparison table
     print(f"\n{'='*80}")
-    print(f"{'Mode':<20s} {'Topics':>7s} {'Avg Recall':>12s} {'Avg Retrieved':>15s} "
+    print(f"{'Mode':<25s} {'Topics':>7s} {'Avg Recall':>12s} {'Avg Retrieved':>15s} "
           f"{'Avg Found':>11s} {'Avg Relevant':>13s} {'Avg Time':>10s}")
     print(f"{'='*80}")
 
     for mode in modes:
         results = all_results[mode]
         if not results:
-            print(f"{mode:<20s}  No results")
+            print(f"{mode:<25s}  No results")
             continue
 
         n = len(results)
@@ -207,7 +227,7 @@ def compare_recall_ceiling(
         avg_relevant = sum(r["n_relevant"] for r in results) / n
         avg_time = sum(r["time_query"] + r["time_resolve"] for r in results) / n
 
-        print(f"{mode:<20s} {n:>7d} {avg_recall:>12.4f} {avg_retrieved:>15.0f} "
+        print(f"{mode:<25s} {n:>7d} {avg_recall:>12.4f} {avg_retrieved:>15.0f} "
               f"{avg_found:>11.1f} {avg_relevant:>13.1f} {avg_time:>9.2f}s")
 
     # Per-query comparison
@@ -216,17 +236,15 @@ def compare_recall_ceiling(
     print(f"{'='*80}")
     header = f"{'QID':<15s}"
     for mode in modes:
-        header += f" {mode:>18s}"
+        header += f" {mode:>20s}"
     header += f" {'Relevant':>9s}"
     print(header)
     print("-" * len(header))
 
-    # Build lookup
     mode_lookup = {}
     for mode in modes:
         mode_lookup[mode] = {r["qid"]: r for r in all_results[mode]}
 
-    # Get all qids that appear in any mode
     all_qids = set()
     for mode in modes:
         all_qids.update(r["qid"] for r in all_results[mode])
@@ -237,26 +255,31 @@ def compare_recall_ceiling(
         for mode in modes:
             r = mode_lookup[mode].get(qid)
             if r:
-                row += f" {r['n_found']:>6d}/{r['n_retrieved']:<5d} ({r['recall']:.2f})"
+                row += f" {r['n_found']:>6d}/{r['n_retrieved']:<6d}({r['recall']:.2f})"
                 n_rel = r["n_relevant"]
             else:
-                row += f" {'N/A':>18s}"
+                row += f" {'N/A':>20s}"
         row += f" {n_rel:>9d}"
         print(row)
 
-    # Summary: how many queries does LLM beat SPLADE?
-    if "llm_adaptive" in modes and "splade_adaptive" in modes:
-        llm_lookup = {r["qid"]: r for r in all_results["llm_adaptive"]}
-        splade_lookup = {r["qid"]: r for r in all_results["splade_adaptive"]}
-        common_qids = set(llm_lookup.keys()) & set(splade_lookup.keys())
+    # Head-to-head for each pair of modes
+    if len(modes) >= 2:
+        print(f"\nHead-to-head comparisons:")
+        from itertools import combinations
+        for mode_a, mode_b in combinations(modes, 2):
+            lookup_a = {r["qid"]: r for r in all_results[mode_a]}
+            lookup_b = {r["qid"]: r for r in all_results[mode_b]}
+            common = set(lookup_a.keys()) & set(lookup_b.keys())
+            if not common:
+                continue
 
-        llm_wins = sum(1 for q in common_qids if llm_lookup[q]["recall"] > splade_lookup[q]["recall"])
-        splade_wins = sum(1 for q in common_qids if splade_lookup[q]["recall"] > llm_lookup[q]["recall"])
-        ties = len(common_qids) - llm_wins - splade_wins
+            a_wins = sum(1 for q in common if lookup_a[q]["recall"] > lookup_b[q]["recall"])
+            b_wins = sum(1 for q in common if lookup_b[q]["recall"] > lookup_a[q]["recall"])
+            ties = len(common) - a_wins - b_wins
+            avg_diff = sum(lookup_a[q]["recall"] - lookup_b[q]["recall"] for q in common) / len(common)
 
-        print(f"\nHead-to-head ({len(common_qids)} queries):")
-        print(f"  LLM wins:    {llm_wins}")
-        print(f"  SPLADE wins: {splade_wins}")
-        print(f"  Ties:        {ties}")
+            print(f"  {mode_a} vs {mode_b} ({len(common)} queries):")
+            print(f"    {mode_a} wins: {a_wins}, {mode_b} wins: {b_wins}, ties: {ties}")
+            print(f"    Avg recall diff: {avg_diff:+.4f}")
 
     return all_results
