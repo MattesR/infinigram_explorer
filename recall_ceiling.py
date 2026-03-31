@@ -62,7 +62,6 @@ def retrieval_recall(
             expansions_path=expansions_path,
             max_standalone=max_standalone,
             max_standalone_sup=max_standalone_sup,
-            max_refined=max_refined,
             max_queries=max_queries,
             max_clause_freq=max_clause_freq,
             filter_mode=filter_mode,

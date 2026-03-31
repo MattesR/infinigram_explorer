@@ -45,7 +45,6 @@ def build_llm_adaptive_queries(
     engine,
     max_standalone: int = 5000,
     max_standalone_sup: int = 1000,
-    max_refined: int = 50000,
     max_count: int = 500000,
     max_queries: int = 50,
     max_clause_freq: int = 100000,
@@ -219,11 +218,14 @@ def build_llm_adaptive_queries(
         print(f"Phase 2: AND high-count terms with KEY OR-clause")
         print(f"{'='*60}")
 
-    # Build the KEY OR-clause from all core validated terms
+    # Build the KEY OR-clause from core validated terms
+    # Only include terms that are exact phrases (not AND-fallbacks)
     key_or_ids = []
     key_or_names = []
     for facet_name, validated in core_validated.items():
         for term in validated:
+            if "cnf" in term:
+                continue  # AND-fallback terms can't be in an OR clause
             ids = term["input_ids"]
             if ids and ids not in key_or_ids:
                 key_or_ids.append(ids)
@@ -260,7 +262,7 @@ def build_llm_adaptive_queries(
         result = engine.find_cnf(**kwargs)
         cnt = result.get("cnt", 0)
 
-        if cnt > 0 and cnt <= max_refined:
+        if cnt > 0 and cnt <= max_standalone:
             key_str = " OR ".join(key_or_names[:5])
             if len(key_or_names) > 5:
                 key_str += f" +{len(key_or_names)-5}"
@@ -274,7 +276,7 @@ def build_llm_adaptive_queries(
             })
             if verbose:
                 print(f"    AND: ({term['phrase']}) -> {cnt:,d} hits")
-        elif verbose and cnt > max_refined:
+        elif verbose and cnt > max_standalone:
             print(f"    SKIP: ({term['phrase']}) -> {cnt:,d} hits (too broad)")
 
     # ================================================================
@@ -285,13 +287,15 @@ def build_llm_adaptive_queries(
         print(f"Phase 3: Facet OR-clauses AND'd across facets")
         print(f"{'='*60}")
 
-    # Build OR clause per facet (using all validated terms, not just ungrabbed)
+    # Build OR clause per facet (only exact phrase terms, not AND-fallbacks)
     facet_or_clauses = {}
     for facet_name, validated in list(core_validated.items()) + list(aux_validated.items()):
         or_ids = []
         or_names = []
         for term in validated:
-            if term["count"] <= max_refined:
+            if "cnf" in term:
+                continue  # AND-fallback can't be in OR clause
+            if term["count"] <= max_standalone:
                 or_ids.append(term["input_ids"])
                 or_names.append(term["phrase"])
         if or_ids:
@@ -355,7 +359,7 @@ def build_llm_adaptive_queries(
             result = engine.find_cnf(**kwargs)
             cnt = result.get("cnt", 0)
 
-            if 0 < cnt <= max_refined:
+            if 0 < cnt <= max_standalone:
                 c_str = " OR ".join(names_core[:4])
                 if len(names_core) > 4:
                     c_str += f" +{len(names_core)-4}"

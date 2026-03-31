@@ -164,7 +164,6 @@ def run_full_eval(
                     min_splade_score=min_splade_score,
                     max_standalone=max_standalone,
                     max_standalone_sup=max_standalone_sup,
-                    max_refined=max_refined,
                     max_count=max_count,
                     max_queries=max_queries_per_topic,
                     max_clause_freq=max_clause_freq,
