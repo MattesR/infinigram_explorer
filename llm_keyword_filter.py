@@ -84,7 +84,7 @@ def extract_noun_phrases(keywords: list[str]) -> list[str]:
 
 
 def validate_against_index(
-    phrases: list[str],
+    phrases,
     tokenizer,
     engine,
     max_count: int = None,
@@ -94,19 +94,28 @@ def validate_against_index(
     Check each phrase against the index and return those with >0 hits.
 
     Args:
-        phrases: List of keyword/phrase strings.
+        phrases: List of keyword/phrase strings OR list of dicts with
+            'phrase' and 'standalone' keys (from stopword_filter).
         tokenizer: Infini-gram tokenizer.
         engine: Infini-gram engine.
         max_count: If set, skip phrases with count above this (too broad).
         verbose: Print counts.
 
     Returns:
-        List of dicts with 'phrase', 'input_ids', 'count', sorted by count ascending
-        (most specific first).
+        List of dicts with 'phrase', 'input_ids', 'count', 'standalone',
+        sorted by count ascending (most specific first).
     """
     validated = []
 
-    for phrase in phrases:
+    for item in phrases:
+        # Handle both string and dict input
+        if isinstance(item, dict):
+            phrase = item["phrase"]
+            standalone = item.get("standalone", True)
+        else:
+            phrase = item
+            standalone = True
+
         ids = tokenizer.encode(phrase, add_special_tokens=False)
         if not ids:
             continue
@@ -115,7 +124,8 @@ def validate_against_index(
 
         if count == 0:
             if verbose:
-                print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
+                marker = "" if standalone else " [AND-only]"
+                print(f"    {0:>10,d}  {phrase}{marker} (SKIP: not in corpus)")
             continue
 
         if max_count and count > max_count:
@@ -127,10 +137,12 @@ def validate_against_index(
             "phrase": phrase,
             "input_ids": ids,
             "count": count,
+            "standalone": standalone,
         })
 
         if verbose:
-            print(f"    {count:>10,d}  {phrase}")
+            marker = "" if standalone else " [AND-only]"
+            print(f"    {count:>10,d}  {phrase}{marker}")
 
     # Sort by count ascending (most specific first)
     validated.sort(key=lambda x: x["count"])
@@ -152,45 +164,73 @@ STOPWORDS = {
 }
 
 
-def stopword_filter(keywords: list[str]) -> list[str]:
+def stopword_filter(keywords: list[str]) -> list[dict]:
     """
-    Simple stopword removal: keep all content words from each keyword phrase.
+    Split keyword phrases on stopwords into separate searchable chunks.
 
-    For multi-word keywords, returns both:
-    - The full phrase (if it has content words)
-    - Individual content words
+    "coping with vicarious trauma" -> [
+        {"phrase": "vicarious trauma", "standalone": True},
+        {"phrase": "coping", "standalone": False}  # AND-only, from split
+    ]
+    "Target shoplifting policy" -> [
+        {"phrase": "target shoplifting policy", "standalone": True}
+    ]
 
-    This preserves words like "Target" that NP extraction might drop.
+    Returns list of dicts with 'phrase' and 'standalone' flag.
+    Chunks that resulted from splitting a multi-word keyword on stopwords
+    and are single words get standalone=False (AND-only).
+    The original full keyword (if no stopwords) gets standalone=True.
 
     Args:
         keywords: Raw keyword strings from LLM.
 
     Returns:
-        Deduplicated list of phrases and words, longest first.
+        Deduplicated list of chunk dicts, longest phrases first.
     """
-    filtered = set()
+    seen = set()
+    results = []
+
+    def _add(phrase, standalone):
+        if phrase not in seen and len(phrase) > 2:
+            seen.add(phrase)
+            results.append({"phrase": phrase, "standalone": standalone})
 
     for kw in keywords:
         if not kw or not kw.strip():
             continue
 
         words = kw.strip().split()
-        content_words = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
 
-        if not content_words:
+        # Check if there are any stopwords
+        has_stopwords = any(w.lower() in STOPWORDS for w in words)
+
+        if not has_stopwords:
+            # No stopwords — entire phrase is standalone
+            phrase = " ".join(words).lower()
+            _add(phrase, standalone=True)
             continue
 
-        # Add the full filtered phrase
-        phrase = " ".join(content_words)
-        if len(phrase) > 2:
-            filtered.add(phrase.lower())
+        # Split on stopwords into chunks
+        chunks = []
+        current_chunk = []
+        for w in words:
+            if w.lower() in STOPWORDS:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk).lower())
+                    current_chunk = []
+            else:
+                current_chunk.append(w)
+        if current_chunk:
+            chunks.append(" ".join(current_chunk).lower())
 
-        # Also add individual words (for AND combinations)
-        for w in content_words:
-            if len(w) > 2:
-                filtered.add(w.lower())
+        # Multi-word chunks are standalone, single words are AND-only
+        for chunk in chunks:
+            is_single_word = " " not in chunk
+            _add(chunk, standalone=not is_single_word)
 
-    return sorted(filtered, key=lambda x: len(x), reverse=True)
+    # Sort by length descending
+    results.sort(key=lambda x: len(x["phrase"]), reverse=True)
+    return results
 
 
 def filter_and_validate_keywords(

@@ -1,23 +1,15 @@
 """
 LLM-keyword-driven adaptive query construction.
 
-Uses faceted keyword expansions from an LLM (via batch_keywords.py)
-combined with index count validation to build efficient queries.
+Clean 3-phase approach:
+  Phase 1: Grab all validated terms (KEY + SUP) below max_standalone directly.
+  Phase 2: For remaining high-count terms, AND with KEY OR-clause.
+  Phase 3: OR across facets AND'd across facets for broad coverage.
 
-Core facets are the main concepts — their terms get grabbed directly
-if low-count, or AND'd across facets if high-count.
-
-Aux facets narrow down high-count core terms.
+No splitting phrases into words. No redundant AND queries for already-grabbed terms.
 
 Usage:
-    from llm_adaptive_queries import build_llm_adaptive_queries
-
-    queries, validated = build_llm_adaptive_queries(
-        qid="2024-145979",
-        expansions_path="keyword_expansions.jsonl",
-        tokenizer=tokenizer,
-        engine=engine,
-    )
+    from llm_adaptive_queries import build_llm_adaptive_queries, run_llm_adaptive
 """
 
 import time
@@ -25,6 +17,7 @@ from tqdm import tqdm
 from llm_keyword_filter import (
     load_faceted_keywords,
     extract_noun_phrases,
+    stopword_filter,
     validate_against_index,
 )
 
@@ -50,7 +43,8 @@ def build_llm_adaptive_queries(
     expansions_path: str,
     tokenizer,
     engine,
-    max_standalone: int = 10000,
+    max_standalone: int = 5000,
+    max_standalone_sup: int = 1000,
     max_refined: int = 50000,
     max_count: int = 500000,
     max_queries: int = 50,
@@ -62,19 +56,11 @@ def build_llm_adaptive_queries(
     """
     Build adaptive queries from LLM faceted keyword expansions.
 
-    Args:
-        qid: Query ID.
-        expansions_path: Path to keyword expansions JSONL.
-        tokenizer: Infini-gram tokenizer.
-        engine: Infini-gram engine.
-        max_standalone: Grab directly if count below this.
-        max_refined: Max count for AND-refined queries.
-        max_count: Skip terms above this entirely.
-        max_queries: Max total queries.
-        max_clause_freq: For CNF sampling.
-        use_core_only: Only use core facets.
-        filter_mode: "stopword" or "noun_phrase".
-        verbose: Print decisions.
+    Phase 1: Grab KEY terms below max_standalone and SUP terms below
+             max_standalone_sup directly.
+    Phase 2: AND remaining high-count terms with KEY OR-clause
+             (threshold: max_standalone).
+    Phase 3: OR within facets, AND across facets.
 
     Returns:
         Tuple of (queries, all_validated_terms).
@@ -83,6 +69,7 @@ def build_llm_adaptive_queries(
     facets = load_faceted_keywords(qid, expansions_path)
     core_facets = facets["core_facets"]
     aux_facets = facets["aux_facets"]
+    verbs = facets.get("verbs", [])
 
     if verbose:
         print(f"\nQuery {qid}")
@@ -92,51 +79,50 @@ def build_llm_adaptive_queries(
         print(f"  Aux facets: {len(aux_facets)}")
         for name, terms in aux_facets.items():
             print(f"    {name}: {len(terms)} terms")
+        if verbs:
+            print(f"  Verbs: {verbs}")
 
-    # Validate all terms against index
-    if verbose:
-        print(f"\nValidating core facet terms...")
-
-    core_validated = {}  # facet_name -> list of validated term dicts
-    for name, terms in core_facets.items():
+    # Choose filter
+    def _filter(terms):
         if filter_mode == "noun_phrase":
-            phrases = extract_noun_phrases(terms)
+            return extract_noun_phrases(terms)
         else:
-            from llm_keyword_filter import stopword_filter
-            phrases = stopword_filter(terms)
+            return stopword_filter(terms)
+
+    # Validate all facets
+    if verbose:
+        print(f"\nValidating terms (filter_mode={filter_mode})...")
+
+    core_validated = {}
+    for name, terms in core_facets.items():
+        phrases = _filter(terms)
         validated = validate_against_index(
             phrases, tokenizer, engine,
             max_count=max_count, verbose=False,
         )
         core_validated[name] = validated
         if verbose:
-            n_valid = len(validated)
+            n = len(validated)
             counts = [v["count"] for v in validated]
-            count_range = f"{min(counts):,d}-{max(counts):,d}" if counts else "none"
-            print(f"    {name}: {len(terms)} raw -> {n_valid} valid ({count_range})")
+            cr = f"{min(counts):,d}-{max(counts):,d}" if counts else "none"
+            print(f"    KEY {name}: {len(terms)} raw -> {n} valid ({cr})")
 
     aux_validated = {}
     if not use_core_only:
-        if verbose:
-            print(f"\nValidating aux facet terms...")
         for name, terms in aux_facets.items():
-            if filter_mode == "noun_phrase":
-                phrases = extract_noun_phrases(terms)
-            else:
-                from llm_keyword_filter import stopword_filter
-                phrases = stopword_filter(terms)
+            phrases = _filter(terms)
             validated = validate_against_index(
                 phrases, tokenizer, engine,
                 max_count=max_count, verbose=False,
             )
             aux_validated[name] = validated
             if verbose:
-                n_valid = len(validated)
+                n = len(validated)
                 counts = [v["count"] for v in validated]
-                count_range = f"{min(counts):,d}-{max(counts):,d}" if counts else "none"
-                print(f"    {name}: {len(terms)} raw -> {n_valid} valid ({count_range})")
+                cr = f"{min(counts):,d}-{max(counts):,d}" if counts else "none"
+                print(f"    SUP {name}: {len(terms)} raw -> {n} valid ({cr})")
 
-    # Collect all validated terms for crude scoring later
+    # Collect all validated for scoring
     all_validated = []
     for terms in list(core_validated.values()) + list(aux_validated.values()):
         all_validated.extend(terms)
@@ -144,6 +130,7 @@ def build_llm_adaptive_queries(
     # Build queries
     queries = []
     seen_keys = set()
+    grabbed_terms = set()  # phrases already grabbed directly
 
     def _add(q):
         key = _query_key(q)
@@ -153,92 +140,127 @@ def build_llm_adaptive_queries(
             return True
         return False
 
+    # ================================================================
+    # Phase 1: Direct grabs for all low-count terms (KEY + SUP)
+    # ================================================================
     if verbose:
         print(f"\n{'='*60}")
-        print(f"Building queries")
+        print(f"Phase 1: Direct grabs (KEY < {max_standalone:,d}, SUP < {max_standalone_sup:,d})")
         print(f"{'='*60}")
 
-    # Phase 1: Direct grabs from core facets
-    # Low-count terms get grabbed directly
-    if verbose:
-        print(f"\nPhase 1: Direct grabs (count < {max_standalone:,d})")
-
-    for name, validated in core_validated.items():
+    # Grab KEY terms (only standalone ones)
+    for facet_name, validated in core_validated.items():
         for term in validated:
-            if term["count"] <= max_standalone:
+            if not term.get("standalone", True):
+                continue  # AND-only terms skip direct grab
+            if term["count"] <= max_standalone and term["count"] > 0:
                 _add({
                     "type": "simple",
                     "input_ids": term["input_ids"],
                     "description": term["phrase"],
-                    "score": max_standalone - term["count"],  # prefer specific
+                    "score": max_standalone - term["count"],
                     "estimated_count": term["count"],
-                    "facet": name,
+                    "facet": facet_name,
                 })
+                grabbed_terms.add(term["phrase"])
                 if verbose:
-                    print(f"    DIRECT: {term['phrase']} ({term['count']:,d})")
+                    print(f"    KEY DIRECT: {term['phrase']} ({term['count']:,d})")
 
-    # Phase 2: Cross-facet AND for high-count core terms
-    # If a core facet has only high-count terms, AND with terms from other core facets
+    # Grab SUP terms (only standalone ones)
+    for facet_name, validated in aux_validated.items():
+        for term in validated:
+            if not term.get("standalone", True):
+                continue  # AND-only terms skip direct grab
+            if term["count"] <= max_standalone_sup and term["count"] > 0:
+                _add({
+                    "type": "simple",
+                    "input_ids": term["input_ids"],
+                    "description": term["phrase"],
+                    "score": max_standalone_sup - term["count"],
+                    "estimated_count": term["count"],
+                    "facet": facet_name,
+                })
+                grabbed_terms.add(term["phrase"])
+                if verbose:
+                    print(f"    SUP DIRECT: {term['phrase']} ({term['count']:,d})")
+
+    # ================================================================
+    # Phase 2: AND high-count terms with KEY OR-clause
+    # ================================================================
     if verbose:
-        print(f"\nPhase 2: Cross-facet AND for high-count core terms")
+        print(f"\n{'='*60}")
+        print(f"Phase 2: AND high-count terms with KEY OR-clause")
+        print(f"{'='*60}")
 
-    core_names = list(core_validated.keys())
-    for i, name_a in enumerate(core_names):
-        high_a = [t for t in core_validated[name_a] if t["count"] > max_standalone]
-        if not high_a:
+    # Build the KEY OR-clause from all core validated terms
+    key_or_ids = []
+    key_or_names = []
+    for facet_name, validated in core_validated.items():
+        for term in validated:
+            ids = term["input_ids"]
+            if ids and ids not in key_or_ids:
+                key_or_ids.append(ids)
+                key_or_names.append(term["phrase"])
+
+    if key_or_ids and verbose:
+        print(f"  KEY OR-clause: ({' OR '.join(key_or_names[:5])}"
+              f"{'...' if len(key_or_names) > 5 else ''})")
+
+    # Find high-count terms not yet grabbed
+    high_count_terms = []
+    for facet_name, validated in core_validated.items():
+        for term in validated:
+            if term["phrase"] not in grabbed_terms and term["count"] > max_standalone:
+                high_count_terms.append(term)
+    for facet_name, validated in aux_validated.items():
+        for term in validated:
+            if term["phrase"] not in grabbed_terms and term["count"] > max_standalone_sup:
+                high_count_terms.append(term)
+
+    for term in high_count_terms:
+        if len(queries) >= max_queries:
+            break
+
+        if not key_or_ids:
             continue
 
-        for j, name_b in enumerate(core_names):
-            if i == j:
-                continue
+        cnf = [key_or_ids, [term["input_ids"]]]
 
-            terms_b = core_validated[name_b]
-            if not terms_b:
-                continue
+        # Count
+        kwargs = {"cnf": cnf}
+        if max_clause_freq:
+            kwargs["max_clause_freq"] = max_clause_freq
+        result = engine.find_cnf(**kwargs)
+        cnt = result.get("cnt", 0)
 
-            # Try each high-count term from A with each term from B
-            for ta in high_a:
-                for tb in terms_b:
-                    if len(queries) >= max_queries:
-                        break
+        if cnt > 0 and cnt <= max_refined:
+            key_str = " OR ".join(key_or_names[:5])
+            if len(key_or_names) > 5:
+                key_str += f" +{len(key_or_names)-5}"
+            desc = f"({key_str}) AND ({term['phrase']})"
+            _add({
+                "type": "cnf",
+                "cnf": cnf,
+                "description": desc,
+                "score": max_standalone,
+                "estimated_count": cnt,
+            })
+            if verbose:
+                print(f"    AND: ({term['phrase']}) -> {cnt:,d} hits")
+        elif verbose and cnt > max_refined:
+            print(f"    SKIP: ({term['phrase']}) -> {cnt:,d} hits (too broad)")
 
-                    cnf = [[ta["input_ids"]], [tb["input_ids"]]]
-
-                    # Estimate count (cheaper than actually counting)
-                    # Use min of the two as upper bound
-                    est = min(ta["count"], tb["count"])
-
-                    if est > max_refined:
-                        continue
-
-                    # Actually count
-                    kwargs = {"cnf": cnf}
-                    if max_clause_freq:
-                        kwargs["max_clause_freq"] = max_clause_freq
-                    result = engine.find_cnf(**kwargs)
-                    cnt = result.get("cnt", 0)
-
-                    if 0 < cnt <= max_refined:
-                        desc = f"({ta['phrase']}) AND ({tb['phrase']})"
-                        _add({
-                            "type": "cnf",
-                            "cnf": cnf,
-                            "description": desc,
-                            "score": (max_standalone - min(ta["count"], max_standalone)) +
-                                     (max_standalone - min(tb["count"], max_standalone)),
-                            "estimated_count": cnt,
-                            "facets": [name_a, name_b],
-                        })
-                        if verbose:
-                            print(f"    CNF: {desc} ({cnt:,d})")
-
-    # Phase 3: Use OR clauses within facets for broader coverage
-    # Build one OR clause per core facet (low+medium count terms), AND across facets
+    # ================================================================
+    # Phase 3: OR within facets, AND across facets
+    # ================================================================
     if verbose:
-        print(f"\nPhase 3: Facet OR clauses AND'd across facets")
+        print(f"\n{'='*60}")
+        print(f"Phase 3: Facet OR-clauses AND'd across facets")
+        print(f"{'='*60}")
 
-    core_or_clauses = {}  # facet_name -> (or_ids, names)
-    for name, validated in core_validated.items():
+    # Build OR clause per facet (using all validated terms, not just ungrabbed)
+    facet_or_clauses = {}
+    for facet_name, validated in list(core_validated.items()) + list(aux_validated.items()):
         or_ids = []
         or_names = []
         for term in validated:
@@ -246,86 +268,83 @@ def build_llm_adaptive_queries(
                 or_ids.append(term["input_ids"])
                 or_names.append(term["phrase"])
         if or_ids:
-            core_or_clauses[name] = (or_ids, or_names)
+            facet_or_clauses[facet_name] = (or_ids, or_names)
 
-    if len(core_or_clauses) >= 2:
-        from itertools import combinations
-        for (name_a, (or_a, names_a)), (name_b, (or_b, names_b)) in combinations(core_or_clauses.items(), 2):
+    # AND core facets with each other
+    from itertools import combinations
+    core_facet_names = list(core_validated.keys())
+
+    for name_a, name_b in combinations(core_facet_names, 2):
+        if len(queries) >= max_queries:
+            break
+        if name_a not in facet_or_clauses or name_b not in facet_or_clauses:
+            continue
+
+        or_a, names_a = facet_or_clauses[name_a]
+        or_b, names_b = facet_or_clauses[name_b]
+
+        cnf = [or_a, or_b]
+        kwargs = {"cnf": cnf}
+        if max_clause_freq:
+            kwargs["max_clause_freq"] = max_clause_freq
+        result = engine.find_cnf(**kwargs)
+        cnt = result.get("cnt", 0)
+
+        if cnt > 0:
+            a_str = " OR ".join(names_a[:4])
+            if len(names_a) > 4:
+                a_str += f" +{len(names_a)-4}"
+            b_str = " OR ".join(names_b[:4])
+            if len(names_b) > 4:
+                b_str += f" +{len(names_b)-4}"
+            desc = f"({a_str}) AND ({b_str})"
+            _add({
+                "type": "cnf",
+                "cnf": cnf,
+                "description": desc,
+                "score": max_standalone * 2,
+                "estimated_count": cnt,
+            })
+            if verbose:
+                print(f"    FACET AND: {desc} -> {cnt:,d} hits")
+
+    # AND core with aux facets
+    for core_name in core_facet_names:
+        if core_name not in facet_or_clauses:
+            continue
+        or_core, names_core = facet_or_clauses[core_name]
+
+        for aux_name, validated in aux_validated.items():
             if len(queries) >= max_queries:
                 break
+            if aux_name not in facet_or_clauses:
+                continue
 
-            cnf = [or_a, or_b]
+            or_aux, names_aux = facet_or_clauses[aux_name]
+            cnf = [or_core, or_aux]
             kwargs = {"cnf": cnf}
             if max_clause_freq:
                 kwargs["max_clause_freq"] = max_clause_freq
             result = engine.find_cnf(**kwargs)
             cnt = result.get("cnt", 0)
 
-            if cnt > 0:
-                a_str = " OR ".join(names_a[:5])
-                if len(names_a) > 5:
-                    a_str += f" +{len(names_a)-5}"
-                b_str = " OR ".join(names_b[:5])
-                if len(names_b) > 5:
-                    b_str += f" +{len(names_b)-5}"
-                desc = f"({a_str}) AND ({b_str})"
-
+            if 0 < cnt <= max_refined:
+                c_str = " OR ".join(names_core[:4])
+                if len(names_core) > 4:
+                    c_str += f" +{len(names_core)-4}"
+                a_str = " OR ".join(names_aux[:4])
+                if len(names_aux) > 4:
+                    a_str += f" +{len(names_aux)-4}"
+                desc = f"({c_str}) AND ({a_str})"
                 _add({
                     "type": "cnf",
                     "cnf": cnf,
                     "description": desc,
-                    "score": sum(max_standalone - min(t["count"], max_standalone)
-                                for t in core_validated[name_a]) +
-                            sum(max_standalone - min(t["count"], max_standalone)
-                                for t in core_validated[name_b]),
+                    "score": max_standalone,
                     "estimated_count": cnt,
-                    "facets": [name_a, name_b],
                 })
                 if verbose:
-                    print(f"    FACET OR: {desc} ({cnt:,d})")
-
-    # Phase 4: Aux facets AND'd with high-count core terms
-    if not use_core_only and aux_validated:
-        if verbose:
-            print(f"\nPhase 4: Aux facets narrowing high-count core terms")
-
-        for core_name, core_terms in core_validated.items():
-            high_core = [t for t in core_terms if t["count"] > max_standalone]
-            if not high_core:
-                continue
-
-            for aux_name, aux_terms in aux_validated.items():
-                if len(queries) >= max_queries:
-                    break
-
-                for ct in high_core[:3]:  # top 3 high-count core terms
-                    for at in aux_terms[:5]:  # top 5 aux terms
-                        if len(queries) >= max_queries:
-                            break
-
-                        cnf = [[ct["input_ids"]], [at["input_ids"]]]
-                        est = min(ct["count"], at["count"])
-                        if est > max_refined:
-                            continue
-
-                        kwargs = {"cnf": cnf}
-                        if max_clause_freq:
-                            kwargs["max_clause_freq"] = max_clause_freq
-                        result = engine.find_cnf(**kwargs)
-                        cnt = result.get("cnt", 0)
-
-                        if 0 < cnt <= max_refined:
-                            desc = f"({ct['phrase']}) AND ({at['phrase']})"
-                            _add({
-                                "type": "cnf",
-                                "cnf": cnf,
-                                "description": desc,
-                                "score": max_standalone - min(at["count"], max_standalone),
-                                "estimated_count": cnt,
-                                "facets": [core_name, aux_name],
-                            })
-                            if verbose:
-                                print(f"    AUX: {desc} ({cnt:,d})")
+                    print(f"    CORE x AUX: {desc} -> {cnt:,d} hits")
 
     # Sort and truncate
     queries.sort(key=lambda x: x["score"], reverse=True)
@@ -339,10 +358,11 @@ def build_llm_adaptive_queries(
         print(f"\n{'='*60}")
         print(f"Summary: {len(queries)} queries ({n_simple} FIND, {n_cnf} CNF)")
         print(f"  ~{total_est:,d} estimated total docs")
+        print(f"  Grabbed directly: {len(grabbed_terms)} terms")
         print(f"{'='*60}")
         for i, q in enumerate(queries):
             marker = "FIND" if q["type"] == "simple" else "CNF "
-            print(f"  {i+1:3d}. [{marker}] [{q['score']:8.0f}] "
+            print(f"  {i+1:3d}. [{marker}] [{q['score']:>8.0f}] "
                   f"~{q['estimated_count']:>8,d}  {q['description']}")
 
     return queries, all_validated
@@ -355,10 +375,7 @@ def run_llm_adaptive(
     min_retrieved_docs: int = None,
     verbose: bool = True,
 ) -> list[dict]:
-    """
-    Execute queries. Handles both 'simple' and 'cnf' types.
-    Same as run_adaptive but imported here for convenience.
-    """
+    """Execute queries. Handles both 'simple' and 'cnf' types."""
     from adaptive_queries import run_adaptive
     return run_adaptive(
         engine, queries,

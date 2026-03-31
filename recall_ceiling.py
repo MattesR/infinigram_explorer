@@ -35,10 +35,12 @@ def retrieval_recall(
     index_dir: str = "../msmarco_segmented_index/",
     mode: str = "llm_adaptive",
     expansions_path: str = None,
-    max_standalone: int = 10000,
+    max_standalone: int = 5000,
+    max_standalone_sup: int = 1000,
     max_refined: int = 50000,
     max_queries: int = 50,
     max_clause_freq: int = 100000,
+    filter_mode: str = "stopword",
 ):
     """
     Run retrieval (no scoring/filtering) and compute raw recall against qrels.
@@ -59,9 +61,11 @@ def retrieval_recall(
             engine=engine,
             expansions_path=expansions_path,
             max_standalone=max_standalone,
+            max_standalone_sup=max_standalone_sup,
             max_refined=max_refined,
             max_queries=max_queries,
             max_clause_freq=max_clause_freq,
+            filter_mode=filter_mode,
             verbose=False,
         )
     elif mode == "splade_adaptive":
@@ -139,10 +143,12 @@ def compare_recall_ceiling(
     expansions_paths: dict = None,
     include_splade: bool = True,
     max_topics: int = None,
-    max_standalone: int = 10000,
+    max_standalone: int = 5000,
+    max_standalone_sup: int = 1000,
     max_refined: int = 50000,
     max_queries: int = 50,
     max_clause_freq: int = 100000,
+    filter_mode: str = "stopword",
 ):
     """
     Compare raw retrieval recall across pipeline modes.
@@ -153,6 +159,7 @@ def compare_recall_ceiling(
             Each becomes an llm_adaptive mode with that label.
         include_splade: If True, also run splade_adaptive for comparison.
         max_topics: Limit number of topics.
+        filter_mode: "stopword" or "noun_phrase" for LLM keyword filtering.
     """
     # Build modes list
     modes = []
@@ -187,9 +194,11 @@ def compare_recall_ceiling(
         for mode in modes:
             kwargs = {
                 "max_standalone": max_standalone,
+                "max_standalone_sup": max_standalone_sup,
                 "max_refined": max_refined,
                 "max_queries": max_queries,
                 "max_clause_freq": max_clause_freq,
+                "filter_mode": filter_mode,
             }
 
             if mode in mode_expansions:

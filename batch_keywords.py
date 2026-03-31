@@ -46,8 +46,8 @@ Rules:
 - No sentences, no questions
 - Return ONLY valid JSON, no explanation"""
 
-
-os.environ['ANTHROPIC_API_KEY'] = 'XXX'
+from utils import get_token
+os.environ['ANTHROPIC_API_KEY'] = get_token('ANTHROPIC_API_KEY')
 
 def load_topics(path):
     topics = []
