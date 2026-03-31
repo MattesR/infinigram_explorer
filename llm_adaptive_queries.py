@@ -45,7 +45,6 @@ def build_llm_adaptive_queries(
     engine,
     max_standalone: int = 5000,
     max_standalone_sup: int = 1000,
-    max_refined: int = 50000,
     max_count: int = 500000,
     max_queries: int = 50,
     max_clause_freq: int = 100000,
@@ -233,7 +232,7 @@ def build_llm_adaptive_queries(
         result = engine.find_cnf(**kwargs)
         cnt = result.get("cnt", 0)
 
-        if cnt > 0 and cnt <= max_refined:
+        if cnt > 0 and cnt <= max_standalone:
             key_str = " OR ".join(key_or_names[:5])
             if len(key_or_names) > 5:
                 key_str += f" +{len(key_or_names)-5}"
@@ -247,7 +246,7 @@ def build_llm_adaptive_queries(
             })
             if verbose:
                 print(f"    AND: ({term['phrase']}) -> {cnt:,d} hits")
-        elif verbose and cnt > max_refined:
+        elif verbose and cnt > max_standalone:
             print(f"    SKIP: ({term['phrase']}) -> {cnt:,d} hits (too broad)")
 
     # ================================================================
@@ -264,7 +263,7 @@ def build_llm_adaptive_queries(
         or_ids = []
         or_names = []
         for term in validated:
-            if term["count"] <= max_refined:
+            if term["count"] <= max_standalone:
                 or_ids.append(term["input_ids"])
                 or_names.append(term["phrase"])
         if or_ids:
@@ -328,7 +327,7 @@ def build_llm_adaptive_queries(
             result = engine.find_cnf(**kwargs)
             cnt = result.get("cnt", 0)
 
-            if 0 < cnt <= max_refined:
+            if 0 < cnt <= max_standalone:
                 c_str = " OR ".join(names_core[:4])
                 if len(names_core) > 4:
                     c_str += f" +{len(names_core)-4}"
