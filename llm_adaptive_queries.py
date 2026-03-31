@@ -45,6 +45,7 @@ def build_llm_adaptive_queries(
     engine,
     max_standalone: int = 5000,
     max_standalone_sup: int = 1000,
+    max_refined: int = 50000,
     max_count: int = 500000,
     max_queries: int = 50,
     max_clause_freq: int = 100000,
@@ -153,17 +154,31 @@ def build_llm_adaptive_queries(
             if not term.get("standalone", True):
                 continue  # AND-only terms skip direct grab
             if term["count"] <= max_standalone and term["count"] > 0:
-                _add({
-                    "type": "simple",
-                    "input_ids": term["input_ids"],
-                    "description": term["phrase"],
-                    "score": max_standalone - term["count"],
-                    "estimated_count": term["count"],
-                    "facet": facet_name,
-                })
+                if "cnf" in term:
+                    # AND fallback — use CNF query
+                    desc = term.get("description", term["phrase"])
+                    _add({
+                        "type": "cnf",
+                        "cnf": term["cnf"],
+                        "description": desc,
+                        "score": max_standalone - term["count"],
+                        "estimated_count": term["count"],
+                        "facet": facet_name,
+                    })
+                    if verbose:
+                        print(f"    KEY AND: {desc} ({term['count']:,d})")
+                else:
+                    _add({
+                        "type": "simple",
+                        "input_ids": term["input_ids"],
+                        "description": term["phrase"],
+                        "score": max_standalone - term["count"],
+                        "estimated_count": term["count"],
+                        "facet": facet_name,
+                    })
+                    if verbose:
+                        print(f"    KEY DIRECT: {term['phrase']} ({term['count']:,d})")
                 grabbed_terms.add(term["phrase"])
-                if verbose:
-                    print(f"    KEY DIRECT: {term['phrase']} ({term['count']:,d})")
 
     # Grab SUP terms (only standalone ones)
     for facet_name, validated in aux_validated.items():
@@ -171,17 +186,30 @@ def build_llm_adaptive_queries(
             if not term.get("standalone", True):
                 continue  # AND-only terms skip direct grab
             if term["count"] <= max_standalone_sup and term["count"] > 0:
-                _add({
-                    "type": "simple",
-                    "input_ids": term["input_ids"],
-                    "description": term["phrase"],
-                    "score": max_standalone_sup - term["count"],
-                    "estimated_count": term["count"],
-                    "facet": facet_name,
-                })
+                if "cnf" in term:
+                    desc = term.get("description", term["phrase"])
+                    _add({
+                        "type": "cnf",
+                        "cnf": term["cnf"],
+                        "description": desc,
+                        "score": max_standalone_sup - term["count"],
+                        "estimated_count": term["count"],
+                        "facet": facet_name,
+                    })
+                    if verbose:
+                        print(f"    SUP AND: {desc} ({term['count']:,d})")
+                else:
+                    _add({
+                        "type": "simple",
+                        "input_ids": term["input_ids"],
+                        "description": term["phrase"],
+                        "score": max_standalone_sup - term["count"],
+                        "estimated_count": term["count"],
+                        "facet": facet_name,
+                    })
+                    if verbose:
+                        print(f"    SUP DIRECT: {term['phrase']} ({term['count']:,d})")
                 grabbed_terms.add(term["phrase"])
-                if verbose:
-                    print(f"    SUP DIRECT: {term['phrase']} ({term['count']:,d})")
 
     # ================================================================
     # Phase 2: AND high-count terms with KEY OR-clause
@@ -232,7 +260,7 @@ def build_llm_adaptive_queries(
         result = engine.find_cnf(**kwargs)
         cnt = result.get("cnt", 0)
 
-        if cnt > 0 and cnt <= max_standalone:
+        if cnt > 0 and cnt <= max_refined:
             key_str = " OR ".join(key_or_names[:5])
             if len(key_or_names) > 5:
                 key_str += f" +{len(key_or_names)-5}"
@@ -246,7 +274,7 @@ def build_llm_adaptive_queries(
             })
             if verbose:
                 print(f"    AND: ({term['phrase']}) -> {cnt:,d} hits")
-        elif verbose and cnt > max_standalone:
+        elif verbose and cnt > max_refined:
             print(f"    SKIP: ({term['phrase']}) -> {cnt:,d} hits (too broad)")
 
     # ================================================================
@@ -263,7 +291,7 @@ def build_llm_adaptive_queries(
         or_ids = []
         or_names = []
         for term in validated:
-            if term["count"] <= max_standalone:
+            if term["count"] <= max_refined:
                 or_ids.append(term["input_ids"])
                 or_names.append(term["phrase"])
         if or_ids:
@@ -327,7 +355,7 @@ def build_llm_adaptive_queries(
             result = engine.find_cnf(**kwargs)
             cnt = result.get("cnt", 0)
 
-            if 0 < cnt <= max_standalone:
+            if 0 < cnt <= max_refined:
                 c_str = " OR ".join(names_core[:4])
                 if len(names_core) > 4:
                     c_str += f" +{len(names_core)-4}"

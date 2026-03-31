@@ -88,10 +88,12 @@ def validate_against_index(
     tokenizer,
     engine,
     max_count: int = None,
+    max_standalone: int = 5000,
     verbose: bool = False,
 ) -> list[dict]:
     """
     Check each phrase against the index and return those with >0 hits.
+    If a multi-word phrase has 0 hits, try AND-ing its words as a CNF fallback.
 
     Args:
         phrases: List of keyword/phrase strings OR list of dicts with
@@ -99,13 +101,16 @@ def validate_against_index(
         tokenizer: Infini-gram tokenizer.
         engine: Infini-gram engine.
         max_count: If set, skip phrases with count above this (too broad).
+        max_standalone: Max count for AND fallback to be accepted.
         verbose: Print counts.
 
     Returns:
         List of dicts with 'phrase', 'input_ids', 'count', 'standalone',
-        sorted by count ascending (most specific first).
+        and optionally 'cnf' (if AND fallback was used).
+        Sorted by count ascending (most specific first).
     """
     validated = []
+    seen_phrases = set()
 
     for item in phrases:
         # Handle both string and dict input
@@ -116,33 +121,88 @@ def validate_against_index(
             phrase = item
             standalone = True
 
+        if phrase in seen_phrases:
+            continue
+        seen_phrases.add(phrase)
+
         ids = tokenizer.encode(phrase, add_special_tokens=False)
         if not ids:
             continue
 
         count = engine.count(input_ids=ids).get("count", 0)
 
-        if count == 0:
+        if count > 0:
+            if max_count and count > max_count:
+                if verbose:
+                    print(f"    {count:>10,d}  {phrase} (SKIP: too broad)")
+                continue
+
+            validated.append({
+                "phrase": phrase,
+                "input_ids": ids,
+                "count": count,
+                "standalone": standalone,
+            })
             if verbose:
                 marker = "" if standalone else " [AND-only]"
-                print(f"    {0:>10,d}  {phrase}{marker} (SKIP: not in corpus)")
+                print(f"    {count:>10,d}  {phrase}{marker}")
             continue
 
-        if max_count and count > max_count:
+        # Phrase has 0 hits — try AND fallback for multi-word phrases
+        words = phrase.split()
+        if len(words) < 2:
             if verbose:
-                print(f"    {count:>10,d}  {phrase} (SKIP: too broad)")
+                print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
             continue
 
-        validated.append({
-            "phrase": phrase,
-            "input_ids": ids,
-            "count": count,
-            "standalone": standalone,
-        })
+        # Encode each word separately, build CNF
+        word_clauses = []
+        word_names = []
+        all_valid = True
+        for w in words:
+            w_ids = tokenizer.encode(w, add_special_tokens=False)
+            if not w_ids:
+                all_valid = False
+                break
+            w_count = engine.count(input_ids=w_ids).get("count", 0)
+            if w_count == 0:
+                all_valid = False
+                break
+            word_clauses.append([w_ids])
+            word_names.append(w)
 
-        if verbose:
-            marker = "" if standalone else " [AND-only]"
-            print(f"    {count:>10,d}  {phrase}{marker}")
+        if not all_valid or len(word_clauses) < 2:
+            if verbose:
+                print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
+            continue
+
+        # Check AND count
+        cnf = [clause[0] for clause in word_clauses]  # flatten
+        cnf_for_query = [[c] for c in cnf]  # proper CNF format: [[ids1], [ids2], ...]
+        try:
+            result = engine.find_cnf(cnf=cnf_for_query)
+            and_count = result.get("cnt", 0)
+        except Exception:
+            and_count = 0
+
+        if and_count > 0 and and_count <= max_standalone:
+            and_desc = " AND ".join(word_names)
+            validated.append({
+                "phrase": phrase,
+                "input_ids": ids,  # original phrase IDs (for reference)
+                "count": and_count,
+                "standalone": standalone,
+                "cnf": cnf_for_query,  # use this for queries instead of input_ids
+                "description": and_desc,
+            })
+            if verbose:
+                marker = "" if standalone else " [AND-only]"
+                print(f"    {and_count:>10,d}  {phrase} -> AND({and_desc}){marker}")
+        elif verbose:
+            if and_count > max_standalone:
+                print(f"    {and_count:>10,d}  {phrase} -> AND too broad")
+            else:
+                print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
 
     # Sort by count ascending (most specific first)
     validated.sort(key=lambda x: x["count"])
