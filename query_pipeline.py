@@ -416,9 +416,10 @@ class QueryPipeline:
         max_refined: int = 50000,
         max_count: int = 500000,
         max_queries: int = 50,
-        max_clause_freq: int = 7000000,
+        max_clause_freq: int = 100000,
         min_retrieved_docs: int = None,
         use_core_only: bool = False,
+        filter_mode: str = "stopword",
         verbose: bool = True,
     ) -> tuple[list[dict], list[tuple]]:
         """
@@ -470,6 +471,7 @@ class QueryPipeline:
             max_queries=max_queries,
             max_clause_freq=max_clause_freq,
             use_core_only=use_core_only,
+            filter_mode=filter_mode,
             verbose=verbose,
         )
 
