@@ -137,21 +137,79 @@ def validate_against_index(
     return validated
 
 
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
+    "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "can", "shall", "it",
+    "its", "this", "that", "these", "those", "what", "which", "who",
+    "whom", "how", "when", "where", "why", "not", "no", "nor", "if",
+    "then", "than", "so", "up", "out", "about", "into", "through",
+    "during", "before", "after", "above", "below", "between", "under",
+    "again", "further", "once", "here", "there", "all", "each", "every",
+    "both", "few", "more", "most", "other", "some", "such", "only",
+    "own", "same", "too", "very", "just", "also",
+}
+
+
+def stopword_filter(keywords: list[str]) -> list[str]:
+    """
+    Simple stopword removal: keep all content words from each keyword phrase.
+
+    For multi-word keywords, returns both:
+    - The full phrase (if it has content words)
+    - Individual content words
+
+    This preserves words like "Target" that NP extraction might drop.
+
+    Args:
+        keywords: Raw keyword strings from LLM.
+
+    Returns:
+        Deduplicated list of phrases and words, longest first.
+    """
+    filtered = set()
+
+    for kw in keywords:
+        if not kw or not kw.strip():
+            continue
+
+        words = kw.strip().split()
+        content_words = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+
+        if not content_words:
+            continue
+
+        # Add the full filtered phrase
+        phrase = " ".join(content_words)
+        if len(phrase) > 2:
+            filtered.add(phrase.lower())
+
+        # Also add individual words (for AND combinations)
+        for w in content_words:
+            if len(w) > 2:
+                filtered.add(w.lower())
+
+    return sorted(filtered, key=lambda x: len(x), reverse=True)
+
+
 def filter_and_validate_keywords(
     keywords: list[str],
     tokenizer,
     engine,
     max_count: int = 500000,
+    filter_mode: str = "stopword",
     verbose: bool = True,
 ) -> list[dict]:
     """
-    Full pipeline: raw LLM keywords -> spaCy filtering -> index validation.
+    Full pipeline: raw LLM keywords -> filtering -> index validation.
 
     Args:
         keywords: Raw keyword strings from LLM.
         tokenizer: Infini-gram tokenizer.
         engine: Infini-gram engine.
         max_count: Skip phrases above this count.
+        filter_mode: "stopword" (keep all content words) or "noun_phrase" (spaCy NP extraction).
         verbose: Print intermediate results.
 
     Returns:
@@ -160,10 +218,15 @@ def filter_and_validate_keywords(
     if verbose:
         print(f"  Raw keywords: {len(keywords)}")
 
-    # Step 1: Extract noun phrases
-    phrases = extract_noun_phrases(keywords)
-    if verbose:
-        print(f"  After NP extraction: {len(phrases)}")
+    # Step 1: Filter
+    if filter_mode == "noun_phrase":
+        phrases = extract_noun_phrases(keywords)
+        if verbose:
+            print(f"  After NP extraction: {len(phrases)}")
+    else:
+        phrases = stopword_filter(keywords)
+        if verbose:
+            print(f"  After stopword filter: {len(phrases)}")
 
     # Step 2: Validate against index
     if verbose:
@@ -185,6 +248,7 @@ def load_and_filter(
     engine,
     max_count: int = 500000,
     use_core_only: bool = False,
+    filter_mode: str = "stopword",
     verbose: bool = True,
 ) -> list[dict]:
     """
@@ -227,11 +291,13 @@ def load_and_filter(
             keywords.extend(data.get("expansion", []))
             n_aux = len(data.get("expansion", []))
     else:
-        # Faceted format: {"CORE: x": [...], "AUX: y": [...], ...}
+        # Faceted format: {"CORE/KEY: x": [...], "AUX/SUP: y": [...], "VERBS": [...]}
         for key, values in data.items():
             if not isinstance(values, list):
                 continue
-            is_core = key.upper().startswith("CORE")
+            upper = key.upper()
+            is_core = upper.startswith("CORE") or upper.startswith("KEY")
+            is_verb = upper == "VERBS"
             if is_core:
                 keywords.extend(values)
                 n_core += len(values)
@@ -244,7 +310,7 @@ def load_and_filter(
 
     return filter_and_validate_keywords(
         keywords, tokenizer, engine,
-        max_count=max_count, verbose=verbose,
+        max_count=max_count, filter_mode=filter_mode, verbose=verbose,
     )
 
 
@@ -252,31 +318,36 @@ def load_faceted_keywords(qid: str, expansions_path: str) -> dict:
     """
     Load faceted keywords preserving the facet structure.
 
+    Supports prefixes: CORE/KEY (-> core_facets), AUX/SUP (-> aux_facets), VERBS.
+
     Returns:
-        Dict with 'core_facets' and 'aux_facets', each mapping
-        facet_name -> list of keywords.
+        Dict with 'core_facets', 'aux_facets', and 'verbs' (list).
     """
     expansions = load_all_expansions(expansions_path)
     data = expansions.get(qid, {})
 
     core_facets = {}
     aux_facets = {}
+    verbs = []
 
     for key, values in data.items():
         if not isinstance(values, list):
             continue
+        upper = key.upper()
         # Strip prefix for clean facet name
-        if key.upper().startswith("CORE:"):
+        if upper.startswith("CORE:") or upper.startswith("KEY:"):
             clean = key.split(":", 1)[1].strip()
             core_facets[clean] = values
-        elif key.upper().startswith("AUX:"):
+        elif upper.startswith("AUX:") or upper.startswith("SUP:"):
             clean = key.split(":", 1)[1].strip()
             aux_facets[clean] = values
+        elif upper == "VERBS":
+            verbs = values
         else:
-            # No prefix — treat as aux
+            # No recognized prefix — treat as aux
             aux_facets[key] = values
 
-    return {"core_facets": core_facets, "aux_facets": aux_facets}
+    return {"core_facets": core_facets, "aux_facets": aux_facets, "verbs": verbs}
 
 
 def load_all_expansions(expansions_path: str) -> dict:

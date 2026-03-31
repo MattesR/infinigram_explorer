@@ -56,6 +56,7 @@ def build_llm_adaptive_queries(
     max_queries: int = 50,
     max_clause_freq: int = 100000,
     use_core_only: bool = False,
+    filter_mode: str = "stopword",
     verbose: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -72,6 +73,7 @@ def build_llm_adaptive_queries(
         max_queries: Max total queries.
         max_clause_freq: For CNF sampling.
         use_core_only: Only use core facets.
+        filter_mode: "stopword" or "noun_phrase".
         verbose: Print decisions.
 
     Returns:
@@ -97,7 +99,11 @@ def build_llm_adaptive_queries(
 
     core_validated = {}  # facet_name -> list of validated term dicts
     for name, terms in core_facets.items():
-        phrases = extract_noun_phrases(terms)
+        if filter_mode == "noun_phrase":
+            phrases = extract_noun_phrases(terms)
+        else:
+            from llm_keyword_filter import stopword_filter
+            phrases = stopword_filter(terms)
         validated = validate_against_index(
             phrases, tokenizer, engine,
             max_count=max_count, verbose=False,
@@ -114,7 +120,11 @@ def build_llm_adaptive_queries(
         if verbose:
             print(f"\nValidating aux facet terms...")
         for name, terms in aux_facets.items():
-            phrases = extract_noun_phrases(terms)
+            if filter_mode == "noun_phrase":
+                phrases = extract_noun_phrases(terms)
+            else:
+                from llm_keyword_filter import stopword_filter
+                phrases = stopword_filter(terms)
             validated = validate_against_index(
                 phrases, tokenizer, engine,
                 max_count=max_count, verbose=False,

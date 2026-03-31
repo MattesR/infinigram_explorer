@@ -84,6 +84,7 @@ def run_full_eval(
     expansions_path: str = None,
     max_count: int = 500000,
     use_core_only: bool = False,
+    filter_mode: str = "stopword",
 ):
     """
     Run the full pipeline on all topics, write a TREC run file, and evaluate.
@@ -167,6 +168,7 @@ def run_full_eval(
                     max_clause_freq=max_clause_freq,
                     min_retrieved_docs=min_retrieved_docs,
                     use_core_only=use_core_only,
+                    filter_mode=filter_mode,
                     verbose=False,
                 )
                 timing["encode"] = 0
