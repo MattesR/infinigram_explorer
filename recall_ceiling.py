@@ -17,6 +17,7 @@ Usage:
     )
 """
 
+import json
 import time
 from pathlib import Path
 from tqdm import tqdm
@@ -41,6 +42,8 @@ def retrieval_recall(
     max_queries: int = 50,
     max_clause_freq: int = 100000,
     filter_mode: str = "stopword",
+    save_inspection: bool = False,
+    inspection_dir: str = './inspections',
 ):
     """
     Run retrieval (no scoring/filtering) and compute raw recall against qrels.
@@ -113,14 +116,15 @@ def retrieval_recall(
         queries=executed,
         index_dir=index_dir,
         tokenizer=tokenizer,
-        max_doc_len=50,  # minimal, just need doc_id
+        max_doc_len=200 if save_inspection else 50,
     )
     t_resolve = time.perf_counter() - t0
 
-    retrieved = set(d["doc_id"] for d in docs if d["doc_id"])
+    retrieved_map = {d["doc_id"]: d for d in docs if d["doc_id"]}
+    retrieved = set(retrieved_map.keys())
     found = relevant & retrieved
 
-    return {
+    result = {
         "qid": qid,
         "n_relevant": len(relevant),
         "n_retrieved": len(retrieved),
@@ -130,6 +134,67 @@ def retrieval_recall(
         "time_resolve": t_resolve,
         "n_queries": len(executed),
     }
+
+    # Save inspection files if requested
+    if save_inspection and inspection_dir:
+        import os
+        os.makedirs(inspection_dir, exist_ok=True)
+
+        found_docs = {did: retrieved_map[did] for did in found}
+        missed_docs = {did: rel for did, rel in qrels.get(qid, {}).items()
+                      if rel > 0 and did not in retrieved}
+        irrelevant_docs = {did: d for did, d in retrieved_map.items()
+                         if did not in relevant}
+
+        def _to_record(did, doc, rel=None):
+            r = {
+                "doc_id": did,
+                "text": doc.get("text", "")[:2000] if doc.get("text") else "",
+                "from_queries": doc.get("from_queries", []),
+            }
+            if rel is not None:
+                r["relevance"] = rel
+            return r
+
+        # Found
+        path = os.path.join(inspection_dir, f"{qid}_found.jsonl")
+        with open(path, "w") as f:
+            for did in sorted(found, key=lambda d: qrels.get(qid, {}).get(d, 0), reverse=True):
+                f.write(json.dumps(_to_record(did, retrieved_map[did],
+                        rel=qrels.get(qid, {}).get(did, 0))) + "\n")
+
+        # Missed
+        path = os.path.join(inspection_dir, f"{qid}_missed.jsonl")
+        with open(path, "w") as f:
+            for did, rel in sorted(missed_docs.items(), key=lambda x: x[1], reverse=True):
+                f.write(json.dumps({"doc_id": did, "relevance": rel}) + "\n")
+
+        # Top irrelevant (random sample since no crude score here)
+        path = os.path.join(inspection_dir, f"{qid}_irrelevant.jsonl")
+        with open(path, "w") as f:
+            for i, (did, doc) in enumerate(irrelevant_docs.items()):
+                if i >= 100:
+                    break
+                f.write(json.dumps(_to_record(did, doc)) + "\n")
+
+        # Info
+        path = os.path.join(inspection_dir, f"{qid}_info.json")
+        with open(path, "w") as f:
+            json.dump({
+                "qid": qid,
+                "query": query_text,
+                "n_relevant": len(relevant),
+                "n_retrieved": len(retrieved),
+                "n_found": len(found),
+                "n_missed": len(missed_docs),
+                "recall": result["recall"],
+                "queries": [
+                    {"description": q.get("description", ""), "count": q.get("cnt", 0)}
+                    for q in executed
+                ],
+            }, f, indent=2)
+
+    return result
 
 
 def compare_recall_ceiling(
@@ -148,6 +213,8 @@ def compare_recall_ceiling(
     max_queries: int = 50,
     max_clause_freq: int = 100000,
     filter_mode: str = "stopword",
+    save_inspection: bool = False,
+    inspection_dir: str = "./inspection",
 ):
     """
     Compare raw retrieval recall across pipeline modes.
@@ -159,6 +226,8 @@ def compare_recall_ceiling(
         include_splade: If True, also run splade_adaptive for comparison.
         max_topics: Limit number of topics.
         filter_mode: "stopword" or "noun_phrase" for LLM keyword filtering.
+        save_inspection: If True, save found/missed/irrelevant JSONL files per query.
+        inspection_dir: Base directory for inspection files. Subdirs created per mode.
     """
     # Build modes list
     modes = []
@@ -198,7 +267,14 @@ def compare_recall_ceiling(
                 "max_queries": max_queries,
                 "max_clause_freq": max_clause_freq,
                 "filter_mode": filter_mode,
+                "save_inspection": save_inspection,
             }
+
+            if save_inspection:
+                import os
+                mode_dir = os.path.join(inspection_dir, mode)
+                os.makedirs(mode_dir, exist_ok=True)
+                kwargs["inspection_dir"] = mode_dir
 
             if mode in mode_expansions:
                 actual_mode = "llm_adaptive"

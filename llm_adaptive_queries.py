@@ -38,6 +38,43 @@ def _query_key(q):
         return ("cnf", cnf_key)
 
 
+def _term_to_query(term, score, facet_name=None):
+    """Create a query dict from a validated term, handling case variants and CNF."""
+    base = {
+        "score": score,
+        "estimated_count": term["count"],
+    }
+    if facet_name:
+        base["facet"] = facet_name
+
+    if "cnf" in term:
+        # AND fallback
+        base["type"] = "cnf"
+        base["cnf"] = term["cnf"]
+        base["description"] = term.get("description", term["phrase"])
+    elif term.get("case_variants"):
+        # Case-sensitive OR: find both "Vietnam" and "vietnam"
+        base["type"] = "cnf"
+        base["cnf"] = [[term["input_ids"], term["input_ids_alt"]]]
+        base["description"] = f"{term['phrase']} (OR {term['phrase'].lower()})"
+    else:
+        base["type"] = "simple"
+        base["input_ids"] = term["input_ids"]
+        base["description"] = term["phrase"]
+
+    return base
+
+
+def _term_ids_for_or(term):
+    """Get the IDs to use when putting this term into an OR clause.
+    Returns a list of ID lists (usually 1, but 2 for case variants)."""
+    if "cnf" in term:
+        return None  # AND-fallback can't go in OR clause
+    if term.get("case_variants"):
+        return [term["input_ids"], term["input_ids_alt"]]
+    return [term["input_ids"]]
+
+
 def build_llm_adaptive_queries(
     qid: str,
     expansions_path: str,
@@ -151,64 +188,27 @@ def build_llm_adaptive_queries(
     for facet_name, validated in core_validated.items():
         for term in validated:
             if not term.get("standalone", True):
-                continue  # AND-only terms skip direct grab
+                continue
             if term["count"] <= max_standalone and term["count"] > 0:
-                if "cnf" in term:
-                    # AND fallback — use CNF query
-                    desc = term.get("description", term["phrase"])
-                    _add({
-                        "type": "cnf",
-                        "cnf": term["cnf"],
-                        "description": desc,
-                        "score": max_standalone - term["count"],
-                        "estimated_count": term["count"],
-                        "facet": facet_name,
-                    })
-                    if verbose:
-                        print(f"    KEY AND: {desc} ({term['count']:,d})")
-                else:
-                    _add({
-                        "type": "simple",
-                        "input_ids": term["input_ids"],
-                        "description": term["phrase"],
-                        "score": max_standalone - term["count"],
-                        "estimated_count": term["count"],
-                        "facet": facet_name,
-                    })
-                    if verbose:
-                        print(f"    KEY DIRECT: {term['phrase']} ({term['count']:,d})")
+                q = _term_to_query(term, max_standalone - term["count"], facet_name)
+                _add(q)
                 grabbed_terms.add(term["phrase"])
+                if verbose:
+                    label = "AND" if "cnf" in term else "DIRECT"
+                    print(f"    KEY {label}: {q['description']} ({term['count']:,d})")
 
     # Grab SUP terms (only standalone ones)
     for facet_name, validated in aux_validated.items():
         for term in validated:
             if not term.get("standalone", True):
-                continue  # AND-only terms skip direct grab
+                continue
             if term["count"] <= max_standalone_sup and term["count"] > 0:
-                if "cnf" in term:
-                    desc = term.get("description", term["phrase"])
-                    _add({
-                        "type": "cnf",
-                        "cnf": term["cnf"],
-                        "description": desc,
-                        "score": max_standalone_sup - term["count"],
-                        "estimated_count": term["count"],
-                        "facet": facet_name,
-                    })
-                    if verbose:
-                        print(f"    SUP AND: {desc} ({term['count']:,d})")
-                else:
-                    _add({
-                        "type": "simple",
-                        "input_ids": term["input_ids"],
-                        "description": term["phrase"],
-                        "score": max_standalone_sup - term["count"],
-                        "estimated_count": term["count"],
-                        "facet": facet_name,
-                    })
-                    if verbose:
-                        print(f"    SUP DIRECT: {term['phrase']} ({term['count']:,d})")
+                q = _term_to_query(term, max_standalone_sup - term["count"], facet_name)
+                _add(q)
                 grabbed_terms.add(term["phrase"])
+                if verbose:
+                    label = "AND" if "cnf" in term else "DIRECT"
+                    print(f"    SUP {label}: {q['description']} ({term['count']:,d})")
 
     # ================================================================
     # Phase 2: AND high-count terms with KEY OR-clause
@@ -219,16 +219,18 @@ def build_llm_adaptive_queries(
         print(f"{'='*60}")
 
     # Build the KEY OR-clause from core validated terms
-    # Only include terms that are exact phrases (not AND-fallbacks)
+    # Only include terms that can go in an OR clause (not AND-fallbacks)
     key_or_ids = []
     key_or_names = []
     for facet_name, validated in core_validated.items():
         for term in validated:
-            if "cnf" in term:
-                continue  # AND-fallback terms can't be in an OR clause
-            ids = term["input_ids"]
-            if ids and ids not in key_or_ids:
-                key_or_ids.append(ids)
+            or_ids = _term_ids_for_or(term)
+            if or_ids is None:
+                continue  # AND-fallback can't be in OR clause
+            for ids in or_ids:
+                if ids not in key_or_ids:
+                    key_or_ids.append(ids)
+            if term["phrase"] not in key_or_names:
                 key_or_names.append(term["phrase"])
 
     if key_or_ids and verbose:
@@ -287,17 +289,21 @@ def build_llm_adaptive_queries(
         print(f"Phase 3: Facet OR-clauses AND'd across facets")
         print(f"{'='*60}")
 
-    # Build OR clause per facet (only exact phrase terms, not AND-fallbacks)
+    # Build OR clause per facet (only terms that can go in OR, not AND-fallbacks)
     facet_or_clauses = {}
     for facet_name, validated in list(core_validated.items()) + list(aux_validated.items()):
         or_ids = []
         or_names = []
         for term in validated:
-            if "cnf" in term:
-                continue  # AND-fallback can't be in OR clause
+            term_ids = _term_ids_for_or(term)
+            if term_ids is None:
+                continue
             if term["count"] <= max_standalone:
-                or_ids.append(term["input_ids"])
-                or_names.append(term["phrase"])
+                for ids in term_ids:
+                    if ids not in or_ids:
+                        or_ids.append(ids)
+                if term["phrase"] not in or_names:
+                    or_names.append(term["phrase"])
         if or_ids:
             facet_or_clauses[facet_name] = (or_ids, or_names)
 

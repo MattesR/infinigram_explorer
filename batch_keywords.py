@@ -19,32 +19,20 @@ import time
 import anthropic
 import os
 
-SYSTEM_PROMPT = """You are generating search terms for an exact-match keyword search engine where terms must appear verbatim in documents.  The goal is to also find highly relevant documents, that might have little or no verbatim overlap with the query.
+SYSTEM_PROMPT = """You are a search keyword expert. Given a query, decompose it into its essential topics and expand the vocabulary for each.
 
-Given a query, identify its key aspects and provide search terms for each.
+A query's essential topics are the concepts that TOGETHER define what makes a document relevant. A document must discuss ALL essential topics to be relevant.
 
-KEY aspects (2-3): The main topics of the query. A key term should be specific to this topic — if someone searches for it, they are likely looking for something related to this query.
+For each topic, generate search terms — these are words and short phrases that authors literally write in documents about this topic. Not descriptions of the topic, but the actual vocabulary used.
 
-SUPPORTING aspects (3-6): Secondary topics that help narrow or contextualize results. These terms are broader and will be combined with key terms during search.
+Three levels of vocabulary expansion:
+- Lexical: Synonyms and alternative phrasings for the same words
+- Conceptual: Technical jargon and domain-specific terms
+- Referential: Specific names, works, laws, theories, or events
 
-VERBS (1, optional): Key verbs relevant to the query's intent in base form (e.g. "cope", "develop", "prevent"). Only include if the query has a clear action focus.
+Provide 2-3 essential topics as "KEY: <topic>" and 3-6 narrower subtopics as "SUP: <topic>". Optionally include "VERBS" with base-form action words if the query has a clear action focus.
 
-For each aspect, provide three levels of search terms:
-1. Lexical: Different ways to say the same thing — synonyms, abbreviations, alternative phrasings (e.g. "AI" and "artificial intelligence", "holistic" and "comprehensive")
-2. Conceptual: Domain-specific technical terms, established frameworks, and jargon from the field
-3. Referential: Named entities — key figures, landmark papers, specific theories, organizations, or standards associated with this topic (only if applicable)
-
-Mix all three levels within each aspect's term list, ordered by specificity (most specific first).
-
-Format: JSON object where keys are "KEY: <aspect name>", "SUP: <aspect name>", or "VERBS" and values are lists of 3-8 search terms.
-
-Rules:
-- Every term must be a noun phrase (1-4 words) that literally appears in real documents
-- Key terms: specific to this topic, domain jargon, technical phrases
-- Supporting terms: can be broader, will be combined with key terms
-- Order terms within each aspect by specificity (most specific first)
-- No sentences, no questions
-- Return ONLY valid JSON, no explanation"""
+Format: JSON object. Keys are "KEY: <topic>", "SUP: <topic>", or "VERBS". Values are lists of 3-8 search terms. Every term must be a real phrase (1-4 words) that authors actually write in documents — not a description or summary of a concept. Order by specificity, most specific first. Return ONLY valid JSON."""
 
 from utils import get_token
 os.environ['ANTHROPIC_API_KEY'] = get_token('ANTHROPIC_API_KEY')

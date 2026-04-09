@@ -112,6 +112,19 @@ def validate_against_index(
     validated = []
     seen_phrases = set()
 
+    def _has_capital(s):
+        return any(c.isupper() for c in s)
+
+    def _try_phrase(phrase, tokenizer, engine):
+        """Try a phrase, return (ids, count) or None."""
+        ids = tokenizer.encode(phrase, add_special_tokens=False)
+        if not ids:
+            return None
+        count = engine.count(input_ids=ids).get("count", 0)
+        if count > 0:
+            return ids, count
+        return None
+
     for item in phrases:
         # Handle both string and dict input
         if isinstance(item, dict):
@@ -121,17 +134,54 @@ def validate_against_index(
             phrase = item
             standalone = True
 
-        if phrase in seen_phrases:
+        key = phrase.lower()
+        if key in seen_phrases:
             continue
-        seen_phrases.add(phrase)
+        seen_phrases.add(key)
 
-        ids = tokenizer.encode(phrase, add_special_tokens=False)
-        if not ids:
-            continue
+        # Try original case first
+        result = _try_phrase(phrase, tokenizer, engine)
 
-        count = engine.count(input_ids=ids).get("count", 0)
+        # If no hits and has capitals, try lowercase
+        if result is None and _has_capital(phrase):
+            result_lower = _try_phrase(phrase.lower(), tokenizer, engine)
+            if result_lower:
+                # Lowercase works — try to create OR with original case
+                ids_orig = tokenizer.encode(phrase, add_special_tokens=False)
+                ids_lower = result_lower[0]
+                count_lower = result_lower[1]
 
-        if count > 0:
+                count_orig = 0
+                if ids_orig:
+                    count_orig = engine.count(input_ids=ids_orig).get("count", 0)
+
+                if count_orig > 0 and ids_orig != ids_lower:
+                    # Both cases have hits — create OR
+                    total = count_orig + count_lower
+                    if max_count and total > max_count:
+                        if verbose:
+                            print(f"    {total:>10,d}  {phrase} (SKIP: too broad, both cases)")
+                        continue
+                    validated.append({
+                        "phrase": phrase,
+                        "input_ids": ids_orig,
+                        "input_ids_alt": ids_lower,
+                        "count": total,
+                        "standalone": standalone,
+                        "case_variants": True,
+                    })
+                    if verbose:
+                        marker = "" if standalone else " [AND-only]"
+                        print(f"    {total:>10,d}  {phrase} (OR {phrase.lower()}){marker}")
+                    continue
+                else:
+                    # Only lowercase works
+                    result = result_lower
+                    phrase = phrase.lower()
+
+        if result is not None:
+            ids, count = result
+
             if max_count and count > max_count:
                 if verbose:
                     print(f"    {count:>10,d}  {phrase} (SKIP: too broad)")
@@ -227,32 +277,25 @@ STOPWORDS = {
 def stopword_filter(keywords: list[str]) -> list[dict]:
     """
     Split keyword phrases on stopwords into separate searchable chunks.
+    Preserves original case (important for case-sensitive indices).
 
     "coping with vicarious trauma" -> [
         {"phrase": "vicarious trauma", "standalone": True},
-        {"phrase": "coping", "standalone": False}  # AND-only, from split
+        {"phrase": "coping", "standalone": False}
     ]
-    "Target shoplifting policy" -> [
-        {"phrase": "target shoplifting policy", "standalone": True}
+    "Vietnam War" -> [
+        {"phrase": "Vietnam War", "standalone": True}
     ]
 
     Returns list of dicts with 'phrase' and 'standalone' flag.
-    Chunks that resulted from splitting a multi-word keyword on stopwords
-    and are single words get standalone=False (AND-only).
-    The original full keyword (if no stopwords) gets standalone=True.
-
-    Args:
-        keywords: Raw keyword strings from LLM.
-
-    Returns:
-        Deduplicated list of chunk dicts, longest phrases first.
     """
     seen = set()
     results = []
 
     def _add(phrase, standalone):
-        if phrase not in seen and len(phrase) > 2:
-            seen.add(phrase)
+        key = phrase.lower()  # deduplicate case-insensitively
+        if key not in seen and len(phrase) > 2:
+            seen.add(key)
             results.append({"phrase": phrase, "standalone": standalone})
 
     for kw in keywords:
@@ -265,8 +308,8 @@ def stopword_filter(keywords: list[str]) -> list[dict]:
         has_stopwords = any(w.lower() in STOPWORDS for w in words)
 
         if not has_stopwords:
-            # No stopwords — entire phrase is standalone
-            phrase = " ".join(words).lower()
+            # No stopwords — entire phrase is standalone, keep original case
+            phrase = " ".join(words)
             _add(phrase, standalone=True)
             continue
 
@@ -276,12 +319,12 @@ def stopword_filter(keywords: list[str]) -> list[dict]:
         for w in words:
             if w.lower() in STOPWORDS:
                 if current_chunk:
-                    chunks.append(" ".join(current_chunk).lower())
+                    chunks.append(" ".join(current_chunk))
                     current_chunk = []
             else:
                 current_chunk.append(w)
         if current_chunk:
-            chunks.append(" ".join(current_chunk).lower())
+            chunks.append(" ".join(current_chunk))
 
         # Multi-word chunks are standalone, single words are AND-only
         for chunk in chunks:
