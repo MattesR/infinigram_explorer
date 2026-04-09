@@ -43,7 +43,8 @@ def retrieval_recall(
     max_clause_freq: int = 100000,
     filter_mode: str = "stopword",
     save_inspection: bool = False,
-    inspection_dir: str = './inspections',
+    inspection_dir: str = None,
+    corpus_dir: str = None,
 ):
     """
     Run retrieval (no scoring/filtering) and compute raw recall against qrels.
@@ -163,11 +164,21 @@ def retrieval_recall(
                 f.write(json.dumps(_to_record(did, retrieved_map[did],
                         rel=qrels.get(qid, {}).get(did, 0))) + "\n")
 
-        # Missed
+        # Missed — look up text from corpus if available
+        missed_texts = {}
+        if corpus_dir and missed_docs:
+            from retrieval_inspector import _lookup_docs_from_corpus
+            missed_texts = _lookup_docs_from_corpus(set(missed_docs.keys()), corpus_dir)
+
         path = os.path.join(inspection_dir, f"{qid}_missed.jsonl")
         with open(path, "w") as f:
             for did, rel in sorted(missed_docs.items(), key=lambda x: x[1], reverse=True):
-                f.write(json.dumps({"doc_id": did, "relevance": rel}) + "\n")
+                record = {"doc_id": did, "relevance": rel}
+                if did in missed_texts:
+                    doc_obj = missed_texts[did]
+                    text = doc_obj.get("segment", doc_obj.get("body", doc_obj.get("text", "")))
+                    record["text"] = text[:2000]
+                f.write(json.dumps(record) + "\n")
 
         # Top irrelevant (random sample since no crude score here)
         path = os.path.join(inspection_dir, f"{qid}_irrelevant.jsonl")
@@ -215,6 +226,7 @@ def compare_recall_ceiling(
     filter_mode: str = "stopword",
     save_inspection: bool = False,
     inspection_dir: str = "./inspection",
+    corpus_dir: str = "../data/infinigram_index/msmarco_v2.1_doc_segmented",
 ):
     """
     Compare raw retrieval recall across pipeline modes.
@@ -275,6 +287,8 @@ def compare_recall_ceiling(
                 mode_dir = os.path.join(inspection_dir, mode)
                 os.makedirs(mode_dir, exist_ok=True)
                 kwargs["inspection_dir"] = mode_dir
+                if corpus_dir:
+                    kwargs["corpus_dir"] = corpus_dir
 
             if mode in mode_expansions:
                 actual_mode = "llm_adaptive"
