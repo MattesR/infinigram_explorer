@@ -206,19 +206,29 @@ def validate_against_index(
             continue
 
         # Encode each word separately, build CNF
+        # For each word, try original case and lowercase, OR them if both work
         word_clauses = []
         word_names = []
         all_valid = True
         for w in words:
-            w_ids = tokenizer.encode(w, add_special_tokens=False)
-            if not w_ids:
+            w_ids_orig = tokenizer.encode(w, add_special_tokens=False)
+            w_ids_lower = tokenizer.encode(w.lower(), add_special_tokens=False) if _has_capital(w) else None
+
+            # Collect valid encodings
+            valid_ids = []
+            if w_ids_orig:
+                cnt = engine.count(input_ids=w_ids_orig).get("count", 0)
+                if cnt > 0:
+                    valid_ids.append(w_ids_orig)
+            if w_ids_lower and w_ids_lower != w_ids_orig:
+                cnt = engine.count(input_ids=w_ids_lower).get("count", 0)
+                if cnt > 0:
+                    valid_ids.append(w_ids_lower)
+
+            if not valid_ids:
                 all_valid = False
                 break
-            w_count = engine.count(input_ids=w_ids).get("count", 0)
-            if w_count == 0:
-                all_valid = False
-                break
-            word_clauses.append([w_ids])
+            word_clauses.append(valid_ids)  # list of ID alternatives for this word
             word_names.append(w)
 
         if not all_valid or len(word_clauses) < 2:
@@ -227,8 +237,8 @@ def validate_against_index(
             continue
 
         # Check AND count
-        cnf = [clause[0] for clause in word_clauses]  # flatten
-        cnf_for_query = [[c] for c in cnf]  # proper CNF format: [[ids1], [ids2], ...]
+        # word_clauses is [[ids_variant1, ids_variant2], [ids], ...] per word
+        cnf_for_query = word_clauses  # already in CNF format: OR within, AND across
         try:
             result = engine.find_cnf(cnf=cnf_for_query)
             and_count = result.get("cnt", 0)
@@ -237,9 +247,11 @@ def validate_against_index(
 
         if and_count > 0 and and_count <= max_standalone:
             and_desc = " AND ".join(word_names)
+            # Encode original phrase for reference (may be 0 hits as contiguous)
+            phrase_ids = tokenizer.encode(phrase, add_special_tokens=False)
             validated.append({
                 "phrase": phrase,
-                "input_ids": ids,  # original phrase IDs (for reference)
+                "input_ids": phrase_ids,  # original phrase IDs (for reference)
                 "count": and_count,
                 "standalone": standalone,
                 "cnf": cnf_for_query,  # use this for queries instead of input_ids
