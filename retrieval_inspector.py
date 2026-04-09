@@ -42,6 +42,7 @@ def inspect_query(
     save_irrelevant: int = 100,
     filter_mode: str = "stopword",
     output_dir: str = "./inspection",
+    corpus_dir: str = None,
 ):
     """
     Inspect retrieval results for a single query.
@@ -124,12 +125,24 @@ def inspect_query(
     print(f"MISSED RELEVANT DOCS ({len(missed)} total, showing {min(show_missed, len(missed))})")
     print(f"{'='*80}")
     missed_sorted = sorted(missed.items(), key=lambda x: x[1], reverse=True)
+
+    # Look up missed doc texts from corpus if available
+    missed_texts = {}
+    if corpus_dir and missed:
+        print(f"  Looking up missed docs from corpus...")
+        missed_texts = _lookup_docs_from_corpus(set(missed.keys()), corpus_dir)
+        print(f"  Found text for {len(missed_texts)}/{len(missed)} missed docs")
+
     for i, (did, rel) in enumerate(missed_sorted):
         if i >= show_missed:
             break
         print(f"\n  [{i+1}] rel={rel} | {did}")
-        # Try to fetch the doc text from the index
-        _show_missed_doc(did, engine, tokenizer, show_text_len)
+        if did in missed_texts:
+            doc_obj = missed_texts[did]
+            text = doc_obj.get("segment", doc_obj.get("body", doc_obj.get("text", "")))
+            print(f"      {text[:show_text_len]}...")
+        else:
+            print(f"      [text not available]")
 
     # Crude score all docs for ranking irrelevant samples
     if mode == "llm_adaptive" and validated:
@@ -198,11 +211,19 @@ def inspect_query(
             f.write(json.dumps(record) + "\n")
     print(f"\nSaved {len(found)} found docs to {found_path}")
 
-    # Save missed relevant (doc_id + relevance, no text since we don't have it)
+    # Save missed relevant (with corpus text if available)
     missed_path = os.path.join(output_dir, f"{qid}_missed.jsonl")
+    # Look up all missed docs from corpus if not already done
+    if corpus_dir and missed and not missed_texts:
+        missed_texts = _lookup_docs_from_corpus(set(missed.keys()), corpus_dir)
     with open(missed_path, "w") as f:
         for did, rel in sorted(missed.items(), key=lambda x: x[1], reverse=True):
-            f.write(json.dumps({"doc_id": did, "relevance": rel}) + "\n")
+            record = {"doc_id": did, "relevance": rel}
+            if did in missed_texts:
+                doc_obj = missed_texts[did]
+                text = doc_obj.get("segment", doc_obj.get("body", doc_obj.get("text", "")))
+                record["text"] = text[:2000]
+            f.write(json.dumps(record) + "\n")
     print(f"Saved {len(missed)} missed docs to {missed_path}")
 
     # Save top irrelevant by crude score
@@ -243,25 +264,50 @@ def inspect_query(
     }
 
 
-def _show_missed_doc(doc_id, engine, tokenizer, show_text_len):
-    """Try to show text of a missed document by looking it up via doc_id search."""
-    # Search for the doc_id string in the index
-    try:
-        ids = tokenizer.encode(doc_id, add_special_tokens=False)
-        result = engine.find(input_ids=ids)
-        cnt = result.get("cnt", 0)
-        if cnt > 0 and cnt < 10:
-            # Fetch first match
-            segs = result.get("segment_by_shard", [])
-            for s, (start, end) in enumerate(segs):
-                if start < end:
-                    doc = engine.get_doc_by_rank(s=s, rank=start, max_disp_len=show_text_len)
-                    text = doc.get("doc", "")[:show_text_len]
-                    print(f"      {text}...")
-                    return
-        print(f"      [could not fetch text]")
-    except Exception:
-        print(f"      [could not fetch text]")
+def _lookup_docs_from_corpus(doc_ids, corpus_dir):
+    """
+    Look up documents from the gzipped MSMARCO corpus files.
+    Groups by file number and scans each file once.
+
+    Args:
+        doc_ids: Set or list of doc ID strings.
+        corpus_dir: Path to directory with msmarco_v2.1_doc_segmented_XX.json.gz files.
+
+    Returns:
+        Dict mapping doc_id -> {"text": ..., "title": ..., ...}
+    """
+    import gzip
+
+    if not doc_ids:
+        return {}
+
+    # Group by file number
+    by_file = {}
+    for did in doc_ids:
+        try:
+            parts = did.split("_")
+            fnum = int(parts[4])
+            by_file.setdefault(fnum, set()).add(did)
+        except (IndexError, ValueError):
+            continue
+
+    results = {}
+    for fnum, ids in sorted(by_file.items()):
+        path = f"{corpus_dir}/msmarco_v2.1_doc_segmented_{fnum:02d}.json.gz"
+        try:
+            with gzip.open(path, "rt") as f:
+                for line in f:
+                    obj = json.loads(line)
+                    did = obj.get("docid", obj.get("doc_id", ""))
+                    if did in ids:
+                        results[did] = obj
+                        ids.discard(did)
+                        if not ids:
+                            break
+        except FileNotFoundError:
+            print(f"      [corpus file not found: {path}]")
+
+    return results
 
 
 def compare_found_missed_keywords(

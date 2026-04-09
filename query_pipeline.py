@@ -416,7 +416,7 @@ class QueryPipeline:
         max_standalone_sup: int = 1000,
         max_count: int = 500000,
         max_queries: int = 50,
-        max_clause_freq: int = 100000,
+        max_clause_freq: int = 7000000,
         min_retrieved_docs: int = None,
         use_core_only: bool = False,
         filter_mode: str = "stopword",
