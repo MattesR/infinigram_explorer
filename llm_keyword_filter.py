@@ -92,41 +92,57 @@ def validate_against_index(
     verbose: bool = False,
 ) -> list[dict]:
     """
-    Check each phrase against the index and return those with >0 hits.
-    If a multi-word phrase has 0 hits, try AND-ing its words as a CNF fallback.
+    Validate phrases against the index with a cascade of fallbacks:
 
-    Args:
-        phrases: List of keyword/phrase strings OR list of dicts with
-            'phrase' and 'standalone' keys (from stopword_filter).
-        tokenizer: Infini-gram tokenizer.
-        engine: Infini-gram engine.
-        max_count: If set, skip phrases with count above this (too broad).
-        max_standalone: Max count for AND fallback to be accepted.
-        verbose: Print counts.
+    1. Try the full phrase as-is (preserving case)
+    2. Try the full phrase lowercased
+    3. If both cases work, create OR (case_variants)
+    4. If phrase has 0 hits, split on stopwords into chunks
+    5. For each chunk: try as-is, try lowercase, try both
+    6. If any chunk has 0 hits, skip entire phrase
+    7. If all chunks valid, create AND query (cnf)
+
+    Single-word chunks from stopword splits get standalone=False.
 
     Returns:
-        List of dicts with 'phrase', 'input_ids', 'count', 'standalone',
-        and optionally 'cnf' (if AND fallback was used).
-        Sorted by count ascending (most specific first).
+        List of validated term dicts, sorted by count ascending.
     """
     validated = []
-    seen_phrases = set()
+    seen = set()
 
     def _has_capital(s):
         return any(c.isupper() for c in s)
 
-    def _try_phrase(phrase, tokenizer, engine):
-        """Try a phrase, return (ids, count) or None."""
-        ids = tokenizer.encode(phrase, add_special_tokens=False)
+    def _try_encode(text):
+        """Encode and count a phrase. Returns (ids, count) or None."""
+        ids = tokenizer.encode(text, add_special_tokens=False)
         if not ids:
             return None
         count = engine.count(input_ids=ids).get("count", 0)
-        if count > 0:
-            return ids, count
+        return (ids, count) if count > 0 else None
+
+    def _try_with_case(phrase):
+        """Try original case and lowercase. Returns best result + metadata."""
+        r_orig = _try_encode(phrase)
+        r_lower = _try_encode(phrase.lower()) if _has_capital(phrase) else None
+
+        if r_orig and r_lower and r_orig[0] != r_lower[0]:
+            # Both cases work with different tokenizations — OR them
+            total = r_orig[1] + r_lower[1]
+            return {
+                "ids": r_orig[0],
+                "ids_alt": r_lower[0],
+                "count": total,
+                "case_variants": True,
+                "display": f"{phrase} (OR {phrase.lower()})",
+            }
+        elif r_orig:
+            return {"ids": r_orig[0], "count": r_orig[1], "display": phrase}
+        elif r_lower:
+            return {"ids": r_lower[0], "count": r_lower[1], "display": phrase.lower()}
         return None
 
     for item in phrases:
-        # Handle both string and dict input
         if isinstance(item, dict):
             phrase = item["phrase"]
             standalone = item.get("standalone", True)
@@ -135,138 +151,131 @@ def validate_against_index(
             standalone = True
 
         key = phrase.lower()
-        if key in seen_phrases:
+        if key in seen:
             continue
-        seen_phrases.add(key)
+        seen.add(key)
 
-        # Try original case first
-        result = _try_phrase(phrase, tokenizer, engine)
+        # Step 1: Try full phrase (with case variants)
+        result = _try_with_case(phrase)
 
-        # If no hits and has capitals, try lowercase
-        if result is None and _has_capital(phrase):
-            result_lower = _try_phrase(phrase.lower(), tokenizer, engine)
-            if result_lower:
-                # Lowercase works — try to create OR with original case
-                ids_orig = tokenizer.encode(phrase, add_special_tokens=False)
-                ids_lower = result_lower[0]
-                count_lower = result_lower[1]
-
-                count_orig = 0
-                if ids_orig:
-                    count_orig = engine.count(input_ids=ids_orig).get("count", 0)
-
-                if count_orig > 0 and ids_orig != ids_lower:
-                    # Both cases have hits — create OR
-                    total = count_orig + count_lower
-                    if max_count and total > max_count:
-                        if verbose:
-                            print(f"    {total:>10,d}  {phrase} (SKIP: too broad, both cases)")
-                        continue
-                    validated.append({
-                        "phrase": phrase,
-                        "input_ids": ids_orig,
-                        "input_ids_alt": ids_lower,
-                        "count": total,
-                        "standalone": standalone,
-                        "case_variants": True,
-                    })
-                    if verbose:
-                        marker = "" if standalone else " [AND-only]"
-                        print(f"    {total:>10,d}  {phrase} (OR {phrase.lower()}){marker}")
-                    continue
-                else:
-                    # Only lowercase works
-                    result = result_lower
-                    phrase = phrase.lower()
-
-        if result is not None:
-            ids, count = result
-
+        if result:
+            count = result["count"]
             if max_count and count > max_count:
                 if verbose:
-                    print(f"    {count:>10,d}  {phrase} (SKIP: too broad)")
+                    print(f"    {count:>10,d}  {result['display']} (SKIP: too broad)")
                 continue
 
-            validated.append({
+            entry = {
                 "phrase": phrase,
-                "input_ids": ids,
+                "input_ids": result["ids"],
                 "count": count,
                 "standalone": standalone,
-            })
+            }
+            if result.get("case_variants"):
+                entry["input_ids_alt"] = result["ids_alt"]
+                entry["case_variants"] = True
             if verbose:
                 marker = "" if standalone else " [AND-only]"
-                print(f"    {count:>10,d}  {phrase}{marker}")
+                print(f"    {count:>10,d}  {result['display']}{marker}")
+            validated.append(entry)
             continue
 
-        # Phrase has 0 hits — try AND fallback for multi-word phrases
+        # Step 2: Full phrase has 0 hits — split on stopwords
         words = phrase.split()
         if len(words) < 2:
             if verbose:
                 print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
             continue
 
-        # Encode each word separately, build CNF
-        # For each word, try original case and lowercase, OR them if both work
-        word_clauses = []
-        word_names = []
-        all_valid = True
+        # Split into chunks on stopwords
+        chunks = []
+        current_chunk = []
         for w in words:
-            w_ids_orig = tokenizer.encode(w, add_special_tokens=False)
-            w_ids_lower = tokenizer.encode(w.lower(), add_special_tokens=False) if _has_capital(w) else None
+            if w.lower() in STOPWORDS:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                    current_chunk = []
+            else:
+                current_chunk.append(w)
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
 
-            # Collect valid encodings
-            valid_ids = []
-            if w_ids_orig:
-                cnt = engine.count(input_ids=w_ids_orig).get("count", 0)
-                if cnt > 0:
-                    valid_ids.append(w_ids_orig)
-            if w_ids_lower and w_ids_lower != w_ids_orig:
-                cnt = engine.count(input_ids=w_ids_lower).get("count", 0)
-                if cnt > 0:
-                    valid_ids.append(w_ids_lower)
-
-            if not valid_ids:
-                all_valid = False
-                break
-            word_clauses.append(valid_ids)  # list of ID alternatives for this word
-            word_names.append(w)
-
-        if not all_valid or len(word_clauses) < 2:
+        if not chunks:
             if verbose:
-                print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
+                print(f"    {0:>10,d}  {phrase} (SKIP: all stopwords)")
             continue
 
-        # Check AND count
-        # word_clauses is [[ids_variant1, ids_variant2], [ids], ...] per word
-        cnf_for_query = word_clauses  # already in CNF format: OR within, AND across
+        # If only one chunk and it's the same as original (no stopwords were found),
+        # the phrase simply doesn't exist in corpus
+        if len(chunks) == 1 and chunks[0].lower() == phrase.lower():
+            # Try AND-ing individual words as last resort
+            chunks = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+            if len(chunks) < 2:
+                if verbose:
+                    print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
+                continue
+
+        # Step 3: Validate each chunk with case variants
+        chunk_results = []
+        all_valid = True
+        for chunk in chunks:
+            cr = _try_with_case(chunk)
+            if cr is None:
+                all_valid = False
+                if verbose:
+                    print(f"    {0:>10,d}  {phrase} (SKIP: chunk '{chunk}' not in corpus)")
+                break
+            chunk_results.append(cr)
+
+        if not all_valid or len(chunk_results) < 2:
+            continue
+
+        # Step 4: Build CNF from chunks
+        cnf_clauses = []
+        chunk_names = []
+        for cr in chunk_results:
+            if cr.get("case_variants"):
+                cnf_clauses.append([cr["ids"], cr["ids_alt"]])
+            else:
+                cnf_clauses.append([cr["ids"]])
+            chunk_names.append(cr["display"])
+
         try:
-            result = engine.find_cnf(cnf=cnf_for_query)
+            result = engine.find_cnf(cnf=cnf_clauses)
             and_count = result.get("cnt", 0)
         except Exception:
             and_count = 0
 
         if and_count > 0 and and_count <= max_standalone:
-            and_desc = " AND ".join(word_names)
-            # Encode original phrase for reference (may be 0 hits as contiguous)
+            and_desc = " AND ".join(chunk_names)
             phrase_ids = tokenizer.encode(phrase, add_special_tokens=False)
+
+            # Determine standalone: single-word chunks from splits are AND-only
+            chunk_standalone = standalone
+            if len(chunks) > 1:
+                single_word_chunks = [c for c in chunks if " " not in c]
+                if len(single_word_chunks) == len(chunks):
+                    # All chunks are single words — mark AND-only
+                    chunk_standalone = False
+
             validated.append({
                 "phrase": phrase,
-                "input_ids": phrase_ids,  # original phrase IDs (for reference)
+                "input_ids": phrase_ids,
                 "count": and_count,
-                "standalone": standalone,
-                "cnf": cnf_for_query,  # use this for queries instead of input_ids
+                "standalone": chunk_standalone,
+                "cnf": cnf_clauses,
                 "description": and_desc,
             })
             if verbose:
-                marker = "" if standalone else " [AND-only]"
+                marker = "" if chunk_standalone else " [AND-only]"
                 print(f"    {and_count:>10,d}  {phrase} -> AND({and_desc}){marker}")
         elif verbose:
+            and_desc = " AND ".join(chunk_names)
             if and_count > max_standalone:
-                print(f"    {and_count:>10,d}  {phrase} -> AND too broad")
+                print(f"    {and_count:>10,d}  {phrase} -> AND({and_desc}) too broad")
             else:
-                print(f"    {0:>10,d}  {phrase} (SKIP: not in corpus)")
+                print(f"    {0:>10,d}  {phrase} (SKIP: AND has 0 hits)")
 
-    # Sort by count ascending (most specific first)
     validated.sort(key=lambda x: x["count"])
     return validated
 
@@ -288,62 +297,35 @@ STOPWORDS = {
 
 def stopword_filter(keywords: list[str]) -> list[dict]:
     """
-    Split keyword phrases on stopwords into separate searchable chunks.
-    Preserves original case (important for case-sensitive indices).
+    Prepare keyword phrases for index validation.
+    Preserves original case and keeps phrases intact.
 
-    "coping with vicarious trauma" -> [
-        {"phrase": "vicarious trauma", "standalone": True},
-        {"phrase": "coping", "standalone": False}
-    ]
-    "Vietnam War" -> [
-        {"phrase": "Vietnam War", "standalone": True}
-    ]
+    Returns each keyword as-is. The validate_against_index function
+    handles trying full phrase, case variants, stopword splitting,
+    and AND fallback.
 
-    Returns list of dicts with 'phrase' and 'standalone' flag.
+    Deduplicates case-insensitively.
+
+    Args:
+        keywords: Raw keyword strings from LLM.
+
+    Returns:
+        Deduplicated list of dicts with 'phrase' and 'standalone' flag.
     """
     seen = set()
     results = []
 
-    def _add(phrase, standalone):
-        key = phrase.lower()  # deduplicate case-insensitively
-        if key not in seen and len(phrase) > 2:
-            seen.add(key)
-            results.append({"phrase": phrase, "standalone": standalone})
-
     for kw in keywords:
         if not kw or not kw.strip():
             continue
-
-        words = kw.strip().split()
-
-        # Check if there are any stopwords
-        has_stopwords = any(w.lower() in STOPWORDS for w in words)
-
-        if not has_stopwords:
-            # No stopwords — entire phrase is standalone, keep original case
-            phrase = " ".join(words)
-            _add(phrase, standalone=True)
+        phrase = kw.strip()
+        key = phrase.lower()
+        if key in seen or len(phrase) <= 2:
             continue
+        seen.add(key)
+        results.append({"phrase": phrase, "standalone": True})
 
-        # Split on stopwords into chunks
-        chunks = []
-        current_chunk = []
-        for w in words:
-            if w.lower() in STOPWORDS:
-                if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                    current_chunk = []
-            else:
-                current_chunk.append(w)
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-
-        # Multi-word chunks are standalone, single words are AND-only
-        for chunk in chunks:
-            is_single_word = " " not in chunk
-            _add(chunk, standalone=not is_single_word)
-
-    # Sort by length descending
+    # Sort by length descending (more specific first)
     results.sort(key=lambda x: len(x["phrase"]), reverse=True)
     return results
 
