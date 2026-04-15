@@ -114,13 +114,30 @@ def expand_term(keyword, tokenizer, engine, max_diff_tokens=5):
         clause = [v["ids"] for v in wd["variants"]]
         cnf.append(clause)
 
+    # For multi-word terms, peek the proximity-AND count
+    count = None
+    if len(cnf) > 1:
+        try:
+            result = engine.count_cnf(
+                cnf,
+                max_clause_freq=80000000,
+                max_diff_tokens=max_diff_tokens,
+            )
+            count = result.get("count", 0)
+        except Exception:
+            count = 0
+    else:
+        # Single word — sum of variant counts
+        count = sum(v["count"] for v in word_data[0]["variants"])
+
     return {
         "original": keyword,
         "words": word_data,
         "cnf": cnf,
+        "count": count,
         "n_words": len(word_data),
         "max_diff_tokens": max_diff_tokens if len(word_data) > 1 else None,
-        "valid": True,
+        "valid": True if count is None or count > 0 else False,
     }
 
 
@@ -231,14 +248,17 @@ def expand_and_peek(
 
 def _print_term(term):
     """Pretty print a single expanded term."""
-    if not term["valid"]:
-        print(f"    INVALID  {term['original']} ('{term.get('invalid_word', '?')}' not in corpus)")
+    if not term.get("valid", True):
+        print(f"           0  {term['original']} (INVALID: '{term.get('invalid_word', '?')}' not in corpus)")
         return
+
+    count = term.get("count", 0)
+    count_str = f"{count:>10,d}" if count is not None else "         ?"
 
     if term["n_words"] == 1:
         variants = term["words"][0]["variants"]
         var_str = " OR ".join(f"{v['text']}({v['count']:,d})" for v in variants)
-        print(f"    {term['original']} -> ({var_str})")
+        print(f"    {count_str}  {term['original']} -> ({var_str})")
     else:
         parts = []
         for wd in term["words"]:
@@ -249,4 +269,4 @@ def _print_term(term):
                 parts.append(f"({var_str})")
         and_str = " AND ".join(parts)
         prox = f" [prox={term['max_diff_tokens']}]" if term.get("max_diff_tokens") else ""
-        print(f"    {term['original']} -> {and_str}{prox}")
+        print(f"    {count_str}  {term['original']} -> {and_str}{prox}")
