@@ -122,25 +122,57 @@ def validate_against_index(
         return (ids, count) if count > 0 else None
 
     def _try_with_case(phrase):
-        """Try original case and lowercase. Returns best result + metadata."""
-        r_orig = _try_encode(phrase)
-        r_lower = _try_encode(phrase.lower()) if _has_capital(phrase) else None
+        """Try multiple capitalizations: original, lowercase, Title Case.
+        OR all variants that have hits. Returns result dict or None."""
+        variants_to_try = [phrase]
 
-        if r_orig and r_lower and r_orig[0] != r_lower[0]:
-            # Both cases work with different tokenizations — OR them
-            total = r_orig[1] + r_lower[1]
-            return {
-                "ids": r_orig[0],
-                "ids_alt": r_lower[0],
-                "count": total,
-                "case_variants": True,
-                "display": f"{phrase} (OR {phrase.lower()})",
-            }
-        elif r_orig:
-            return {"ids": r_orig[0], "count": r_orig[1], "display": phrase}
-        elif r_lower:
-            return {"ids": r_lower[0], "count": r_lower[1], "display": phrase.lower()}
-        return None
+        # Add lowercase if different
+        lower = phrase.lower()
+        if lower != phrase:
+            variants_to_try.append(lower)
+
+        # Add title case if different from both
+        title = phrase.title()
+        if title != phrase and title != lower:
+            variants_to_try.append(title)
+
+        # Also try capitalizing first letter only
+        capitalized = phrase[0].upper() + phrase[1:].lower() if len(phrase) > 1 else phrase.upper()
+        if capitalized not in variants_to_try:
+            variants_to_try.append(capitalized)
+
+        # Try each variant
+        hits = []  # list of (ids, count, display_name)
+        seen_ids = set()
+        for variant in variants_to_try:
+            r = _try_encode(variant)
+            if r:
+                ids_key = tuple(r[0])
+                if ids_key not in seen_ids:
+                    seen_ids.add(ids_key)
+                    hits.append((r[0], r[1], variant))
+
+        if not hits:
+            return None
+
+        if len(hits) == 1:
+            ids, count, display = hits[0]
+            return {"ids": ids, "count": count, "display": display}
+
+        # Multiple case variants have hits — OR them all
+        total_count = sum(c for _, c, _ in hits)
+        displays = [d for _, _, d in hits]
+        result = {
+            "ids": hits[0][0],  # primary
+            "all_ids": [ids for ids, _, _ in hits],  # all variants
+            "count": total_count,
+            "case_variants": True,
+            "display": f"{displays[0]} (OR {' OR '.join(displays[1:])})",
+        }
+        # For backward compat, set ids_alt if exactly 2
+        if len(hits) == 2:
+            result["ids_alt"] = hits[1][0]
+        return result
 
     for item in phrases:
         if isinstance(item, dict):
@@ -172,8 +204,11 @@ def validate_against_index(
                 "standalone": standalone,
             }
             if result.get("case_variants"):
-                entry["input_ids_alt"] = result["ids_alt"]
                 entry["case_variants"] = True
+                if "all_ids" in result:
+                    entry["all_ids"] = result["all_ids"]
+                if "ids_alt" in result:
+                    entry["input_ids_alt"] = result["ids_alt"]
             if verbose:
                 marker = "" if standalone else " [AND-only]"
                 print(f"    {count:>10,d}  {result['display']}{marker}")
@@ -455,36 +490,97 @@ def load_faceted_keywords(qid: str, expansions_path: str) -> dict:
     """
     Load faceted keywords preserving the facet structure.
 
-    Supports prefixes: CORE/KEY (-> core_facets), AUX/SUP (-> aux_facets), VERBS.
+    Supports multiple formats:
+    1. Old prefixed: {"KEY: x": [...], "SUP: y": [...], "VERBS": [...]}
+    2. Old prefixed: {"CORE: x": [...], "AUX: y": [...]}
+    3. New nested: {
+         "KEY_ENTITIES": {"aspect": {"lexical": [...], "conceptual": [...], "referential": [...]}},
+         "ASSOCIATED_TERMS": [...],
+         "VERBS": {"verb": ["expansion1", ...]}
+       }
+    4. Flat aspects: {"aspect1": [...], "aspect2": [...], "ASSOCIATED": [...]}
 
     Returns:
-        Dict with 'core_facets', 'aux_facets', and 'verbs' (list).
+        Dict with 'aspects' (dict of name -> flat term list),
+        'associated' (flat list), and 'verbs' (flat list).
+        Also 'core_facets' and 'aux_facets' for backward compat.
     """
     expansions = load_all_expansions(expansions_path)
     data = expansions.get(qid, {})
 
-    core_facets = {}
-    aux_facets = {}
+    aspects = {}
+    associated = []
     verbs = []
 
-    for key, values in data.items():
-        if not isinstance(values, list):
-            continue
-        upper = key.upper()
-        # Strip prefix for clean facet name
-        if upper.startswith("CORE:") or upper.startswith("KEY:"):
-            clean = key.split(":", 1)[1].strip()
-            core_facets[clean] = values
-        elif upper.startswith("AUX:") or upper.startswith("SUP:"):
-            clean = key.split(":", 1)[1].strip()
-            aux_facets[clean] = values
-        elif upper == "VERBS":
-            verbs = values
-        else:
-            # No recognized prefix — treat as aux
-            aux_facets[key] = values
+    # Detect format
+    if "KEY_ENTITIES" in data:
+        # New nested format
+        for aspect_name, aspect_data in data["KEY_ENTITIES"].items():
+            if isinstance(aspect_data, dict):
+                # Flatten lexical + conceptual + referential
+                terms = []
+                for level in ["lexical", "conceptual", "referential"]:
+                    terms.extend(aspect_data.get(level, []))
+                aspects[aspect_name] = terms
+            elif isinstance(aspect_data, list):
+                aspects[aspect_name] = aspect_data
 
-    return {"core_facets": core_facets, "aux_facets": aux_facets, "verbs": verbs}
+        if "ASSOCIATED_TERMS" in data:
+            associated = data["ASSOCIATED_TERMS"]
+        elif "ASSOCIATED" in data:
+            associated = data["ASSOCIATED"]
+
+        if "VERBS" in data:
+            verb_data = data["VERBS"]
+            if isinstance(verb_data, dict):
+                # {"devastate": ["damage", "harm", ...]} -> flatten
+                for verb, expansions_list in verb_data.items():
+                    verbs.append(verb)
+                    verbs.extend(expansions_list)
+            elif isinstance(verb_data, list):
+                verbs = verb_data
+
+    else:
+        # Old format or flat aspects
+        for key, values in data.items():
+            upper = key.upper()
+
+            if upper == "VERBS":
+                if isinstance(values, dict):
+                    for verb, exps in values.items():
+                        verbs.append(verb)
+                        verbs.extend(exps)
+                elif isinstance(values, list):
+                    verbs = values
+            elif upper in ("ASSOCIATED", "ASSOCIATED_TERMS"):
+                if isinstance(values, list):
+                    associated = values
+            elif isinstance(values, list):
+                # Prefixed or flat aspect
+                if ":" in key:
+                    clean = key.split(":", 1)[1].strip()
+                else:
+                    clean = key
+                aspects[clean] = values
+            elif isinstance(values, dict):
+                # Nested aspect without KEY_ENTITIES wrapper
+                terms = []
+                for level in ["lexical", "conceptual", "referential"]:
+                    terms.extend(values.get(level, []))
+                if terms:
+                    aspects[key] = terms
+
+    # Backward compat: map aspects to core_facets, associated to aux_facets
+    core_facets = aspects
+    aux_facets = {"associated": associated} if associated else {}
+
+    return {
+        "aspects": aspects,
+        "associated": associated,
+        "verbs": verbs,
+        "core_facets": core_facets,
+        "aux_facets": aux_facets,
+    }
 
 
 def load_all_expansions(expansions_path: str) -> dict:
