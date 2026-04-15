@@ -362,6 +362,8 @@ def run_adaptive(
             kwargs = {"cnf": q["cnf"]}
             if max_clause_freq:
                 kwargs["max_clause_freq"] = max_clause_freq
+            if q.get("max_diff_tokens"):
+                kwargs["max_diff_tokens"] = q["max_diff_tokens"]
             result = engine.find_cnf(**kwargs)
             q["cnt"] = result.get("cnt", 0)
             q["approx"] = result.get("approx", False)
