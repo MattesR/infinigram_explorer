@@ -19,20 +19,22 @@ import time
 import anthropic
 import os
 
-SYSTEM_PROMPT = """You are a search keyword expert. Given a query, decompose it into its essential topics and expand the vocabulary for each.
+SYSTEM_PROMPT = """You are a  keyword expansion expert. The keywords need to be designed, so that they work with a search system that can only find verbatim matches of keywords, and their logical expansion. You can for example search for ('Waterpark' AND 'Attractions') to find all documents, where both terms occur. The challenge is to find keywords that work for such a search system. They need to be specific enough to find only relevant documents, but expansive enough to find clearly relevant documents with terminology that differs from the query.
 
-A query's essential topics are the concepts that TOGETHER define what makes a document relevant. A document must discuss ALL essential topics to be relevant.
+Given a query,  find relevant search terms in three categories:
 
-For each topic, generate search terms — these are words and short phrases that authors literally write in documents about this topic. Not descriptions of the topic, but the actual vocabulary used.
+1.KEY_ENTITIES: Identify the key entities in the query. They describe the information need of query.  These key entities  should be non-overlapping noun phrases. For each of these terms, do a threefold keyword expansion.
+The expansions should contain terms that are:
+- Lexical : Synonyms and alternative phrasings for the same words
+- Conceptual: Technical jargon and domain-specific terms that occur in documents about the entity
+- Referential: Specific names, works, laws, theories, or events that could replace the entity in the context of the query
 
-Three levels of vocabulary expansion:
-- Lexical: Synonyms and alternative phrasings for the same words
-- Conceptual: Technical jargon and domain-specific terms
-- Referential: Specific names, works, laws, theories, or events
+   
+2. ASSOCIATED_TERMS: Keywords strongly associated with the overall query that can find relevant documents which have little to no overlap in vocabulary with the query. These are specific terms where finding them in a document is strong evidence the document is relevant to the whole query, without being an expansion of just a single entity.
 
-Provide 2-3 essential topics as "KEY: <topic>" and 3-6 narrower subtopics as "SUP: <topic>". Optionally include "VERBS" with base-form action words if the query has a clear action focus.
+3. VERBS: For the relevant verbs in the query, find expansion relevant to query. 
 
-Format: JSON object. Keys are "KEY: <topic>", "SUP: <topic>", or "VERBS". Values are lists of 3-8 search terms. Every term must be a real phrase (1-4 words) that authors actually write in documents — not a description or summary of a concept. Order by specificity, most specific first. Return ONLY valid JSON."""
+Format: JSON object. KEY_ENTITIES  keys contain term lists. An "ASSOCIATED" key contains topic-level terms. Order by specificity. Every term must be a phrase (1-4 words) that literally appears in real documents. Return ONLY valid JSON."""
 
 from utils import get_token
 os.environ['ANTHROPIC_API_KEY'] = get_token('ANTHROPIC_API_KEY')

@@ -42,31 +42,31 @@ def _check_kw(text, kw):
 
 
 def _load_keywords(qid, expansions_path):
-    """Load keywords for a query from expansions file."""
-    from llm_keyword_filter import load_all_expansions
-    expansions = load_all_expansions(expansions_path)
-    data = expansions.get(qid, {})
+    """Load keywords for a query from expansions file. Handles all formats."""
+    from llm_keyword_filter import load_faceted_keywords
 
-    key_groups = {}
-    sup_groups = {}
-    verbs = []
+    facets = load_faceted_keywords(qid, expansions_path)
+    aspects = facets.get("aspects", facets.get("core_facets", {}))
+    associated = facets.get("associated", [])
+    verbs = facets.get("verbs", [])
+
+    # For effectiveness analysis, aspects are "key_groups"
+    # and associated terms are "sup_groups"
+    key_groups = aspects
+    sup_groups = {"associated": associated} if associated else {}
+
     all_terms = []
+    for terms in aspects.values():
+        all_terms.extend(terms)
+    all_terms.extend(associated)
+    all_terms.extend(verbs)
 
-    for key, values in data.items():
-        if not isinstance(values, list):
-            continue
-        upper = key.upper()
-        if upper.startswith("KEY:") or upper.startswith("CORE:"):
-            name = key.split(":", 1)[1].strip()
-            key_groups[name] = values
-            all_terms.extend(values)
-        elif upper.startswith("SUP:") or upper.startswith("AUX:"):
-            name = key.split(":", 1)[1].strip()
-            sup_groups[name] = values
-            all_terms.extend(values)
-        elif upper == "VERBS":
-            verbs = values
-            all_terms.extend(values)
+    return {
+        "key_groups": key_groups,
+        "sup_groups": sup_groups,
+        "verbs": verbs,
+        "all_terms": all_terms,
+    }
 
     return {
         "key_groups": key_groups,

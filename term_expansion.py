@@ -99,7 +99,6 @@ def expand_term(keyword, tokenizer, engine, max_diff_tokens=5):
                 "original": keyword,
                 "words": [],
                 "cnf": [],
-                "count": 0,
                 "n_words": len(words),
                 "valid": False,
                 "invalid_word": w,
@@ -115,31 +114,13 @@ def expand_term(keyword, tokenizer, engine, max_diff_tokens=5):
         clause = [v["ids"] for v in wd["variants"]]
         cnf.append(clause)
 
-    # Peek count
-    if len(cnf) == 1:
-        # Single word — count is sum of all variant counts
-        total_count = sum(v["count"] for v in word_data[0]["variants"])
-        count = total_count
-    else:
-        # Multi-word — use proximity AND
-        try:
-            result = engine.count_cnf(
-                cnf,
-                max_clause_freq=80000000,
-                max_diff_tokens=max_diff_tokens,
-            )
-            count = result.get("count", 0)
-        except Exception as e:
-            count = 0
-
     return {
         "original": keyword,
         "words": word_data,
         "cnf": cnf,
-        "count": count,
         "n_words": len(word_data),
         "max_diff_tokens": max_diff_tokens if len(word_data) > 1 else None,
-        "valid": count > 0,
+        "valid": True,
     }
 
 
@@ -152,64 +133,64 @@ def expand_and_peek(
     verbose: bool = True,
 ):
     """
-    Expand all keywords for a query and peek their counts.
+    Expand all keywords for a query with case variants and proximity AND.
+
+    Handles multiple keyword formats:
+    - Old: KEY:/SUP: prefixed facets
+    - New: KEY_ENTITIES with nested lexical/conceptual/referential + ASSOCIATED_TERMS + VERBS
 
     Returns dict with:
-        - key_terms: list of expanded terms from KEY groups
-        - sup_terms: list of expanded terms from SUP groups
+        - aspect_terms: dict of aspect_name -> list of expanded terms
+        - associated_terms: list of expanded terms from ASSOCIATED
         - verb_terms: list of expanded verb terms
         - all_terms: flat list of all expanded terms
-        - facets: original facet structure with expanded terms
     """
     facets = load_faceted_keywords(qid, expansions_path)
-    core_facets = facets["core_facets"]
-    aux_facets = facets["aux_facets"]
+    aspects = facets.get("aspects", facets.get("core_facets", {}))
+    associated = facets.get("associated", [])
     verbs = facets.get("verbs", [])
 
     if verbose:
         print(f"\nExpanding keywords for {qid}")
-        print(f"  KEY facets: {len(core_facets)}")
-        print(f"  SUP facets: {len(aux_facets)}")
+        print(f"  Aspects: {len(aspects)}")
+        print(f"  Associated: {len(associated)} terms")
         print(f"  Verbs: {len(verbs)}")
         print(f"  max_diff_tokens: {max_diff_tokens}")
 
-    key_terms = []
-    sup_terms = []
-    verb_terms = []
+    aspect_terms = {}
+    associated_expanded = []
+    verb_expanded = []
+    all_terms = []
 
-    # Key facets with structure preserved
-    key_facets_expanded = {}
-    for facet_name, keywords in core_facets.items():
+    # Expand aspects
+    for aspect_name, keywords in aspects.items():
         if verbose:
-            print(f"\n  KEY: {facet_name}")
+            print(f"\n  ASPECT: {aspect_name}")
         expanded = []
         for kw in keywords:
             term = expand_term(kw, tokenizer, engine, max_diff_tokens)
             if term is None:
                 continue
             expanded.append(term)
-            key_terms.append(term)
+            all_terms.append(term)
             if verbose:
                 _print_term(term)
-        key_facets_expanded[facet_name] = expanded
+        aspect_terms[aspect_name] = expanded
 
-    # Sup facets
-    sup_facets_expanded = {}
-    for facet_name, keywords in aux_facets.items():
+    # Expand associated terms
+    if associated:
         if verbose:
-            print(f"\n  SUP: {facet_name}")
-        expanded = []
-        for kw in keywords:
+            print(f"\n  ASSOCIATED:")
+        for kw in associated:
             term = expand_term(kw, tokenizer, engine, max_diff_tokens)
             if term is None:
                 continue
-            expanded.append(term)
-            sup_terms.append(term)
+            associated_expanded.append(term)
+            all_terms.append(term)
             if verbose:
                 _print_term(term)
-        sup_facets_expanded[facet_name] = expanded
 
-    # Verbs
+    # Expand verbs
     if verbs:
         if verbose:
             print(f"\n  VERBS:")
@@ -217,11 +198,10 @@ def expand_and_peek(
             term = expand_term(v, tokenizer, engine, max_diff_tokens)
             if term is None:
                 continue
-            verb_terms.append(term)
+            verb_expanded.append(term)
+            all_terms.append(term)
             if verbose:
                 _print_term(term)
-
-    all_terms = key_terms + sup_terms + verb_terms
 
     # Summary
     if verbose:
@@ -229,42 +209,36 @@ def expand_and_peek(
         n_invalid = sum(1 for t in all_terms if not t["valid"])
         print(f"\n{'='*60}")
         print(f"Summary: {len(all_terms)} terms ({n_valid} valid, {n_invalid} invalid)")
-        print(f"  KEY: {len(key_terms)} terms")
-        print(f"  SUP: {len(sup_terms)} terms")
-        print(f"  VERBS: {len(verb_terms)} terms")
-
-        # Show count distribution
-        valid_counts = sorted([t["count"] for t in all_terms if t["valid"]])
-        if valid_counts:
-            print(f"  Count range: {valid_counts[0]:,d} - {valid_counts[-1]:,d}")
-            print(f"  < 100: {sum(1 for c in valid_counts if c < 100)}")
-            print(f"  100-1k: {sum(1 for c in valid_counts if 100 <= c < 1000)}")
-            print(f"  1k-5k: {sum(1 for c in valid_counts if 1000 <= c < 5000)}")
-            print(f"  5k-10k: {sum(1 for c in valid_counts if 5000 <= c < 10000)}")
-            print(f"  10k+: {sum(1 for c in valid_counts if c >= 10000)}")
+        for name, terms in aspect_terms.items():
+            n_v = sum(1 for t in terms if t["valid"])
+            print(f"  {name}: {len(terms)} terms ({n_v} valid)")
+        print(f"  ASSOCIATED: {len(associated_expanded)} terms")
+        print(f"  VERBS: {len(verb_expanded)} terms")
         print(f"{'='*60}")
 
     return {
-        "key_terms": key_terms,
-        "sup_terms": sup_terms,
-        "verb_terms": verb_terms,
+        "aspect_terms": aspect_terms,
+        "associated_terms": associated_expanded,
+        "verb_terms": verb_expanded,
         "all_terms": all_terms,
-        "key_facets": key_facets_expanded,
-        "sup_facets": sup_facets_expanded,
+        # Backward compat
+        "key_terms": all_terms,
+        "sup_terms": associated_expanded,
+        "key_facets": aspect_terms,
+        "sup_facets": {"associated": associated_expanded} if associated_expanded else {},
     }
 
 
 def _print_term(term):
     """Pretty print a single expanded term."""
     if not term["valid"]:
-        print(f"    {0:>8,d}  {term['original']} (INVALID: '{term.get('invalid_word', '?')}' not in corpus)")
+        print(f"    INVALID  {term['original']} ('{term.get('invalid_word', '?')}' not in corpus)")
         return
 
-    # Build description
     if term["n_words"] == 1:
         variants = term["words"][0]["variants"]
         var_str = " OR ".join(f"{v['text']}({v['count']:,d})" for v in variants)
-        print(f"    {term['count']:>8,d}  {term['original']} -> ({var_str})")
+        print(f"    {term['original']} -> ({var_str})")
     else:
         parts = []
         for wd in term["words"]:
@@ -275,4 +249,4 @@ def _print_term(term):
                 parts.append(f"({var_str})")
         and_str = " AND ".join(parts)
         prox = f" [prox={term['max_diff_tokens']}]" if term.get("max_diff_tokens") else ""
-        print(f"    {term['count']:>8,d}  {term['original']} -> {and_str}{prox}")
+        print(f"    {term['original']} -> {and_str}{prox}")
