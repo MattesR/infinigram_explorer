@@ -77,6 +77,7 @@ def _make_base_piece(keywords, tokenizer, engine):
         "cnf_clause": or_ids,
         "words": sorted(word_variants.keys()),
         "description": " OR ".join(sorted(word_variants.keys())),
+        "source_keywords": keywords,
     }
 
 
@@ -248,6 +249,7 @@ def build_queries(
         return True
 
     aspect_names = list(key_pieces.keys())
+    grabbed_aspects = set()  # aspects fully grabbed in Step 0
 
     if verbose:
         print(f"\n{'='*70}")
@@ -256,7 +258,61 @@ def build_queries(
         print(f"{'='*70}")
 
     # ================================================================
-    # Step 2: Cross-aspect ANDs
+    # Step 0: Try each KEY lexical term as exact phrase (cheapest)
+    # ================================================================
+    if verbose:
+        print(f"\nStep 0: KEY terms as exact phrases (< {max_standalone})")
+
+    for aspect_name, piece in key_pieces.items():
+        source_kws = piece.get("source_keywords", [])
+        aspect_total = 0
+
+        for kw in source_kws:
+            # Remove stopwords but keep phrase structure
+            words = kw.strip().split()
+            content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+            if not content:
+                continue
+
+            phrase = " ".join(content)
+
+            # Try multiple case variants as simple find() calls
+            variants_to_try = {phrase, phrase.lower()}
+            if len(phrase) > 1:
+                variants_to_try.add(phrase[0].upper() + phrase[1:])
+            # Title case
+            variants_to_try.add(" ".join(w.capitalize() for w in content))
+
+            for variant in variants_to_try:
+                ids = tokenizer.encode(variant, add_special_tokens=False)
+                if not ids:
+                    continue
+                ids_key = tuple(ids)
+                if ids_key in seen:
+                    continue
+
+                count = engine.count(input_ids=ids).get("count", 0)
+                if 0 < count <= max_standalone:
+                    seen.add(ids_key)
+                    queries.append({
+                        "type": "simple",
+                        "input_ids": ids,
+                        "description": f"{variant} (exact)",
+                        "estimated_count": count,
+                        "level": "S0_exact",
+                    })
+                    aspect_total += count
+                    if verbose:
+                        print(f"    {count:>8,d}  [S0] {variant}")
+
+        # If all terms in this aspect are grabbed, mark it
+        if aspect_total > 0 and aspect_total <= max_standalone * 2:
+            grabbed_aspects.add(aspect_name)
+            if verbose:
+                print(f"    -> aspect '{aspect_name}' covered ({aspect_total} total)")
+
+    # ================================================================
+    # Step 2: Cross-aspect ANDs (skip aspects already grabbed)
     # ================================================================
     if verbose:
         print(f"\nStep 2: Cross-aspect ANDs")
@@ -275,8 +331,8 @@ def build_queries(
         desc = f"({key_pieces[a]['description']}) AND ({key_pieces[b]['description']})"
         _add(cnf, prox_medium, desc, "S2_pair")
 
-    # N-1 (drop one) — useful for 3+ aspects
-    if len(aspect_names) >= 3:
+    # N-1 (drop one) — only useful for 4+ aspects
+    if len(aspect_names) >= 4:
         for drop in aspect_names:
             if len(queries) >= max_total:
                 break
