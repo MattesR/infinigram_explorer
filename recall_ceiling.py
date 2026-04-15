@@ -58,7 +58,16 @@ def retrieval_recall(
 
     t0 = time.perf_counter()
 
-    if mode == "llm_adaptive":
+    if mode == "progressive":
+        from progressive_queries import build_pieces, build_queries
+        from adaptive_queries import run_adaptive
+
+        pieces = build_pieces(qid, expansions_path, tokenizer, engine, verbose=False)
+        queries = build_queries(pieces, engine, tokenizer, verbose=False,
+                                max_clause_freq=max_clause_freq)
+        executed = run_adaptive(engine, queries, max_clause_freq=max_clause_freq, verbose=False)
+
+    elif mode == "llm_adaptive":
         executed, scored, scoring_terms_q = pipeline.build_and_run_llm_adaptive(
             query_text,
             qid=qid,
@@ -216,6 +225,7 @@ def compare_recall_ceiling(
     tokenizer,
     index_dir: str = "../msmarco_segmented_index/",
     expansions_paths: dict = None,
+    progressive_paths: dict = None,
     include_splade: bool = True,
     max_topics: int = None,
     max_standalone: int = 5000,
@@ -232,23 +242,24 @@ def compare_recall_ceiling(
     Compare raw retrieval recall across pipeline modes.
 
     Args:
-        expansions_paths: Dict mapping label -> JSONL path.
-            e.g. {"llm_v1": "kw_v1.jsonl", "llm_v2": "kw_v2.jsonl"}
-            Each becomes an llm_adaptive mode with that label.
+        expansions_paths: Dict mapping label -> JSONL path for llm_adaptive mode.
+        progressive_paths: Dict mapping label -> JSONL path for progressive mode.
         include_splade: If True, also run splade_adaptive for comparison.
-        max_topics: Limit number of topics.
-        filter_mode: "stopword" or "noun_phrase" for LLM keyword filtering.
-        save_inspection: If True, save found/missed/irrelevant JSONL files per query.
-        inspection_dir: Base directory for inspection files. Subdirs created per mode.
     """
     # Build modes list
     modes = []
-    mode_expansions = {}  # mode_name -> expansions_path
+    mode_expansions = {}   # label -> path (llm_adaptive)
+    mode_progressive = {}  # label -> path (progressive)
 
     if expansions_paths:
         for label, path in expansions_paths.items():
             modes.append(label)
             mode_expansions[label] = path
+
+    if progressive_paths:
+        for label, path in progressive_paths.items():
+            modes.append(label)
+            mode_progressive[label] = path
 
     if include_splade:
         modes.append("splade_adaptive")
@@ -290,7 +301,10 @@ def compare_recall_ceiling(
                 if corpus_dir:
                     kwargs["corpus_dir"] = corpus_dir
 
-            if mode in mode_expansions:
+            if mode in mode_progressive:
+                actual_mode = "progressive"
+                kwargs["expansions_path"] = mode_progressive[mode]
+            elif mode in mode_expansions:
                 actual_mode = "llm_adaptive"
                 kwargs["expansions_path"] = mode_expansions[mode]
             else:

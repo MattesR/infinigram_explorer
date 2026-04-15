@@ -72,7 +72,7 @@ def build_adaptive_queries(
     max_refined: int = 20000,
     min_cluster_score: float = 1.0,
     max_queries: int = 50,
-    max_clause_freq: int = 100000,
+    max_clause_freq: int = 8000000,
     verbose: bool = True,
 ) -> list[dict]:
     """
@@ -335,7 +335,7 @@ def build_adaptive_queries(
 def run_adaptive(
     engine,
     queries: list[dict],
-    max_clause_freq: int = 100000,
+    max_clause_freq: int = 8000000,
     min_retrieved_docs: int = None,
     verbose: bool = True,
 ) -> list[dict]:
