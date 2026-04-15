@@ -390,6 +390,6 @@ def run_adaptive(
             approx = "~" if q.get("approx") else ""
             marker = "FIND" if q["type"] == "simple" else "CNF"
             print(f"{i+1:4d} {marker:<5s} {q.get('cnt', 0):>10,d}"
-                  f"{approx:>1s} {q['score']:>8.2f} {q['description']}")
+                  f"{approx:>1s} {q.get('score', 0):>8.2f} {q['description']}")
 
     return executed
