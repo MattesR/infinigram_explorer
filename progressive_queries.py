@@ -284,7 +284,7 @@ def peek_and_grab(
         Process a single keyword. Returns:
             ("grabbed_exact", None) — fully grabbed via exact-phrase variants
             ("grabbed_cnf", None) — fully grabbed via CNF query
-            ("remaining", piece_dict) — exact grabbed, CNF kept for combination
+            ("remaining", piece_dict) — CNF kept for combination
             ("skipped", None) — no hits at all
         """
         variants, exact_total = _peek_keyword(kw, tokenizer, engine)
@@ -319,8 +319,7 @@ def peek_and_grab(
                 })
             return "grabbed_cnf", None, cnf_count
 
-        # Both exact and CNF too big — grab exact hits, keep CNF for combinations
-        _grab_exact_variants(variants, category)
+        # Both exact and CNF too big — don't grab anything, keep CNF for combinations
         return "remaining", {
             "keyword": kw,
             "cnf": cnf,
@@ -357,7 +356,7 @@ def peek_and_grab(
                 aspect_remaining.append(remaining_piece)
                 any_remaining = True
                 if verbose:
-                    print(f"    {remaining_piece['exact_count']:>8,d}/{count:,d}  {kw} -> exact grabbed, CNF kept")
+                    print(f"    {remaining_piece['exact_count']:>8,d}/{count:,d}  {kw} -> CNF kept for combination")
             elif verbose:
                 print(f"    {0:>8,d}  {kw} (not in corpus)")
 
@@ -388,7 +387,7 @@ def peek_and_grab(
             remaining_piece["category"] = piece.get("category", "referential")
             remaining_ref_pieces.append(remaining_piece)
             if verbose:
-                print(f"    {remaining_piece['exact_count']:>8,d}/{count:,d}  {kw} -> exact grabbed, CNF kept")
+                print(f"    {remaining_piece['exact_count']:>8,d}/{count:,d}  {kw} -> CNF kept for combination")
         elif verbose:
             print(f"    {0:>8,d}  {kw} (not in corpus)")
 
@@ -408,7 +407,7 @@ def peek_and_grab(
         elif status == "remaining":
             remaining_assoc_pieces.append(remaining_piece)
             if verbose:
-                print(f"    {remaining_piece['exact_count']:>8,d}/{count:,d}  {kw} -> exact grabbed, CNF kept")
+                print(f"    {remaining_piece['exact_count']:>8,d}/{count:,d}  {kw} -> CNF kept for combination")
         elif verbose:
             print(f"    {0:>8,d}  {kw} (not in corpus)")
 
