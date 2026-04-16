@@ -1,19 +1,15 @@
 """
 Progressive CNF query construction.
 
-Step 1: Build base OR pieces per aspect from lexical expansions
-Step 2: Cross-aspect ANDs (core queries)
-Step 3: Referential terms standalone (grab specific ones)
-Step 4: Remaining referential AND narrowest base
-Step 5: Associated terms AND narrowest base
-
-Skips: conceptual terms (covered by base pieces), verbs (too broad)
+Step 0: Peek all terms (KEY + referential + associated), grab cheap ones
+Step 1+: Combine remaining terms intelligently
 
 Usage:
-    from progressive_queries import build_pieces, build_queries
+    from progressive_queries import build_pieces, peek_and_grab, build_combination_queries
 
-    pieces = build_pieces("2024-32912", "./kws.jsonl", tokenizer, engine)
-    queries = build_queries(pieces, engine, tokenizer)
+    pieces = build_pieces(qid, path, tokenizer, engine)
+    peek = peek_and_grab(pieces, engine, tokenizer)
+    queries = peek["grabbed"] + build_combination_queries(peek, engine, tokenizer)
 """
 
 from itertools import combinations
@@ -25,7 +21,6 @@ def _case_variants(word, tokenizer, engine):
     candidates = {word, word.lower()}
     if len(word) > 1:
         candidates.add(word[0].upper() + word[1:].lower())
-
     valid = []
     seen = set()
     for w in candidates:
@@ -43,23 +38,18 @@ def _case_variants(word, tokenizer, engine):
 
 
 def _make_base_piece(keywords, tokenizer, engine):
-    """
-    Pool keyword phrases into one OR clause.
-    Extracts all unique content words, gets case variants for each.
-    """
+    """Pool keyword phrases into one OR clause with case variants per word."""
     all_words = set()
     for kw in keywords:
         for w in kw.strip().split():
             if w.lower() not in STOPWORDS and len(w) > 1:
                 all_words.add(w.lower())
-
     if not all_words:
         return None
 
     or_ids = []
     seen = set()
     word_variants = {}
-
     for w in all_words:
         variants = _case_variants(w, tokenizer, engine)
         if variants:
@@ -69,7 +59,6 @@ def _make_base_piece(keywords, tokenizer, engine):
                 if k not in seen:
                     seen.add(k)
                     or_ids.append(ids)
-
     if not or_ids:
         return None
 
@@ -82,23 +71,17 @@ def _make_base_piece(keywords, tokenizer, engine):
 
 
 def _make_term_piece(keyword, tokenizer, engine):
-    """
-    Make a CNF piece from a single keyword phrase.
-    Multi-word: one clause per word (for proximity AND).
-    Single word: single clause with case variants.
-    """
+    """Make a CNF piece from a single keyword phrase."""
     words = keyword.strip().split()
     content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
     if not content:
         return None
-
     clauses = []
     for w in content:
         variants = _case_variants(w, tokenizer, engine)
         if not variants:
             return None
         clauses.append(variants)
-
     return {
         "cnf": clauses,
         "description": keyword,
@@ -106,44 +89,68 @@ def _make_term_piece(keyword, tokenizer, engine):
     }
 
 
-def build_pieces(qid, expansions_path, tokenizer, engine, verbose=True):
+def _peek_keyword(keyword, tokenizer, engine):
     """
-    Build CNF pieces from keyword expansions.
+    Peek a single keyword: try all case variants of the full phrase.
+    Returns list of (ids, count, variant_text) and total count.
+    """
+    words = keyword.strip().split()
+    content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+    if not content:
+        return [], 0
 
-    Returns dict with key_pieces, referential_pieces, associated_pieces.
-    """
+    phrase = " ".join(content)
+    variants_to_try = {phrase, phrase.lower()}
+    if len(phrase) > 1:
+        variants_to_try.add(phrase[0].upper() + phrase[1:])
+    variants_to_try.add(" ".join(w.capitalize() for w in content))
+
+    results = []
+    seen = set()
+    total = 0
+    for variant in variants_to_try:
+        ids = tokenizer.encode(variant, add_special_tokens=False)
+        if not ids:
+            continue
+        ids_key = tuple(ids)
+        if ids_key in seen:
+            continue
+        seen.add(ids_key)
+        count = engine.count(input_ids=ids).get("count", 0)
+        if count > 0:
+            results.append({"ids": ids, "count": count, "text": variant})
+            total += count
+
+    return results, total
+
+
+def build_pieces(qid, expansions_path, tokenizer, engine, verbose=True):
+    """Build CNF pieces from keyword expansions."""
     data = load_all_expansions(expansions_path).get(qid, {})
 
-    key_pieces = {}       # aspect_name -> base OR piece
-    referential = []      # flat list of term pieces
-    associated = []       # flat list of term pieces
+    key_pieces = {}
+    referential = []
+    associated = []
 
     if verbose:
         print(f"\n{'='*70}")
         print(f"Building pieces for {qid}")
         print(f"{'='*70}")
 
-    # KEY_ENTITIES
     key_entities = data.get("KEY_ENTITIES", {})
     for name, aspect in key_entities.items():
         if isinstance(aspect, dict):
             lexical = aspect.get("lexical", [])
-            # Build base from aspect name + lexical expansions
             piece = _make_base_piece([name] + lexical, tokenizer, engine)
             if piece:
                 key_pieces[name] = piece
                 if verbose:
                     print(f"  KEY '{name}': ({piece['description']})")
-
-            # Collect referential terms
             for kw in aspect.get("referential", []):
                 p = _make_term_piece(kw, tokenizer, engine)
                 if p:
                     p["source_aspect"] = name
                     referential.append(p)
-
-            # Skip conceptual — covered by base pieces
-
         elif isinstance(aspect, list):
             piece = _make_base_piece([name] + aspect, tokenizer, engine)
             if piece:
@@ -151,7 +158,6 @@ def build_pieces(qid, expansions_path, tokenizer, engine, verbose=True):
                 if verbose:
                     print(f"  KEY '{name}': ({piece['description']})")
 
-    # ASSOCIATED_TERMS
     for kw in data.get("ASSOCIATED_TERMS", data.get("ASSOCIATED", [])):
         p = _make_term_piece(kw, tokenizer, engine)
         if p:
@@ -161,10 +167,171 @@ def build_pieces(qid, expansions_path, tokenizer, engine, verbose=True):
         print(f"  Referential: {len(referential)} terms")
         print(f"  Associated: {len(associated)} terms")
 
+    return {"key_pieces": key_pieces, "referential": referential, "associated": associated}
+
+
+def peek_and_grab(
+    pieces,
+    engine,
+    tokenizer,
+    max_standalone_key: int = 1000,
+    max_standalone_assoc: int = 200,
+    verbose: bool = True,
+):
+    """
+    Peek all terms, grab cheap ones. Returns structured overview.
+
+    Returns dict with:
+        grabbed: list of query dicts (ready to execute)
+        remaining_key_terms: {aspect_name: [(keyword, total_count, variants), ...]}
+        remaining_referential: [(piece, total_count), ...]
+        remaining_associated: [(piece, total_count), ...]
+        key_pieces: the original pooled OR pieces (for combination queries)
+        grabbed_aspects: set of fully-grabbed aspect names
+    """
+    key_pieces = pieces["key_pieces"]
+    referential = pieces["referential"]
+    associated = pieces["associated"]
+
+    grabbed = []
+    remaining_key_terms = {}
+    grabbed_aspects = set()
+    seen_ids = set()
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"Peeking all terms")
+        print(f"{'='*70}")
+
+    # ---- KEY terms ----
+    for aspect_name, piece in key_pieces.items():
+        source_kws = piece.get("source_keywords", [])
+        aspect_remaining = []
+        all_grabbed = True
+
+        if verbose:
+            print(f"\n  KEY: {aspect_name}")
+
+        for kw in source_kws:
+            variants, total = _peek_keyword(kw, tokenizer, engine)
+            if total == 0:
+                if verbose:
+                    print(f"    {0:>8,d}  {kw} (not in corpus)")
+                continue
+
+            if total <= max_standalone_key:
+                # Grab all variants
+                for v in variants:
+                    ids_key = tuple(v["ids"])
+                    if ids_key not in seen_ids:
+                        seen_ids.add(ids_key)
+                        grabbed.append({
+                            "type": "simple",
+                            "input_ids": v["ids"],
+                            "description": f"{v['text']} (exact)",
+                            "estimated_count": v["count"],
+                            "level": "S0_key",
+                        })
+                if verbose:
+                    print(f"    {total:>8,d}  {kw} -> GRAB ({len(variants)} variants)")
+            else:
+                aspect_remaining.append((kw, total, variants))
+                all_grabbed = False
+                if verbose:
+                    print(f"    {total:>8,d}  {kw} -> KEEP")
+
+        remaining_key_terms[aspect_name] = aspect_remaining
+        if all_grabbed and source_kws:
+            grabbed_aspects.add(aspect_name)
+            if verbose:
+                print(f"    -> aspect '{aspect_name}' fully grabbed")
+
+    # ---- Referential terms ----
+    if verbose:
+        print(f"\n  REFERENTIAL:")
+
+    remaining_ref = []
+    for piece in referential:
+        variants, total = _peek_keyword(piece["description"], tokenizer, engine)
+        if total == 0:
+            if verbose:
+                print(f"    {0:>8,d}  {piece['description']} (not in corpus)")
+            continue
+
+        if total <= max_standalone_assoc:
+            for v in variants:
+                ids_key = tuple(v["ids"])
+                if ids_key not in seen_ids:
+                    seen_ids.add(ids_key)
+                    grabbed.append({
+                        "type": "simple",
+                        "input_ids": v["ids"],
+                        "description": f"{v['text']} (ref)",
+                        "estimated_count": v["count"],
+                        "level": "S0_ref",
+                    })
+            if verbose:
+                print(f"    {total:>8,d}  {piece['description']} -> GRAB")
+        else:
+            remaining_ref.append((piece, total))
+            if verbose:
+                print(f"    {total:>8,d}  {piece['description']} -> KEEP")
+
+    # ---- Associated terms ----
+    if verbose:
+        print(f"\n  ASSOCIATED:")
+
+    remaining_assoc = []
+    for piece in associated:
+        variants, total = _peek_keyword(piece["description"], tokenizer, engine)
+        if total == 0:
+            if verbose:
+                print(f"    {0:>8,d}  {piece['description']} (not in corpus)")
+            continue
+
+        if total <= max_standalone_assoc:
+            for v in variants:
+                ids_key = tuple(v["ids"])
+                if ids_key not in seen_ids:
+                    seen_ids.add(ids_key)
+                    grabbed.append({
+                        "type": "simple",
+                        "input_ids": v["ids"],
+                        "description": f"{v['text']} (assoc)",
+                        "estimated_count": v["count"],
+                        "level": "S0_assoc",
+                    })
+            if verbose:
+                print(f"    {total:>8,d}  {piece['description']} -> GRAB")
+        else:
+            remaining_assoc.append((piece, total))
+            if verbose:
+                print(f"    {total:>8,d}  {piece['description']} -> KEEP")
+
+    # Sort remaining by count ascending (most specific first)
+    remaining_ref.sort(key=lambda x: x[1])
+    remaining_assoc.sort(key=lambda x: x[1])
+
+    # Summary
+    if verbose:
+        total_grabbed = sum(q["estimated_count"] for q in grabbed)
+        print(f"\n{'='*70}")
+        print(f"Peek summary:")
+        print(f"  Grabbed: {len(grabbed)} queries, ~{total_grabbed:,d} docs")
+        print(f"  Grabbed aspects: {grabbed_aspects or 'none'}")
+        print(f"  Remaining KEY terms: {sum(len(v) for v in remaining_key_terms.values())}")
+        print(f"  Remaining referential: {len(remaining_ref)}")
+        print(f"  Remaining associated: {len(remaining_assoc)}")
+        print(f"{'='*70}")
+
     return {
+        "grabbed": grabbed,
+        "remaining_key_terms": remaining_key_terms,
+        "remaining_referential": remaining_ref,
+        "remaining_associated": remaining_assoc,
         "key_pieces": key_pieces,
-        "referential": referential,
-        "associated": associated,
+        "grabbed_aspects": grabbed_aspects,
+        "seen_ids": seen_ids,
     }
 
 
@@ -179,11 +346,10 @@ def _and_pieces(*pieces):
     return cnf
 
 
-def build_queries(
-    pieces,
+def build_combination_queries(
+    peek,
     engine,
     tokenizer,
-    max_standalone: int = 500,
     max_query_count: int = 5000,
     max_total: int = 40,
     prox_tight: int = 20,
@@ -193,19 +359,22 @@ def build_queries(
     verbose: bool = True,
 ):
     """
-    Build ~25-30 queries progressively.
+    Build combination queries from remaining (non-grabbed) terms.
 
-    Step 2: Cross-aspect ANDs
-    Step 3: Referential standalone
-    Step 4: Remaining referential AND narrowest base
-    Step 5: Associated AND narrowest base
+    Uses the peek results to know what's left and their counts.
     """
-    key_pieces = pieces["key_pieces"]
-    referential = pieces["referential"]
-    associated = pieces["associated"]
+    key_pieces = peek["key_pieces"]
+    grabbed_aspects = peek["grabbed_aspects"]
+    remaining_key = peek["remaining_key_terms"]
+    remaining_ref = peek["remaining_referential"]
+    remaining_assoc = peek["remaining_associated"]
+    seen = set(peek.get("seen_ids", set()))
+
+    # Only use non-grabbed aspects for combinations
+    remaining_pieces = {n: p for n, p in key_pieces.items() if n not in grabbed_aspects}
+    remaining_names = list(remaining_pieces.keys())
 
     queries = []
-    seen = set()
 
     def _qkey(cnf, prox):
         return (tuple(tuple(tuple(a) for a in c) for c in cnf), prox)
@@ -214,7 +383,6 @@ def build_queries(
         key = _qkey(cnf, prox)
         if key in seen or len(queries) >= max_total:
             return False
-
         if count is None:
             try:
                 kwargs = {"max_clause_freq": max_clause_freq}
@@ -224,17 +392,14 @@ def build_queries(
                 count = result.get("count", 0)
             except Exception:
                 count = 0
-
         if count == 0:
             if verbose:
                 print(f"           0  [{level}] {desc} (SKIP)")
             return False
-
         if count > max_query_count:
             if verbose:
                 print(f"    {count:>8,d}  [{level}] {desc} (SKIP: >{max_query_count:,d})")
             return False
-
         seen.add(key)
         queries.append({
             "type": "cnf",
@@ -248,164 +413,67 @@ def build_queries(
             print(f"    {count:>8,d}  [{level}] {desc}")
         return True
 
-    aspect_names = list(key_pieces.keys())
-    grabbed_aspects = set()  # aspects fully grabbed in Step 0
-
     if verbose:
         print(f"\n{'='*70}")
-        print(f"Building queries ({len(aspect_names)} aspects, "
-              f"{len(referential)} ref, {len(associated)} assoc)")
+        print(f"Building combination queries")
+        print(f"  Remaining aspects: {remaining_names}")
+        print(f"  Remaining ref: {len(remaining_ref)}, assoc: {len(remaining_assoc)}")
         print(f"{'='*70}")
 
     # ================================================================
-    # Step 0: Try each KEY lexical term as exact phrase (cheapest)
+    # Cross-aspect ANDs
     # ================================================================
     if verbose:
-        print(f"\nStep 0: KEY terms as exact phrases (< {max_standalone})")
+        print(f"\nCross-aspect ANDs:")
 
-    for aspect_name, piece in key_pieces.items():
-        source_kws = piece.get("source_keywords", [])
-        aspect_total = 0
+    if len(remaining_names) >= 2:
+        # All remaining AND'd
+        cnf = [remaining_pieces[n]["cnf_clause"] for n in remaining_names]
+        desc = " AND ".join(f"({remaining_pieces[n]['description']})" for n in remaining_names)
+        _add(cnf, prox_tight, desc, "S1_all")
 
-        for kw in source_kws:
-            # Remove stopwords but keep phrase structure
-            words = kw.strip().split()
-            content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
-            if not content:
-                continue
-
-            phrase = " ".join(content)
-
-            # Try multiple case variants as simple find() calls
-            variants_to_try = {phrase, phrase.lower()}
-            if len(phrase) > 1:
-                variants_to_try.add(phrase[0].upper() + phrase[1:])
-            # Title case
-            variants_to_try.add(" ".join(w.capitalize() for w in content))
-
-            for variant in variants_to_try:
-                ids = tokenizer.encode(variant, add_special_tokens=False)
-                if not ids:
-                    continue
-                ids_key = tuple(ids)
-                if ids_key in seen:
-                    continue
-
-                count = engine.count(input_ids=ids).get("count", 0)
-                if 0 < count <= max_standalone:
-                    seen.add(ids_key)
-                    queries.append({
-                        "type": "simple",
-                        "input_ids": ids,
-                        "description": f"{variant} (exact)",
-                        "estimated_count": count,
-                        "level": "S0_exact",
-                    })
-                    aspect_total += count
-                    if verbose:
-                        print(f"    {count:>8,d}  [S0] {variant}")
-
-        # If all terms in this aspect are grabbed, mark it
-        if aspect_total > 0 and aspect_total <= max_standalone * 2:
-            grabbed_aspects.add(aspect_name)
-            if verbose:
-                print(f"    -> aspect '{aspect_name}' covered ({aspect_total} total)")
-
-    # ================================================================
-    # Step 2: Cross-aspect ANDs (skip aspects already grabbed)
-    # ================================================================
-    if verbose:
-        print(f"\nStep 2: Cross-aspect ANDs")
-
-    # All aspects AND'd
-    if len(aspect_names) >= 2:
-        cnf = [key_pieces[n]["cnf_clause"] for n in aspect_names]
-        desc = " AND ".join(f"({key_pieces[n]['description']})" for n in aspect_names)
-        _add(cnf, prox_tight, desc, "S2_all")
-
-    # Pairwise
-    for a, b in combinations(aspect_names, 2):
-        if len(queries) >= max_total:
-            break
-        cnf = [key_pieces[a]["cnf_clause"], key_pieces[b]["cnf_clause"]]
-        desc = f"({key_pieces[a]['description']}) AND ({key_pieces[b]['description']})"
-        _add(cnf, prox_medium, desc, "S2_pair")
-
-    # N-1 (drop one) — only useful for 4+ aspects
-    if len(aspect_names) >= 4:
-        for drop in aspect_names:
+        # Pairwise
+        for a, b in combinations(remaining_names, 2):
             if len(queries) >= max_total:
                 break
-            remaining = [n for n in aspect_names if n != drop]
-            cnf = [key_pieces[n]["cnf_clause"] for n in remaining]
-            desc = " AND ".join(f"({key_pieces[n]['description']})" for n in remaining)
-            desc += f" [no {drop}]"
-            # Don't add if it's same as a pairwise (when 3 aspects, N-1 == pairwise)
-            _add(cnf, prox_medium, desc, "S2_drop1")
+            cnf = [remaining_pieces[a]["cnf_clause"], remaining_pieces[b]["cnf_clause"]]
+            desc = f"({remaining_pieces[a]['description']}) AND ({remaining_pieces[b]['description']})"
+            _add(cnf, prox_medium, desc, "S1_pair")
 
     # ================================================================
-    # Step 3: Referential standalone (grab specific ones)
+    # Referential AND other aspects
     # ================================================================
     if verbose:
-        print(f"\nStep 3: Referential standalone (< {max_standalone})")
-
-    remaining_ref = []
-    for piece in referential:
-        count = 0
-        try:
-            kwargs = {"max_clause_freq": max_clause_freq}
-            if piece["n_words"] > 1:
-                kwargs["max_diff_tokens"] = prox_tight
-            result = engine.count_cnf(piece["cnf"], **kwargs)
-            count = result.get("count", 0)
-        except Exception:
-            pass
-
-        if 0 < count <= max_standalone:
-            _add(piece["cnf"], prox_tight if piece["n_words"] > 1 else None,
-                 f"{piece['description']} (standalone)", "S3_ref", count=count)
-        elif count > max_standalone:
-            remaining_ref.append((piece, count))
-
-    # ================================================================
-    # Step 4: Remaining referential AND narrowest base
-    # ================================================================
-    if verbose:
-        print(f"\nStep 4: Remaining referential AND base")
-
-    # Find narrowest aspect (fewest OR variants = most specific)
-    narrowest = min(aspect_names, key=lambda n: len(key_pieces[n]["cnf_clause"])) if aspect_names else None
+        print(f"\nReferential AND other aspects:")
 
     for piece, ref_count in remaining_ref:
         if len(queries) >= max_total:
             break
-        # AND with a different aspect than the source
         source = piece.get("source_aspect")
-        for name in aspect_names:
+        for name in remaining_names:
             if name == source:
-                continue  # skip own aspect
+                continue
             if len(queries) >= max_total:
                 break
-            cnf = _and_pieces(key_pieces[name], piece)
-            desc = f"({key_pieces[name]['description']}) AND ({piece['description']})"
-            _add(cnf, prox_wide, desc, "S4_ref")
+            cnf = _and_pieces(remaining_pieces[name], piece)
+            desc = f"({remaining_pieces[name]['description']}) AND ({piece['description']})"
+            _add(cnf, prox_wide, desc, "S2_ref")
 
     # ================================================================
-    # Step 5: Associated AND narrowest base
+    # Associated AND aspects
     # ================================================================
     if verbose:
-        print(f"\nStep 5: Associated AND base")
+        print(f"\nAssociated AND aspects:")
 
-    # Sort associated by specificity (fewer words = more specific usually)
-    for piece in associated:
+    narrowest = min(remaining_names, key=lambda n: len(remaining_pieces[n]["cnf_clause"])) if remaining_names else None
+
+    for piece, assoc_count in remaining_assoc:
         if len(queries) >= max_total:
             break
-
-        # Try AND with narrowest aspect first
         if narrowest:
-            cnf = _and_pieces(key_pieces[narrowest], piece)
-            desc = f"({key_pieces[narrowest]['description']}) AND ({piece['description']})"
-            _add(cnf, prox_wide, desc, "S5_assoc")
+            cnf = _and_pieces(remaining_pieces[narrowest], piece)
+            desc = f"({remaining_pieces[narrowest]['description']}) AND ({piece['description']})"
+            _add(cnf, prox_wide, desc, "S3_assoc")
 
     # Summary
     if verbose:
@@ -413,12 +481,8 @@ def build_queries(
         by_level = {}
         for q in queries:
             by_level.setdefault(q["level"], []).append(q)
-
         print(f"\n{'='*70}")
-        print(f"Summary: {len(queries)} queries, ~{total_est:,d} estimated docs")
+        print(f"Combination queries: {len(queries)}, ~{total_est:,d} estimated docs")
         for level, qs in sorted(by_level.items()):
-            level_est = sum(q["estimated_count"] for q in qs)
-            print(f"  {level}: {len(qs)} queries, ~{level_est:,d} docs")
+            print(f"  {level}: {len(qs)} queries, ~{sum(q['estimated_count'] for q in qs):,d} docs")
         print(f"{'='*70}")
-
-    return queries
