@@ -256,10 +256,13 @@ def peek_and_grab(
         """
         Build CNF for a keyword (OR case variants per word) and peek its count.
         Returns (cnf, count) or (None, 0) if can't build.
+
+        For single words, returns a 1-clause CNF (OR over case variants).
+        For multi-word, returns multi-clause CNF for proximity AND.
         """
         words = keyword.strip().split()
         content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
-        if len(content) < 2:
+        if not content:
             return None, 0
 
         cnf = []
@@ -270,11 +273,10 @@ def peek_and_grab(
             cnf.append(variants)
 
         try:
-            result = engine.count_cnf(
-                cnf,
-                max_clause_freq=max_clause_freq,
-                max_diff_tokens=prox_peek,
-            )
+            kwargs = {"max_clause_freq": max_clause_freq}
+            if len(cnf) > 1:
+                kwargs["max_diff_tokens"] = prox_peek
+            result = engine.count_cnf(cnf, **kwargs)
             return cnf, result.get("count", 0)
         except Exception:
             return None, 0
@@ -298,10 +300,8 @@ def peek_and_grab(
         # Exact total exceeds threshold — try CNF
         cnf, cnf_count = _peek_cnf_version(kw)
 
-        if cnf is None:
-            # Single word, can't do CNF — just grab exact and skip (too broad)
-            _grab_exact_variants(variants, category)
-            return "grabbed_exact", None, exact_total
+        if cnf is None or cnf_count == 0:
+            return "skipped", None, exact_total
 
         if 0 < cnf_count <= threshold:
             # CNF fits — grab it (superset of exact)
@@ -453,6 +453,7 @@ def build_combination_queries(
     peek,
     engine,
     tokenizer,
+    max_docs: int = 30000,
     max_query_count: int = 5000,
     max_total: int = 40,
     prox_tight: int = 20,
@@ -462,30 +463,36 @@ def build_combination_queries(
     verbose: bool = True,
 ):
     """
-    Build combination queries from remaining (non-grabbed) terms.
+    Build combination queries from remaining terms, filling a doc budget.
 
-    Uses the peek results to know what's left and their counts.
+    Each remaining CNF piece is AND'd with the pooled OR clause of another aspect.
+    All candidates are sorted by count ascending (most specific first) and
+    added greedily until the budget is filled.
+
+    Args:
+        max_docs: Total doc budget (grabbed + combination).
+        max_query_count: Skip individual queries above this count.
+        max_total: Max number of combination queries.
     """
     key_pieces = peek["key_pieces"]
     grabbed_aspects = peek["grabbed_aspects"]
+    remaining_key = peek["remaining_key_pieces"]
     remaining_ref = peek["remaining_ref_pieces"]
     remaining_assoc = peek["remaining_assoc_pieces"]
-    seen_set = peek.get("seen_ids", set())
-    # Make a copy we can add CNF keys to
-    seen = set()
-    for item in seen_set:
-        seen.add(item)
+    seen = set(peek.get("seen_ids", set()))
 
-    # Only use non-grabbed aspects for combinations
-    remaining_pieces = {n: p for n, p in key_pieces.items() if n not in grabbed_aspects}
-    remaining_names = list(remaining_pieces.keys())
+    # Budget: subtract already-grabbed docs
+    grabbed_total = sum(q["estimated_count"] for q in peek["grabbed"])
+    budget = max_docs - grabbed_total
 
+    aspect_names = list(key_pieces.keys())
     queries = []
 
     def _qkey(cnf, prox):
         return (tuple(tuple(tuple(a) for a in c) for c in cnf), prox)
 
     def _add(cnf, prox, desc, level, count=None):
+        nonlocal budget
         key = _qkey(cnf, prox)
         if key in seen or len(queries) >= max_total:
             return False
@@ -499,8 +506,6 @@ def build_combination_queries(
             except Exception:
                 count = 0
         if count == 0:
-            if verbose:
-                print(f"           0  [{level}] {desc} (SKIP)")
             return False
         if count > max_query_count:
             if verbose:
@@ -515,74 +520,71 @@ def build_combination_queries(
             "estimated_count": count,
             "level": level,
         })
+        budget -= count
         if verbose:
-            print(f"    {count:>8,d}  [{level}] {desc}")
+            print(f"    {count:>8,d}  [{level}] {desc} (budget: {budget:,d})")
         return True
 
     if verbose:
         print(f"\n{'='*70}")
         print(f"Building combination queries")
-        print(f"  Remaining aspects: {remaining_names}")
-        print(f"  Remaining ref: {len(remaining_ref)}, assoc: {len(remaining_assoc)}")
+        print(f"  Grabbed so far: ~{grabbed_total:,d} docs")
+        print(f"  Budget remaining: ~{budget:,d} docs")
+        print(f"  Aspects: {aspect_names}")
         print(f"{'='*70}")
 
-    # ================================================================
-    # Cross-aspect ANDs
-    # ================================================================
-    if verbose:
-        print(f"\nCross-aspect ANDs:")
-
-    if len(remaining_names) >= 2:
-        # All remaining AND'd
-        cnf = [remaining_pieces[n]["cnf_clause"] for n in remaining_names]
-        desc = " AND ".join(f"({remaining_pieces[n]['description']})" for n in remaining_names)
-        _add(cnf, prox_tight, desc, "S1_all")
-
-        # Pairwise
-        for a, b in combinations(remaining_names, 2):
-            if len(queries) >= max_total:
-                break
-            cnf = [remaining_pieces[a]["cnf_clause"], remaining_pieces[b]["cnf_clause"]]
-            desc = f"({remaining_pieces[a]['description']}) AND ({remaining_pieces[b]['description']})"
-            _add(cnf, prox_medium, desc, "S1_pair")
+    if budget <= 0:
+        if verbose:
+            print(f"  Budget exhausted, skipping combinations.")
+        return queries
 
     # ================================================================
-    # Referential AND other aspects
+    # Build all candidate queries, then sort by count and fill budget
     # ================================================================
-    if verbose:
-        print(f"\nReferential AND other aspects:")
 
+    # A candidate is (estimated_count, cnf, prox, desc, level)
+    candidates = []
+
+    # 1. Remaining KEY lexical pieces AND other aspects' pooled OR
+    for aspect_name, pieces_list in remaining_key.items():
+        for piece in pieces_list:
+            # AND with each OTHER aspect's pooled OR
+            for other_name in aspect_names:
+                if other_name == aspect_name:
+                    continue
+                cnf = [key_pieces[other_name]["cnf_clause"]] + piece["cnf"]
+                desc = f"({key_pieces[other_name]['description']}) AND ({piece['keyword']})"
+                candidates.append((piece["count"], cnf, prox_tight, desc, "C1_key"))
+
+    # 2. Remaining referential/conceptual AND other aspects' pooled OR
     for piece in remaining_ref:
-        if len(queries) >= max_total:
-            break
         source = piece.get("source_aspect")
-        kw = piece["keyword"]
-        for name in remaining_names:
-            if name == source:
+        for other_name in aspect_names:
+            if other_name == source:
                 continue
-            if len(queries) >= max_total:
-                break
-            # Build CNF: key piece + ref piece clauses
-            cnf = [remaining_pieces[name]["cnf_clause"]] + piece["cnf"]
-            desc = f"({remaining_pieces[name]['description']}) AND ({kw})"
-            _add(cnf, prox_wide, desc, "S2_ref")
+            cnf = [key_pieces[other_name]["cnf_clause"]] + piece["cnf"]
+            desc = f"({key_pieces[other_name]['description']}) AND ({piece['keyword']})"
+            candidates.append((piece["count"], cnf, prox_medium, desc, "C2_ref"))
 
-    # ================================================================
-    # Associated AND aspects
-    # ================================================================
-    if verbose:
-        print(f"\nAssociated AND aspects:")
-
-    narrowest = min(remaining_names, key=lambda n: len(remaining_pieces[n]["cnf_clause"])) if remaining_names else None
-
+    # 3. Remaining associated AND each aspect's pooled OR
     for piece in remaining_assoc:
-        if len(queries) >= max_total:
+        for name in aspect_names:
+            cnf = [key_pieces[name]["cnf_clause"]] + piece["cnf"]
+            desc = f"({key_pieces[name]['description']}) AND ({piece['keyword']})"
+            candidates.append((piece["count"], cnf, prox_wide, desc, "C3_assoc"))
+
+    # Sort by count ascending (most specific first)
+    candidates.sort(key=lambda x: x[0])
+
+    if verbose:
+        print(f"\n  {len(candidates)} candidate queries, filling budget...")
+        print()
+
+    # Greedily add candidates
+    for est_count, cnf, prox, desc, level in candidates:
+        if budget <= 0 or len(queries) >= max_total:
             break
-        if narrowest:
-            kw = piece["keyword"]
-            cnf = [remaining_pieces[narrowest]["cnf_clause"]] + piece["cnf"]
-            desc = f"({remaining_pieces[narrowest]['description']}) AND ({kw})"
-            _add(cnf, prox_wide, desc, "S3_assoc")
+        _add(cnf, prox, desc, level)
 
     # Summary
     if verbose:
@@ -594,6 +596,7 @@ def build_combination_queries(
         print(f"Combination queries: {len(queries)}, ~{total_est:,d} estimated docs")
         for level, qs in sorted(by_level.items()):
             print(f"  {level}: {len(qs)} queries, ~{sum(q['estimated_count'] for q in qs):,d} docs")
+        print(f"  Budget remaining: ~{budget:,d}")
         print(f"{'='*70}")
 
     return queries
