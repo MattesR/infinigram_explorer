@@ -224,35 +224,40 @@ def peek_and_grab(
     verbose: bool = True,
 ):
     """
-    Peek all terms and build CNF pieces for combination queries.
-    No standalone grabs — everything goes through combinations.
+    Peek all terms as CNF queries and grab cheap ones.
 
     For each keyword:
-    1. Build CNF version (case variants OR'd per word, proximity AND)
-    2. Peek its count
-    3. Store as a piece for later combination
+    1. Build CNF (case variants OR'd per word, proximity AND at prox_peek)
+    2. Peek count
+    3. If count < threshold: grab as a query
+    4. If count >= threshold: store as piece for combination
 
     Returns dict with:
-        grabbed: [] (empty — no standalone grabs)
+        grabbed: list of query dicts ready to execute
         remaining_key_pieces: {aspect_name: [{keyword, cnf, count}, ...]}
         remaining_ref_pieces: [{keyword, cnf, count, source_aspect}, ...]
         remaining_assoc_pieces: [{keyword, cnf, count}, ...]
-        key_pieces: original pooled OR pieces
-        grabbed_aspects: set() (empty)
+        grabbed_aspects: set of fully-grabbed aspect names
     """
     key_pieces = pieces["key_pieces"]
     referential = pieces["referential"]
     associated = pieces["associated"]
 
+    grabbed = []
     remaining_key_pieces = {}
     remaining_ref_pieces = []
     remaining_assoc_pieces = []
+    grabbed_aspects = set()
+    seen_ids = set()
 
-    def _build_cnf(keyword):
-        """Build CNF for a keyword with case variants per word."""
+    def _build_and_peek(keyword):
+        """Build CNF for keyword and peek count. Returns (cnf, count) or (None, 0)."""
         words = keyword.strip().split()
         content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
         if not content:
+            return None, 0
+        # Skip multi-word that reduced to single word
+        if len(words) > 1 and len(content) == 1:
             return None, 0
 
         cnf = []
@@ -271,36 +276,65 @@ def peek_and_grab(
         except Exception:
             return None, 0
 
+    def _grab(cnf, count, keyword, level):
+        """Add a query to grabbed list."""
+        cnf_key = tuple(tuple(tuple(a) for a in c) for c in cnf)
+        if cnf_key in seen_ids:
+            return
+        seen_ids.add(cnf_key)
+        prox = prox_peek if len(cnf) > 1 else None
+        grabbed.append({
+            "type": "cnf",
+            "cnf": cnf,
+            "max_diff_tokens": prox,
+            "description": f"{keyword}",
+            "estimated_count": count,
+            "level": level,
+        })
+
     if verbose:
         print(f"\n{'='*70}")
-        print(f"Peek all terms (prox={prox_peek})")
+        print(f"Peek and grab (key<{max_standalone_key}, assoc<{max_standalone_assoc}, prox={prox_peek})")
         print(f"{'='*70}")
 
     # ---- KEY terms ----
     for aspect_name, aspect_term_pieces in key_pieces.items():
-        aspect_pieces = []
+        aspect_remaining = []
+        all_grabbed = True
 
         if verbose:
             print(f"\n  KEY: {aspect_name}")
 
         for term_piece in aspect_term_pieces:
             kw = term_piece["description"]
-            cnf, count = _build_cnf(kw)
+            cnf, count = _build_and_peek(kw)
+
             if cnf is None or count == 0:
                 if verbose:
                     print(f"    {0:>8,d}  {kw} (skip)")
                 continue
 
-            aspect_pieces.append({
-                "keyword": kw,
-                "cnf": cnf,
-                "count": count,
-            })
-            if verbose:
-                print(f"    {count:>8,d}  {kw}")
+            if count <= max_standalone_key:
+                _grab(cnf, count, kw, "S0_key")
+                if verbose:
+                    print(f"    {count:>8,d}  {kw} -> GRAB")
+            else:
+                aspect_remaining.append({
+                    "keyword": kw,
+                    "cnf": cnf,
+                    "count": count,
+                })
+                all_grabbed = False
+                if verbose:
+                    print(f"    {count:>8,d}  {kw} -> KEEP")
 
-        aspect_pieces.sort(key=lambda p: p["count"])
-        remaining_key_pieces[aspect_name] = aspect_pieces
+        aspect_remaining.sort(key=lambda p: p["count"])
+        remaining_key_pieces[aspect_name] = aspect_remaining
+
+        if all_grabbed and aspect_term_pieces:
+            grabbed_aspects.add(aspect_name)
+            if verbose:
+                print(f"    -> aspect '{aspect_name}' fully grabbed")
 
     # ---- Referential/conceptual terms ----
     if verbose:
@@ -308,21 +342,27 @@ def peek_and_grab(
 
     for piece in referential:
         kw = piece["description"]
-        cnf, count = _build_cnf(kw)
+        cnf, count = _build_and_peek(kw)
+
         if cnf is None or count == 0:
             if verbose:
                 print(f"    {0:>8,d}  {kw} (skip)")
             continue
 
-        remaining_ref_pieces.append({
-            "keyword": kw,
-            "cnf": cnf,
-            "count": count,
-            "source_aspect": piece.get("source_aspect"),
-            "category": piece.get("category", "referential"),
-        })
-        if verbose:
-            print(f"    {count:>8,d}  {kw}")
+        if count <= max_standalone_assoc:
+            _grab(cnf, count, kw, "S0_ref")
+            if verbose:
+                print(f"    {count:>8,d}  {kw} -> GRAB")
+        else:
+            remaining_ref_pieces.append({
+                "keyword": kw,
+                "cnf": cnf,
+                "count": count,
+                "source_aspect": piece.get("source_aspect"),
+                "category": piece.get("category", "referential"),
+            })
+            if verbose:
+                print(f"    {count:>8,d}  {kw} -> KEEP")
 
     # ---- Associated terms ----
     if verbose:
@@ -330,41 +370,49 @@ def peek_and_grab(
 
     for piece in associated:
         kw = piece["description"]
-        cnf, count = _build_cnf(kw)
+        cnf, count = _build_and_peek(kw)
+
         if cnf is None or count == 0:
             if verbose:
                 print(f"    {0:>8,d}  {kw} (skip)")
             continue
 
-        remaining_assoc_pieces.append({
-            "keyword": kw,
-            "cnf": cnf,
-            "count": count,
-        })
-        if verbose:
-            print(f"    {count:>8,d}  {kw}")
+        if count <= max_standalone_assoc:
+            _grab(cnf, count, kw, "S0_assoc")
+            if verbose:
+                print(f"    {count:>8,d}  {kw} -> GRAB")
+        else:
+            remaining_assoc_pieces.append({
+                "keyword": kw,
+                "cnf": cnf,
+                "count": count,
+            })
+            if verbose:
+                print(f"    {count:>8,d}  {kw} -> KEEP")
 
-    # Sort by count ascending
+    # Sort remaining by count ascending
     remaining_ref_pieces.sort(key=lambda p: p["count"])
     remaining_assoc_pieces.sort(key=lambda p: p["count"])
 
     if verbose:
-        n_key = sum(len(v) for v in remaining_key_pieces.values())
+        total_grabbed = sum(q["estimated_count"] for q in grabbed)
+        n_rem_key = sum(len(v) for v in remaining_key_pieces.values())
         print(f"\n{'='*70}")
         print(f"Peek summary:")
-        print(f"  Key pieces: {n_key}")
-        print(f"  Referential/conceptual pieces: {len(remaining_ref_pieces)}")
-        print(f"  Associated pieces: {len(remaining_assoc_pieces)}")
+        print(f"  Grabbed: {len(grabbed)} queries, ~{total_grabbed:,d} docs")
+        print(f"  Grabbed aspects: {grabbed_aspects or 'none'}")
+        print(f"  Remaining key: {n_rem_key}")
+        print(f"  Remaining ref/conceptual: {len(remaining_ref_pieces)}")
+        print(f"  Remaining associated: {len(remaining_assoc_pieces)}")
         print(f"{'='*70}")
 
     return {
-        "grabbed": [],
+        "grabbed": grabbed,
         "remaining_key_pieces": remaining_key_pieces,
         "remaining_ref_pieces": remaining_ref_pieces,
         "remaining_assoc_pieces": remaining_assoc_pieces,
-        "key_pieces": key_pieces,
-        "grabbed_aspects": set(),
-        "seen_ids": set(),
+        "grabbed_aspects": grabbed_aspects,
+        "seen_ids": seen_ids,
     }
 
 
