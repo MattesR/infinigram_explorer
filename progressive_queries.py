@@ -526,9 +526,9 @@ def build_combination_queries(
                 count = 0
         if count == 0:
             return False
-        if count > max_query_count:
+        if count > budget:
             if verbose:
-                print(f"    {count:>8,d}  [{level}] {desc} (SKIP: >{max_query_count:,d})")
+                print(f"    {count:>8,d}  [{level}] {desc} (SKIP: exceeds budget {budget:,d})")
             return False
         seen.add(key)
         queries.append({
