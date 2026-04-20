@@ -427,6 +427,51 @@ def _and_pieces(*pieces):
     return cnf
 
 
+def _build_phrase_or_clause(pieces_list, tokenizer):
+    """
+    Build one OR clause from a list of CNF pieces by encoding
+    each keyword as a contiguous phrase (all case variants).
+
+    Each piece's keyword becomes multiple alternatives (case variants)
+    as contiguous token sequences.
+
+    Returns (or_clause, descriptions) where or_clause is a list of
+    token ID sequences to OR together.
+    """
+    or_ids = []
+    seen = set()
+    descriptions = []
+
+    for piece in pieces_list:
+        kw = piece["keyword"]
+        descriptions.append(kw)
+
+        # Remove stopwords
+        words = kw.strip().split()
+        content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+        if not content:
+            continue
+
+        phrase = " ".join(content)
+
+        # Generate case variants of the full phrase
+        variants = {phrase, phrase.lower()}
+        if len(phrase) > 1:
+            variants.add(phrase[0].upper() + phrase[1:])
+        variants.add(" ".join(w.capitalize() for w in content))
+
+        for variant in variants:
+            ids = tokenizer.encode(variant, add_special_tokens=False)
+            if not ids:
+                continue
+            ids_key = tuple(ids)
+            if ids_key not in seen:
+                seen.add(ids_key)
+                or_ids.append(ids)
+
+    return or_ids, descriptions
+
+
 def build_combination_queries(
     peek,
     engine,
@@ -435,22 +480,23 @@ def build_combination_queries(
     max_query_count: int = 5000,
     max_total: int = 40,
     prox_tight: int = 20,
-    prox_medium: int = 30,
+    prox_medium: int = 50,
     prox_wide: int = 80,
     max_clause_freq: int = 80000000,
     verbose: bool = True,
 ):
     """
-    Build combination queries from remaining terms, filling a doc budget.
+    Build combination queries from remaining terms.
 
-    Each remaining piece is AND'd with pieces from other aspects.
-    All candidates are sorted by estimated count ascending and
-    added greedily until the budget is filled.
+    Uses phrase-OR clauses: each aspect's remaining keywords become one
+    OR clause of contiguous phrase variants. Clauses are AND'd across aspects.
 
-    Step 1: Cross-aspect key piece × key piece ANDs
-    Step 2: Remaining key/ref/assoc pieces AND'd with other aspects' key pieces
+    Step 1: All aspects AND'd (one clause per aspect, OR over phrases)
+    Step 2: Pairwise aspect ANDs
+    Step 3: Each aspect AND'd with each associated piece
+    Step 4: Each aspect AND'd with each ref/conceptual piece from other aspects
     """
-    remaining_key = peek["remaining_key_pieces"]  # {aspect: [{keyword, cnf, count}, ...]}
+    remaining_key = peek["remaining_key_pieces"]
     remaining_ref = peek["remaining_ref_pieces"]
     remaining_assoc = peek["remaining_assoc_pieces"]
     seen = set(peek.get("seen_ids", set()))
@@ -498,13 +544,21 @@ def build_combination_queries(
             print(f"    {count:>8,d}  [{level}] {desc} (budget: {budget:,d})")
         return True
 
+    # Build phrase-OR clause per aspect
+    aspect_clauses = {}  # aspect_name -> (or_ids, descriptions)
+    for name, pieces_list in remaining_key.items():
+        or_ids, descs = _build_phrase_or_clause(pieces_list, tokenizer)
+        if or_ids:
+            aspect_clauses[name] = (or_ids, descs)
+
     if verbose:
         print(f"\n{'='*70}")
         print(f"Building combination queries")
         print(f"  Budget: ~{budget:,d} docs")
-        print(f"  Aspects: {aspect_names}")
-        n_key = sum(len(v) for v in remaining_key.values())
-        print(f"  Key pieces: {n_key}, ref: {len(remaining_ref)}, assoc: {len(remaining_assoc)}")
+        print(f"  Aspects with phrase-OR clauses: {list(aspect_clauses.keys())}")
+        for name, (or_ids, descs) in aspect_clauses.items():
+            print(f"    {name}: {len(or_ids)} phrase variants from {len(descs)} keywords")
+        print(f"  Remaining ref: {len(remaining_ref)}, assoc: {len(remaining_assoc)}")
         print(f"{'='*70}")
 
     if budget <= 0:
@@ -512,56 +566,73 @@ def build_combination_queries(
             print(f"  Budget exhausted.")
         return queries
 
+    active_names = list(aspect_clauses.keys())
+
     # ================================================================
-    # Build all candidate queries
+    # Step 1: All aspects AND'd
     # ================================================================
-    candidates = []
-
-    # 1. Cross-aspect key × key: piece from aspect A AND piece from aspect B
-    for a_name, a_pieces in remaining_key.items():
-        for b_name, b_pieces in remaining_key.items():
-            if a_name >= b_name:  # avoid duplicates + self
-                continue
-            for a_piece in a_pieces:
-                for b_piece in b_pieces:
-                    cnf = a_piece["cnf"] + b_piece["cnf"]
-                    est = min(a_piece["count"], b_piece["count"])  # rough lower bound
-                    desc = f"({a_piece['keyword']}) AND ({b_piece['keyword']})"
-                    candidates.append((est, cnf, prox_tight, desc, "C1_key_x_key"))
-
-    # 2. Ref/conceptual pieces AND key pieces from other aspects
-    for piece in remaining_ref:
-        source = piece.get("source_aspect")
-        for other_name, other_pieces in remaining_key.items():
-            if other_name == source:
-                continue
-            for other_piece in other_pieces:
-                cnf = other_piece["cnf"] + piece["cnf"]
-                est = min(other_piece["count"], piece["count"])
-                desc = f"({other_piece['keyword']}) AND ({piece['keyword']})"
-                candidates.append((est, cnf, prox_medium, desc, "C2_ref"))
-
-    # 3. Associated pieces AND key pieces from each aspect
-    for piece in remaining_assoc:
-        for name, key_pieces_list in remaining_key.items():
-            for key_piece in key_pieces_list:
-                cnf = key_piece["cnf"] + piece["cnf"]
-                est = min(key_piece["count"], piece["count"])
-                desc = f"({key_piece['keyword']}) AND ({piece['keyword']})"
-                candidates.append((est, cnf, prox_wide, desc, "C3_assoc"))
-
-    # Sort by estimated count ascending (most specific first)
-    candidates.sort(key=lambda x: x[0])
-
     if verbose:
-        print(f"\n  {len(candidates)} candidate queries, filling budget...")
-        print()
+        print(f"\nStep 1: All aspects AND'd")
 
-    # Greedily add candidates
-    for est_count, cnf, prox, desc, level in candidates:
+    if len(active_names) >= 2:
+        cnf = [aspect_clauses[n][0] for n in active_names]
+        desc = " AND ".join(f"[{n}]" for n in active_names)
+        _add(cnf, prox_tight, desc, "S1_all")
+
+    # ================================================================
+    # Step 2: Pairwise aspect ANDs
+    # ================================================================
+    if verbose:
+        print(f"\nStep 2: Pairwise aspects")
+
+    for a, b in combinations(active_names, 2):
         if budget <= 0 or len(queries) >= max_total:
             break
-        _add(cnf, prox, desc, level)
+        cnf = [aspect_clauses[a][0], aspect_clauses[b][0]]
+        desc = f"[{a}] AND [{b}]"
+        _add(cnf, prox_medium, desc, "S2_pair")
+
+    # ================================================================
+    # Step 3: Each aspect clause AND'd with associated pieces
+    # ================================================================
+    if verbose:
+        print(f"\nStep 3: Aspect AND associated")
+
+    for piece in remaining_assoc:
+        if budget <= 0 or len(queries) >= max_total:
+            break
+        # Build phrase-OR for the associated term too
+        assoc_or, _ = _build_phrase_or_clause([piece], tokenizer)
+        if not assoc_or:
+            continue
+        for name in active_names:
+            if budget <= 0 or len(queries) >= max_total:
+                break
+            cnf = [aspect_clauses[name][0], assoc_or]
+            desc = f"[{name}] AND ({piece['keyword']})"
+            _add(cnf, prox_wide, desc, "S3_assoc")
+
+    # ================================================================
+    # Step 4: Each aspect AND'd with ref/conceptual from other aspects
+    # ================================================================
+    if verbose:
+        print(f"\nStep 4: Aspect AND ref/conceptual")
+
+    for piece in remaining_ref:
+        if budget <= 0 or len(queries) >= max_total:
+            break
+        source = piece.get("source_aspect")
+        ref_or, _ = _build_phrase_or_clause([piece], tokenizer)
+        if not ref_or:
+            continue
+        for name in active_names:
+            if name == source:
+                continue
+            if budget <= 0 or len(queries) >= max_total:
+                break
+            cnf = [aspect_clauses[name][0], ref_or]
+            desc = f"[{name}] AND ({piece['keyword']})"
+            _add(cnf, prox_wide, desc, "S4_ref")
 
     # Summary
     if verbose:
