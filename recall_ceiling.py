@@ -24,6 +24,7 @@ from tqdm import tqdm
 from trec_output import load_qrels
 from full_eval import load_topics
 from resolve_documents import resolve_all_queries
+from llm_keyword_filter import STOPWORDS
 
 
 def retrieval_recall(
@@ -265,6 +266,8 @@ def compare_recall_ceiling(
     prox_tight: int = 20,
     prox_medium: int = 50,
     prox_wide: int = 80,
+    # Return docs for reranking
+    return_docs: bool = False,
 ):
     """
     Compare raw retrieval recall across pipeline modes.
@@ -352,6 +355,9 @@ def compare_recall_ceiling(
                     index_dir=index_dir, mode=actual_mode, **kwargs,
                 )
                 if result:
+                    if not return_docs:
+                        result.pop("docs", None)
+                        result.pop("relevant", None)
                     all_results[mode].append(result)
             except Exception as e:
                 print(f"  [{qid}] {mode} ERROR: {e}")
