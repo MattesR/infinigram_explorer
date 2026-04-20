@@ -161,6 +161,8 @@ def retrieval_recall(
         "time_query": t_query,
         "time_resolve": t_resolve,
         "n_queries": len(executed),
+        "docs": docs,
+        "relevant": relevant,
     }
 
     # Save inspection files if requested

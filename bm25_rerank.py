@@ -106,7 +106,7 @@ def rerank_and_evaluate(
     qrels_path: str,
     expansions_path: str = None,
     top_k: int = 1000,
-    query_weight: int = 3,
+    query_weight: int = 1,
     verbose: bool = True,
 ):
     """
