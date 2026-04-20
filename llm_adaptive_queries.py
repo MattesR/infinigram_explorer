@@ -408,7 +408,7 @@ def build_llm_adaptive_queries(
 def run_llm_adaptive(
     engine,
     queries: list[dict],
-    max_clause_freq: int = 100000,
+    max_clause_freq: int = 8000000,
     min_retrieved_docs: int = None,
     verbose: bool = True,
 ) -> list[dict]:

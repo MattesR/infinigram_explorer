@@ -289,12 +289,20 @@ def rerank_batch(
                 print(f" {avg_r:>10.4f} {avg_p:>10.4f}", end="")
             print()
 
-        # Per-query table
-        print(f"\n{'='*80}")
-        print(f"Per-query results (best strategy: {strategies[0] if strategies else 'N/A'})")
-        print(f"{'='*80}")
+        # Per-query table — find actual best strategy by avg recall at max cutoff
+        max_k = max(top_k_list)
+        best_strategy = None
+        best_avg = -1
+        for strategy in strategies:
+            recalls = [r[strategy][max_k]["recall"] for r in all_rerank if strategy in r]
+            avg = sum(recalls) / len(recalls) if recalls else 0
+            if avg > best_avg:
+                best_avg = avg
+                best_strategy = strategy
 
-        best_strategy = strategies[0] if strategies else None
+        print(f"\n{'='*80}")
+        print(f"Per-query results (best strategy: {best_strategy})")
+        print(f"{'='*80}")
         if best_strategy:
             header = f"{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Raw':>6s}"
             for k in top_k_list:

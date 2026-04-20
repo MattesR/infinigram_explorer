@@ -145,7 +145,6 @@ def retrieval_recall(
         queries=executed,
         index_dir=index_dir,
         tokenizer=tokenizer,
-        max_doc_len=200 if save_inspection else 50,
     )
     t_resolve = time.perf_counter() - t0
 

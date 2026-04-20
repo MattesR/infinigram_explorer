@@ -24,7 +24,7 @@ def resolve_all_queries(
     queries: list[dict],
     index_dir: str,
     tokenizer=None,
-    max_doc_len: int = 200,
+    max_doc_len: int = 2000,
     token_width: int = 2,
     top_splade_filter: int = None,
     top_tokens: list[tuple] = None,
