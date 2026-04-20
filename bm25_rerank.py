@@ -105,8 +105,8 @@ def rerank_and_evaluate(
     docs: list,
     qrels_path: str,
     expansions_path: str = None,
-    top_k: int = 1000,
-    query_weight: int = 1,
+    top_k_list: list = None,
+    query_weight: int = 3,
     verbose: bool = True,
 ):
     """
@@ -117,8 +117,16 @@ def rerank_and_evaluate(
         - query_plus_kw: Original query + all LLM keywords (equal weight)
         - query_weighted: Original query repeated N times + keywords once
 
-    Returns dict with per-strategy results.
+    Args:
+        top_k_list: List of cutoffs to evaluate at. Default [10, 100, 1000].
+
+    Returns dict with per-strategy, per-cutoff results.
     """
+    if top_k_list is None:
+        top_k_list = [10, 100, 1000]
+
+    max_k = max(top_k_list)
+
     qrels = load_qrels(qrels_path)
     relevant = {did: rel for did, rel in qrels.get(qid, {}).items() if rel > 0}
 
@@ -130,7 +138,7 @@ def rerank_and_evaluate(
         print(f"\nBM25 reranking for {qid}")
         print(f"  Docs to rerank: {len(all_doc_ids)}")
         print(f"  Relevant in pool: {len(all_found)}/{len(relevant)}")
-        print(f"  Top-k: {top_k}")
+        print(f"  Cutoffs: {top_k_list}")
 
     # Build query variants
     query_tokens = query_text.lower().split()
@@ -157,34 +165,34 @@ def rerank_and_evaluate(
 
     results = {}
     for name, terms in strategies.items():
-        ranked = rerank_bm25(docs, terms, top_k=top_k)
+        ranked = rerank_bm25(docs, terms, top_k=max_k)
 
-        top_ids = {did for _, did, _ in ranked}
-        found = top_ids & set(relevant.keys())
+        strategy_results = {}
+        for k in top_k_list:
+            top_ids = {did for _, did, _ in ranked[:k]}
+            found = top_ids & set(relevant.keys())
+            recall = len(found) / len(relevant) if relevant else 0
+            precision = len(found) / min(k, len(ranked)) if ranked else 0
 
-        # Compute recall at top_k
-        recall = len(found) / len(relevant) if relevant else 0
+            strategy_results[k] = {
+                "recall": recall,
+                "precision": precision,
+                "found": len(found),
+            }
 
-        # Also compute precision
-        precision = len(found) / len(top_ids) if top_ids else 0
-
-        results[name] = {
-            "recall": recall,
-            "precision": precision,
-            "found": len(found),
-            "relevant": len(relevant),
-            "top_k": len(ranked),
-            "n_terms": len(set(terms)),
-        }
+        results[name] = strategy_results
 
         if verbose:
             print(f"\n  {name} ({len(set(terms))} unique terms):")
-            print(f"    Recall@{top_k}: {recall:.3f} ({len(found)}/{len(relevant)})")
-            print(f"    Precision@{top_k}: {precision:.4f}")
+            for k in top_k_list:
+                r = strategy_results[k]
+                print(f"    @{k:<5d} Recall: {r['recall']:.3f} ({r['found']}/{len(relevant)})  "
+                      f"Precision: {r['precision']:.4f}")
 
     if verbose:
-        lost = len(all_found) - max(r["found"] for r in results.values())
+        best_at_max = max(results[s][max_k]["found"] for s in results)
+        lost = len(all_found) - best_at_max
         if lost > 0:
-            print(f"\n  WARNING: Best strategy loses {lost} relevant docs vs unreranked pool")
+            print(f"\n  WARNING: Best strategy @{max_k} loses {lost} relevant docs vs unreranked pool")
 
     return results
