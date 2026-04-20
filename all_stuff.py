@@ -25,6 +25,7 @@ tokenizer,engine = beam_search.load_default_engine(with_embedding_model=False)
 # splade = SparseEncoder("naver/splade-cocondenser-ensembledistil")
 first_query = "what makes up a community, including its definitions in various contexts like science and what it means to be a 'civilized community."
 input_ids = tokenizer.encode('community')
+qrels = load_qrels("./qrels.rag24.test-umbrela-all.txt")
 # q_query = splade.encode(first_query)
 # tokenizer_splade = AutoTokenizer.from_pretrained("naver/splade-cocondenser-ensembledistil")
 # probs = np.load('tup.probs.npy')
