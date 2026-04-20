@@ -16,6 +16,7 @@ Usage:
 
 import json
 from rank_bm25 import BM25Okapi
+from tqdm import tqdm
 from llm_keyword_filter import load_all_expansions, STOPWORDS
 from trec_output import load_qrels
 
@@ -196,3 +197,130 @@ def rerank_and_evaluate(
             print(f"\n  WARNING: Best strategy @{max_k} loses {lost} relevant docs vs unreranked pool")
 
     return results
+
+
+def rerank_batch(
+    retrieval_results: list,
+    topics_path: str,
+    qrels_path: str,
+    expansions_path: str = None,
+    top_k_list: list = None,
+    query_weight: int = 3,
+    verbose: bool = True,
+):
+    """
+    Rerank all retrieval results and print summary report.
+
+    Args:
+        retrieval_results: List of result dicts from compare_recall_ceiling
+                           (must have 'docs', 'qid' fields).
+        topics_path: Path to topics file (for query text).
+        qrels_path: Path to qrels file.
+        expansions_path: Path to keyword expansions JSONL.
+        top_k_list: Cutoffs to evaluate. Default [10, 100, 1000].
+        query_weight: Weight multiplier for original query in weighted strategy.
+
+    Returns list of per-query rerank results.
+    """
+    if top_k_list is None:
+        top_k_list = [10, 100, 1000]
+
+    from full_eval import load_topics
+    topics = dict(load_topics(topics_path))
+
+    all_rerank = []
+    strategies_seen = set()
+
+    for r in tqdm(retrieval_results, desc="Reranking", disable=not verbose):
+        qid = r["qid"]
+        query_text = topics.get(qid, "")
+        docs = r.get("docs", [])
+
+        if not docs:
+            continue
+
+        rerank_result = rerank_and_evaluate(
+            qid=qid,
+            query_text=query_text,
+            docs=docs,
+            qrels_path=qrels_path,
+            expansions_path=expansions_path,
+            top_k_list=top_k_list,
+            query_weight=query_weight,
+            verbose=False,
+        )
+
+        rerank_result["qid"] = qid
+        rerank_result["n_relevant"] = r.get("n_relevant", 0)
+        rerank_result["n_retrieved"] = r.get("n_retrieved", 0)
+        rerank_result["raw_recall"] = r.get("recall", 0)
+        rerank_result["raw_found"] = r.get("n_found", 0)
+        all_rerank.append(rerank_result)
+        strategies_seen.update(k for k in rerank_result if k not in
+                                {"qid", "n_relevant", "n_retrieved", "raw_recall", "raw_found"})
+
+    if verbose and all_rerank:
+        n = len(all_rerank)
+        strategies = sorted(strategies_seen)
+
+        # Summary table
+        print(f"\n{'='*80}")
+        print(f"BM25 Reranking Summary ({n} topics)")
+        print(f"{'='*80}")
+
+        # Raw recall
+        avg_raw = sum(r["raw_recall"] for r in all_rerank) / n
+        avg_retr = sum(r["n_retrieved"] for r in all_rerank) / n
+        print(f"\n  Raw retrieval: Avg Recall={avg_raw:.4f}, Avg Retrieved={avg_retr:.0f}")
+
+        # Per strategy, per cutoff
+        for strategy in strategies:
+            print(f"\n  Strategy: {strategy}")
+            header = f"    {'':>15s}"
+            for k in top_k_list:
+                header += f" {'R@'+str(k):>10s} {'P@'+str(k):>10s}"
+            print(header)
+            print(f"    {'Average':>15s}", end="")
+            for k in top_k_list:
+                recalls = [r[strategy][k]["recall"] for r in all_rerank if strategy in r]
+                precisions = [r[strategy][k]["precision"] for r in all_rerank if strategy in r]
+                avg_r = sum(recalls) / len(recalls) if recalls else 0
+                avg_p = sum(precisions) / len(precisions) if precisions else 0
+                print(f" {avg_r:>10.4f} {avg_p:>10.4f}", end="")
+            print()
+
+        # Per-query table
+        print(f"\n{'='*80}")
+        print(f"Per-query results (best strategy: {strategies[0] if strategies else 'N/A'})")
+        print(f"{'='*80}")
+
+        best_strategy = strategies[0] if strategies else None
+        if best_strategy:
+            header = f"{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Raw':>6s}"
+            for k in top_k_list:
+                header += f" {'R@'+str(k):>7s}"
+            print(header)
+            print("-" * len(header))
+
+            for r in all_rerank:
+                row = f"{r['qid']:<15s} {r['n_retrieved']:>6d} {r['n_relevant']:>5d} {r['raw_found']:>6d}"
+                for k in top_k_list:
+                    recall = r[best_strategy][k]["recall"]
+                    row += f" {recall:>7.3f}"
+                print(row)
+
+            # Strategy comparison at max cutoff
+            max_k = max(top_k_list)
+            print(f"\n{'='*80}")
+            print(f"Strategy comparison at @{max_k}:")
+            print(f"{'='*80}")
+            print(f"{'Strategy':<20s} {'Avg Recall':>12s} {'Avg Precision':>14s} {'Avg Found':>10s}")
+            for strategy in strategies:
+                recalls = [r[strategy][max_k]["recall"] for r in all_rerank if strategy in r]
+                precisions = [r[strategy][max_k]["precision"] for r in all_rerank if strategy in r]
+                founds = [r[strategy][max_k]["found"] for r in all_rerank if strategy in r]
+                print(f"{strategy:<20s} {sum(recalls)/len(recalls):>12.4f} "
+                      f"{sum(precisions)/len(precisions):>14.4f} "
+                      f"{sum(founds)/len(founds):>10.1f}")
+
+    return all_rerank
