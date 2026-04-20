@@ -40,7 +40,7 @@ def retrieval_recall(
     max_standalone_sup: int = 1000,
     max_refined: int = 50000,
     max_queries: int = 50,
-    max_clause_freq: int = 8000000,
+    max_clause_freq: int = 100000,
     filter_mode: str = "stopword",
     save_inspection: bool = False,
     inspection_dir: str = None,
@@ -59,13 +59,16 @@ def retrieval_recall(
     t0 = time.perf_counter()
 
     if mode == "progressive":
-        from progressive_queries import build_pieces, build_queries
+        from progressive_queries import build_pieces, peek_and_grab, build_combination_queries
         from adaptive_queries import run_adaptive
 
         pieces = build_pieces(qid, expansions_path, tokenizer, engine, verbose=False)
-        queries = build_queries(pieces, engine, tokenizer, verbose=False,
-                                max_clause_freq=max_clause_freq)
-        executed = run_adaptive(engine, queries, max_clause_freq=max_clause_freq, verbose=False)
+        peek = peek_and_grab(pieces, engine, tokenizer, verbose=False,
+                             max_clause_freq=max_clause_freq)
+        combo = build_combination_queries(peek, engine, tokenizer, verbose=False,
+                                           max_clause_freq=max_clause_freq)
+        all_queries = peek["grabbed"] + combo
+        executed = run_adaptive(engine, all_queries, max_clause_freq=max_clause_freq, verbose=False)
 
     elif mode == "llm_adaptive":
         executed, scored, scoring_terms_q = pipeline.build_and_run_llm_adaptive(
@@ -232,7 +235,7 @@ def compare_recall_ceiling(
     max_standalone_sup: int = 1000,
     max_refined: int = 50000,
     max_queries: int = 50,
-    max_clause_freq: int = 8000000,
+    max_clause_freq: int = 100000,
     filter_mode: str = "stopword",
     save_inspection: bool = False,
     inspection_dir: str = "./inspection",
