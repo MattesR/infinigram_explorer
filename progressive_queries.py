@@ -292,20 +292,24 @@ def build_combination_queries(
     engine,
     tokenizer,
     max_docs: int = 10000,
-    max_total: int = 200,
+    max_combo_grab: int = 5000,
+    max_total: int = 100,
     prox_cross: int = 50,
     prox_assoc: int = 80,
     max_clause_freq: int = 80000000,
     verbose: bool = True,
 ):
     """
-    Build combination queries by concatenating CNF pieces across aspects.
+    Build combination queries using aspect name pieces.
 
-    Step 1: All aspects — piece from each aspect AND'd together
-    Step 2: Pairwise aspects — every piece_A × piece_B
-    Step 3: Key pieces AND associated pieces
+    Step 1: All aspects AND'd (aspect names only)
+    Step 2: Pairwise aspects (aspect names only)
+       - If pairwise count > max_combo_grab: narrow with associated terms
+    Step 3: Each aspect name AND each associated piece
 
-    Each query is piece_A["cnf"] + piece_B["cnf"] with max_diff_tokens.
+    Args:
+        max_combo_grab: Max count for a combo query to be grabbed directly.
+            If exceeded, narrow by AND-ing with associated terms.
     """
     remaining_key = peek["remaining_key_pieces"]
     remaining_assoc = peek["remaining_assoc_pieces"]
@@ -314,7 +318,6 @@ def build_combination_queries(
     grabbed_total = sum(q["estimated_count"] for q in peek["grabbed"])
     budget = max_docs - grabbed_total
 
-    aspect_names = [n for n, pieces in remaining_key.items() if pieces]
     queries = []
 
     def _qkey(cnf, prox):
@@ -324,7 +327,7 @@ def build_combination_queries(
         nonlocal budget
         key = _qkey(cnf, prox)
         if key in seen or len(queries) >= max_total:
-            return False
+            return False, 0
         if count is None:
             try:
                 kwargs = {"max_clause_freq": max_clause_freq}
@@ -335,11 +338,11 @@ def build_combination_queries(
             except Exception:
                 count = 0
         if count == 0:
-            return False
+            return False, 0
         if count > budget:
             if verbose:
                 print(f"    {count:>8,d}  [{level}] {desc} (SKIP: exceeds budget {budget:,d})")
-            return False
+            return False, count
         seen.add(key)
         queries.append({
             "type": "cnf",
@@ -352,16 +355,32 @@ def build_combination_queries(
         budget -= count
         if verbose:
             print(f"    {count:>8,d}  [{level}] {desc} (budget: {budget:,d})")
-        return True
+        return True, count
+
+    # Find the aspect name piece (first piece per aspect, which is the name itself)
+    aspect_name_pieces = {}
+    for name, pieces_list in remaining_key.items():
+        if pieces_list:
+            # Aspect name is typically the first piece (lowest index, added as [name] + terms)
+            # Find it by matching keyword to aspect name
+            name_piece = None
+            for p in pieces_list:
+                if p["keyword"].lower() == name.lower():
+                    name_piece = p
+                    break
+            if name_piece is None:
+                name_piece = pieces_list[0]  # fallback to first
+            aspect_name_pieces[name] = name_piece
+
+    aspect_names = list(aspect_name_pieces.keys())
 
     if verbose:
         print(f"\n{'='*70}")
-        print(f"Building combination queries (CNF piece concatenation)")
+        print(f"Building combination queries (aspect names + narrowing)")
         print(f"  Budget: ~{budget:,d} docs")
-        print(f"  Aspects: {aspect_names}")
-        for name in aspect_names:
-            n = len(remaining_key[name])
-            print(f"    {name}: {n} pieces")
+        print(f"  max_combo_grab: {max_combo_grab:,d}")
+        for name, piece in aspect_name_pieces.items():
+            print(f"  [{name}]: {piece['keyword']} ({piece['count']:,d} standalone)")
         print(f"  Associated: {len(remaining_assoc)} pieces")
         print(f"{'='*70}")
 
@@ -371,72 +390,89 @@ def build_combination_queries(
         return queries
 
     # ================================================================
-    # Step 1: All aspects — one piece per aspect, all combinations
+    # Step 1: All aspects AND'd
     # ================================================================
-    if len(aspect_names) >= 3 and verbose:
+    if verbose:
         print(f"\nStep 1: All aspects AND'd")
 
-    if len(aspect_names) >= 3:
-        # Build all combinations: one piece from each aspect
-        from itertools import product
-        aspect_piece_lists = [remaining_key[n] for n in aspect_names]
-        for combo in product(*aspect_piece_lists):
-            if budget <= 0 or len(queries) >= max_total:
-                break
-            cnf = []
-            descs = []
-            for piece in combo:
-                cnf.extend(piece["cnf"])
-                descs.append(piece["keyword"])
-            desc = " AND ".join(f"({d})" for d in descs)
-            _add(cnf, prox_cross, desc, "S1_all")
+    if len(aspect_names) >= 2:
+        cnf = []
+        descs = []
+        for name in aspect_names:
+            cnf.extend(aspect_name_pieces[name]["cnf"])
+            descs.append(name)
+        desc = " AND ".join(f"({d})" for d in descs)
+        added, count = _add(cnf, prox_cross, desc, "S1_all")
+
+        # If too broad, try narrowing with associated terms
+        if not added and count > max_combo_grab and remaining_assoc:
+            if verbose:
+                print(f"    -> narrowing with associated terms...")
+            for assoc_piece in remaining_assoc:
+                if budget <= 0 or len(queries) >= max_total:
+                    break
+                narrow_cnf = cnf + assoc_piece["cnf"]
+                narrow_desc = f"{desc} AND ({assoc_piece['keyword']})"
+                _add(narrow_cnf, prox_cross, narrow_desc, "S1_narrow")
 
     # ================================================================
-    # Step 2: Pairwise — every piece_A × piece_B across aspects
+    # Step 2: Pairwise aspects
     # ================================================================
     if verbose:
-        print(f"\nStep 2: Pairwise aspect ANDs")
+        print(f"\nStep 2: Pairwise aspects")
 
     if len(aspect_names) >= 2:
-        # Sort pairs so we try combinations with smallest pieces first
-        pair_candidates = []
         for a_name, b_name in combinations(aspect_names, 2):
-            for a_piece in remaining_key[a_name]:
-                for b_piece in remaining_key[b_name]:
-                    est = min(a_piece["count"], b_piece["count"])
-                    pair_candidates.append((est, a_piece, b_piece, a_name, b_name))
-
-        pair_candidates.sort(key=lambda x: x[0])
-
-        for est, a_piece, b_piece, a_name, b_name in pair_candidates:
             if budget <= 0 or len(queries) >= max_total:
                 break
+
+            a_piece = aspect_name_pieces[a_name]
+            b_piece = aspect_name_pieces[b_name]
             cnf = a_piece["cnf"] + b_piece["cnf"]
-            desc = f"({a_piece['keyword']}) AND ({b_piece['keyword']})"
-            _add(cnf, prox_cross, desc, "S2_pair")
+            desc = f"({a_name}) AND ({b_name})"
+
+            added, count = _add(cnf, prox_cross, desc, "S2_pair")
+
+            # If too broad, narrow with associated terms
+            if not added and count > max_combo_grab and remaining_assoc:
+                if verbose:
+                    print(f"    -> narrowing ({a_name}) AND ({b_name}) with associated...")
+                for assoc_piece in remaining_assoc:
+                    if budget <= 0 or len(queries) >= max_total:
+                        break
+                    narrow_cnf = cnf + assoc_piece["cnf"]
+                    narrow_desc = f"({a_name}) AND ({b_name}) AND ({assoc_piece['keyword']})"
+                    _add(narrow_cnf, prox_cross, narrow_desc, "S2_narrow")
 
     # ================================================================
-    # Step 3: Key pieces AND associated pieces
+    # Step 3: Each aspect AND each associated
     # ================================================================
     if verbose:
-        print(f"\nStep 3: Key AND associated")
+        print(f"\nStep 3: Aspect AND associated")
 
-    # Sort: smallest key × smallest assoc first
-    assoc_candidates = []
     for name in aspect_names:
-        for key_piece in remaining_key[name]:
-            for assoc_piece in remaining_assoc:
-                est = min(key_piece["count"], assoc_piece["count"])
-                assoc_candidates.append((est, key_piece, assoc_piece, name))
+        piece = aspect_name_pieces[name]
+        for assoc_piece in remaining_assoc:
+            if budget <= 0 or len(queries) >= max_total:
+                break
+            cnf = piece["cnf"] + assoc_piece["cnf"]
+            desc = f"({name}) AND ({assoc_piece['keyword']})"
+            _add(cnf, prox_assoc, desc, "S3_assoc")
 
-    assoc_candidates.sort(key=lambda x: x[0])
+    # Summary
+    if verbose:
+        total_est = sum(q["estimated_count"] for q in queries)
+        by_level = {}
+        for q in queries:
+            by_level.setdefault(q["level"], []).append(q)
+        print(f"\n{'='*70}")
+        print(f"Combination queries: {len(queries)}, ~{total_est:,d} estimated docs")
+        for level, qs in sorted(by_level.items()):
+            print(f"  {level}: {len(qs)} queries, ~{sum(q['estimated_count'] for q in qs):,d} docs")
+        print(f"  Budget remaining: ~{budget:,d}")
+        print(f"{'='*70}")
 
-    for est, key_piece, assoc_piece, name in assoc_candidates:
-        if budget <= 0 or len(queries) >= max_total:
-            break
-        cnf = key_piece["cnf"] + assoc_piece["cnf"]
-        desc = f"({key_piece['keyword']}) AND ({assoc_piece['keyword']})"
-        _add(cnf, prox_assoc, desc, "S3_assoc")
+    return queries
 
     # Summary
     if verbose:
