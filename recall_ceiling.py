@@ -31,9 +31,9 @@ def retrieval_recall(
     qid: str,
     query_text: str,
     qrels: dict,
-    pipeline,
     engine,
     tokenizer,
+    pipeline=None,
     index_dir: str = "../msmarco_segmented_index/",
     mode: str = "llm_adaptive",
     expansions_path: str = None,
@@ -145,6 +145,7 @@ def retrieval_recall(
         queries=executed,
         index_dir=index_dir,
         tokenizer=tokenizer,
+        max_doc_len=200 if save_inspection else 50,
     )
     t_resolve = time.perf_counter() - t0
 
@@ -164,6 +165,11 @@ def retrieval_recall(
         "docs": docs,
         "relevant": relevant,
     }
+
+    # Store peek and executed for progressive mode (needed for scorer)
+    if mode == "progressive":
+        result["peek"] = peek
+        result["executed"] = executed
 
     # Save inspection files if requested
     if save_inspection and inspection_dir:
@@ -240,19 +246,19 @@ def retrieval_recall(
 def compare_recall_ceiling(
     topics_path: str,
     qrels_path: str,
-    pipeline,
     engine,
     tokenizer,
+    pipeline=None,
     index_dir: str = "../msmarco_segmented_index/",
     expansions_paths: dict = None,
     progressive_paths: dict = None,
-    include_splade: bool = True,
+    include_splade: bool = False,
     max_topics: int = None,
     max_standalone: int = 5000,
     max_standalone_sup: int = 1000,
     max_refined: int = 50000,
     max_queries: int = 50,
-    max_clause_freq: int = 100000,
+    max_clause_freq: int = 80000000,
     filter_mode: str = "stopword",
     save_inspection: bool = False,
     inspection_dir: str = "./inspection",
@@ -350,7 +356,7 @@ def compare_recall_ceiling(
 
             try:
                 result = retrieval_recall(
-                    qid, query_text, qrels, pipeline, engine, tokenizer,
+                    qid, query_text, qrels, engine, tokenizer,
                     index_dir=index_dir, mode=actual_mode, **kwargs,
                 )
                 if result:
