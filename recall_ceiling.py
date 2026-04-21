@@ -50,10 +50,10 @@ def retrieval_recall(
     max_standalone_key: int = 1000,
     max_standalone_assoc: int = 200,
     prox_peek: int = 10,
-    max_docs: int = 30000,
-    prox_tight: int = 20,
-    prox_medium: int = 50,
-    prox_wide: int = 80,
+    max_docs: int = 10000,
+    max_combo_grab: int = 5000,
+    prox_cross: int = 50,
+    prox_assoc: int = 80,
 ):
     """
     Run retrieval (no scoring/filtering) and compute raw recall against qrels.
@@ -79,9 +79,9 @@ def retrieval_recall(
                              max_clause_freq=max_clause_freq)
         combo = build_combination_queries(peek, engine, tokenizer, verbose=False,
                                            max_docs=max_docs,
-                                           prox_tight=prox_tight,
-                                           prox_medium=prox_medium,
-                                           prox_wide=prox_wide,
+                                           max_combo_grab=max_combo_grab,
+                                           prox_cross=prox_cross,
+                                           prox_assoc=prox_assoc,
                                            max_clause_freq=max_clause_freq)
         all_queries = peek["grabbed"] + combo
         executed = run_adaptive(engine, all_queries, max_clause_freq=max_clause_freq, verbose=False)
@@ -267,10 +267,10 @@ def compare_recall_ceiling(
     max_standalone_key: int = 1000,
     max_standalone_assoc: int = 200,
     prox_peek: int = 10,
-    max_docs: int = 30000,
-    prox_tight: int = 20,
-    prox_medium: int = 50,
-    prox_wide: int = 80,
+    max_docs: int = 10000,
+    max_combo_grab: int = 5000,
+    prox_cross: int = 50,
+    prox_assoc: int = 80,
     # Return docs for reranking
     return_docs: bool = False,
 ):
@@ -332,9 +332,9 @@ def compare_recall_ceiling(
                 "max_standalone_assoc": max_standalone_assoc,
                 "prox_peek": prox_peek,
                 "max_docs": max_docs,
-                "prox_tight": prox_tight,
-                "prox_medium": prox_medium,
-                "prox_wide": prox_wide,
+                "max_combo_grab": max_combo_grab,
+                "prox_cross": prox_cross,
+                "prox_assoc": prox_assoc,
             }
 
             if save_inspection:
