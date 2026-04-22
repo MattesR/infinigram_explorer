@@ -459,20 +459,65 @@ def build_combination_queries(
             desc = f"({name}) AND ({assoc_piece['keyword']})"
             _add(cnf, prox_assoc, desc, "S3_assoc")
 
-    # Summary
+    # ================================================================
+    # Step 4: Expansion pieces AND'd with other aspect name pieces
+    # Fill remaining budget with cross-aspect expansion queries
+    # ================================================================
     if verbose:
-        total_est = sum(q["estimated_count"] for q in queries)
-        by_level = {}
-        for q in queries:
-            by_level.setdefault(q["level"], []).append(q)
-        print(f"\n{'='*70}")
-        print(f"Combination queries: {len(queries)}, ~{total_est:,d} estimated docs")
-        for level, qs in sorted(by_level.items()):
-            print(f"  {level}: {len(qs)} queries, ~{sum(q['estimated_count'] for q in qs):,d} docs")
-        print(f"  Budget remaining: ~{budget:,d}")
-        print(f"{'='*70}")
+        print(f"\nStep 4: Expansion pieces AND other aspects (budget fill)")
 
-    return queries
+    if budget > 0 and len(aspect_names) >= 2:
+        # Collect all non-name expansion pieces with their source aspect
+        expansion_candidates = []
+        for name, pieces_list in remaining_key.items():
+            name_kw = aspect_name_pieces[name]["keyword"].lower() if name in aspect_name_pieces else ""
+            for piece in pieces_list:
+                if piece["keyword"].lower() == name_kw:
+                    continue  # skip the aspect name itself, already used
+                expansion_candidates.append((piece, name))
+
+        # Sort by count ascending (most specific first)
+        expansion_candidates.sort(key=lambda x: x[0]["count"])
+
+        for exp_piece, source_aspect in expansion_candidates:
+            if budget <= 0 or len(queries) >= max_total:
+                break
+            # AND with each other aspect's name piece
+            for other_name in aspect_names:
+                if other_name == source_aspect:
+                    continue
+                if budget <= 0 or len(queries) >= max_total:
+                    break
+                other_piece = aspect_name_pieces[other_name]
+                cnf = exp_piece["cnf"] + other_piece["cnf"]
+                desc = f"({exp_piece['keyword']}) AND ({other_name})"
+                _add(cnf, prox_cross, desc, "S4_expand")
+
+    # ================================================================
+    # Step 5: Expansion pieces AND'd with associated pieces
+    # ================================================================
+    if verbose:
+        print(f"\nStep 5: Expansion AND associated (budget fill)")
+
+    if budget > 0:
+        exp_assoc_candidates = []
+        for name, pieces_list in remaining_key.items():
+            name_kw = aspect_name_pieces[name]["keyword"].lower() if name in aspect_name_pieces else ""
+            for piece in pieces_list:
+                if piece["keyword"].lower() == name_kw:
+                    continue
+                for assoc_piece in remaining_assoc:
+                    est = min(piece["count"], assoc_piece["count"])
+                    exp_assoc_candidates.append((est, piece, assoc_piece, name))
+
+        exp_assoc_candidates.sort(key=lambda x: x[0])
+
+        for est, exp_piece, assoc_piece, source in exp_assoc_candidates:
+            if budget <= 0 or len(queries) >= max_total:
+                break
+            cnf = exp_piece["cnf"] + assoc_piece["cnf"]
+            desc = f"({exp_piece['keyword']}) AND ({assoc_piece['keyword']})"
+            _add(cnf, prox_assoc, desc, "S5_exp_assoc")
 
     # Summary
     if verbose:
