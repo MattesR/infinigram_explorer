@@ -426,3 +426,376 @@ def analyze_query_coverage(
         "assoc_patterns": assoc_patterns,
         "aspect_names": aspect_names,
     }
+
+
+def find_optimal_queries(
+    analysis_results: dict,
+    engine,
+    tokenizer,
+    prox_values: list = None,
+    max_clause_freq: int = 80000000,
+    verbose: bool = True,
+):
+    """
+    Find the tightest and fewest queries to cover all relevant documents.
+
+    For each candidate query (cross-aspect AND, aspect+assoc AND):
+    1. Check which relevant docs it covers at various proximity values
+    2. Execute against engine to get total count (relevant + irrelevant)
+    3. Compute precision = relevant_covered / total_count
+
+    Then run greedy set cover to find minimum query set.
+
+    Args:
+        analysis_results: Output from analyze_query_coverage.
+        prox_values: List of proximity values to test. Default [10, 20, 50, 100, 200].
+    """
+    if prox_values is None:
+        prox_values = [10, 20, 50, 100, 200]
+
+    doc_analyses = analysis_results["doc_analyses"]
+    key_patterns = analysis_results["key_patterns"]
+    assoc_patterns = analysis_results["assoc_patterns"]
+    aspect_names = analysis_results["aspect_names"]
+
+    n_docs = len(doc_analyses)
+    all_doc_ids = {da["doc_id"] for da in doc_analyses}
+
+    # ================================================================
+    # Build candidate queries and check coverage per doc
+    # ================================================================
+
+    candidates = []  # list of {desc, cnf, covered_docs_by_prox, engine_counts}
+
+    # Helper: build CNF from keyword patterns
+    def _patterns_to_cnf(patterns_list):
+        """Convert list of (word_patterns, keyword) to flat CNF clauses."""
+        cnf = []
+        for word_patterns, kw in patterns_list:
+            for word_variants in word_patterns:
+                cnf.append(word_variants)
+        return cnf
+
+    def _check_doc_coverage(doc_analysis, required_keywords, prox_val):
+        """
+        Check if a doc is covered by a query requiring specific keywords
+        at a given proximity.
+
+        required_keywords: list of keyword strings that must all match
+        prox_val: max token span for cross-keyword proximity
+        """
+        matches = doc_analysis["keyword_matches"]
+
+        # Check all keywords present
+        for kw in required_keywords:
+            if kw not in matches:
+                return False
+
+        # Check proximity: all matched keywords within prox_val tokens
+        # Use cross_aspect_prox or within-keyword spans
+        if len(required_keywords) <= 1:
+            return True
+
+        # Get all matched positions across required keywords
+        # We need the raw positions — but we only stored min_span
+        # For now, use a heuristic: if the keyword's min_span < prox_val, it's reachable
+        # For cross-keyword, check cross_aspect_prox
+        # This is approximate — full position check would need re-tokenization
+
+        # Simple check: are all keywords from aspects that have cross-prox < prox_val?
+        aspects_involved = set()
+        for kw in required_keywords:
+            info = matches[kw]
+            if "aspect" in info:
+                aspects_involved.add(info["aspect"])
+
+        cross_prox = doc_analysis.get("cross_aspect_prox", {})
+        for a, b in combinations(aspects_involved, 2):
+            key = (a, b) if (a, b) in cross_prox else (b, a)
+            dist = cross_prox.get(key, float('inf'))
+            if dist > prox_val:
+                return False
+
+        return True
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"OPTIMAL QUERY ANALYSIS")
+        print(f"{'='*70}")
+
+    # Candidate type 1: Pairwise aspect names
+    for a, b in combinations(aspect_names, 2):
+        kw_a = a  # aspect name as keyword
+        kw_b = b
+        desc = f"({a}) AND ({b})"
+
+        covered_by_prox = {}
+        for prox in prox_values:
+            covered = set()
+            for da in doc_analyses:
+                if kw_a in da["keyword_matches"] and kw_b in da["keyword_matches"]:
+                    # Check cross-aspect proximity
+                    cross_prox = da.get("cross_aspect_prox", {})
+                    key = (a, b) if (a, b) in cross_prox else (b, a)
+                    dist = cross_prox.get(key, float('inf'))
+                    if dist <= prox:
+                        covered.add(da["doc_id"])
+            covered_by_prox[prox] = covered
+
+        # Get engine count at each prox
+        # Build CNF from aspect name patterns
+        cnf_clauses = []
+        for name in [a, b]:
+            for word_patterns, kw in key_patterns[name]:
+                if kw.lower() == name.lower():
+                    for word_variants in word_patterns:
+                        cnf_clauses.append(word_variants)
+                    break
+
+        engine_counts = {}
+        for prox in prox_values:
+            try:
+                result = engine.count_cnf(
+                    cnf_clauses, max_clause_freq=max_clause_freq,
+                    max_diff_tokens=prox)
+                engine_counts[prox] = result.get("count", 0)
+            except Exception:
+                engine_counts[prox] = 0
+
+        candidates.append({
+            "desc": desc,
+            "type": "pairwise",
+            "cnf": cnf_clauses,
+            "covered_by_prox": covered_by_prox,
+            "engine_counts": engine_counts,
+        })
+
+    # Candidate type 2: All aspects AND'd
+    if len(aspect_names) >= 2:
+        desc = " AND ".join(f"({n})" for n in aspect_names)
+        covered_by_prox = {}
+        for prox in prox_values:
+            covered = set()
+            for da in doc_analyses:
+                if da["n_aspects_covered"] == len(aspect_names):
+                    # Check all cross-aspect proximities
+                    all_close = True
+                    cross_prox = da.get("cross_aspect_prox", {})
+                    for a2, b2 in combinations(aspect_names, 2):
+                        key = (a2, b2) if (a2, b2) in cross_prox else (b2, a2)
+                        dist = cross_prox.get(key, float('inf'))
+                        if dist > prox:
+                            all_close = False
+                            break
+                    if all_close:
+                        covered.add(da["doc_id"])
+            covered_by_prox[prox] = covered
+
+        cnf_clauses = []
+        for name in aspect_names:
+            for word_patterns, kw in key_patterns[name]:
+                if kw.lower() == name.lower():
+                    for word_variants in word_patterns:
+                        cnf_clauses.append(word_variants)
+                    break
+
+        engine_counts = {}
+        for prox in prox_values:
+            try:
+                result = engine.count_cnf(
+                    cnf_clauses, max_clause_freq=max_clause_freq,
+                    max_diff_tokens=prox)
+                engine_counts[prox] = result.get("count", 0)
+            except Exception:
+                engine_counts[prox] = 0
+
+        candidates.append({
+            "desc": desc,
+            "type": "all_aspects",
+            "cnf": cnf_clauses,
+            "covered_by_prox": covered_by_prox,
+            "engine_counts": engine_counts,
+        })
+
+    # Candidate type 3: Aspect name AND associated term
+    for name in aspect_names:
+        for assoc_wp, assoc_kw in assoc_patterns:
+            desc = f"({name}) AND ({assoc_kw})"
+            covered_by_prox = {}
+            for prox in prox_values:
+                covered = set()
+                for da in doc_analyses:
+                    if name in [info.get("aspect") for info in da["keyword_matches"].values()
+                                if info.get("aspect")]:
+                        # Check if aspect name keyword matches
+                        if name.lower() not in [kw.lower() for kw in da["keyword_matches"]]:
+                            # Try any keyword from this aspect
+                            if not da["aspect_matches"].get(name):
+                                continue
+                        if assoc_kw in da["keyword_matches"]:
+                            covered.add(da["doc_id"])
+                covered_by_prox[prox] = covered
+
+            # Build CNF
+            cnf_clauses = []
+            for word_patterns, kw in key_patterns[name]:
+                if kw.lower() == name.lower():
+                    for word_variants in word_patterns:
+                        cnf_clauses.append(word_variants)
+                    break
+            for word_variants in assoc_wp:
+                cnf_clauses.append(word_variants)
+
+            engine_counts = {}
+            for prox in prox_values:
+                try:
+                    result = engine.count_cnf(
+                        cnf_clauses, max_clause_freq=max_clause_freq,
+                        max_diff_tokens=prox)
+                    engine_counts[prox] = result.get("count", 0)
+                except Exception:
+                    engine_counts[prox] = 0
+
+            candidates.append({
+                "desc": desc,
+                "type": "aspect_assoc",
+                "cnf": cnf_clauses,
+                "covered_by_prox": covered_by_prox,
+                "engine_counts": engine_counts,
+            })
+
+    # Candidate type 4: Single keyword (for grabbed terms)
+    for name in aspect_names:
+        for word_patterns, kw in key_patterns[name]:
+            covered = {da["doc_id"] for da in doc_analyses if kw in da["keyword_matches"]}
+            if not covered:
+                continue
+            cnf_clauses = [wv for wv in word_patterns]
+            engine_counts = {}
+            for prox in prox_values:
+                try:
+                    kwargs = {"max_clause_freq": max_clause_freq}
+                    if len(cnf_clauses) > 1:
+                        kwargs["max_diff_tokens"] = prox
+                    result = engine.count_cnf(cnf_clauses, **kwargs)
+                    engine_counts[prox] = result.get("count", 0)
+                except Exception:
+                    engine_counts[prox] = 0
+            candidates.append({
+                "desc": f"{kw} (standalone)",
+                "type": "standalone_key",
+                "cnf": cnf_clauses,
+                "covered_by_prox": {p: covered for p in prox_values},
+                "engine_counts": engine_counts,
+            })
+
+    for assoc_wp, assoc_kw in assoc_patterns:
+        covered = {da["doc_id"] for da in doc_analyses if assoc_kw in da["keyword_matches"]}
+        if not covered:
+            continue
+        cnf_clauses = [wv for wv in assoc_wp]
+        engine_counts = {}
+        for prox in prox_values:
+            try:
+                kwargs = {"max_clause_freq": max_clause_freq}
+                if len(cnf_clauses) > 1:
+                    kwargs["max_diff_tokens"] = prox
+                result = engine.count_cnf(cnf_clauses, **kwargs)
+                engine_counts[prox] = result.get("count", 0)
+            except Exception:
+                engine_counts[prox] = 0
+        candidates.append({
+            "desc": f"{assoc_kw} (standalone)",
+            "type": "standalone_assoc",
+            "cnf": cnf_clauses,
+            "covered_by_prox": {p: covered for p in prox_values},
+            "engine_counts": engine_counts,
+        })
+
+    # ================================================================
+    # Print query analysis
+    # ================================================================
+    if verbose:
+        # Pick a representative prox for display
+        display_prox = 50
+
+        print(f"\n  Candidate queries at prox={display_prox}:")
+        print(f"  {'Type':<15s} {'Covered':>8s} {'Engine':>8s} {'Prec':>7s}  Query")
+        print(f"  {'-'*70}")
+
+        sorted_cands = sorted(candidates,
+                              key=lambda c: len(c["covered_by_prox"].get(display_prox, set())),
+                              reverse=True)
+
+        for c in sorted_cands:
+            covered = len(c["covered_by_prox"].get(display_prox, set()))
+            eng_count = c["engine_counts"].get(display_prox, 0)
+            prec = covered / eng_count if eng_count > 0 else 0
+            if covered > 0:
+                print(f"  {c['type']:<15s} {covered:>7d} {eng_count:>8d} {prec:>7.4f}  {c['desc']}")
+
+        # Proximity sweep for top queries
+        print(f"\n  Proximity sweep for top queries:")
+        for c in sorted_cands[:5]:
+            print(f"\n    {c['desc']}:")
+            print(f"    {'prox':>6s} {'covered':>8s} {'engine':>8s} {'prec':>7s} {'recall':>7s}")
+            for prox in prox_values:
+                covered = len(c["covered_by_prox"].get(prox, set()))
+                eng = c["engine_counts"].get(prox, 0)
+                prec = covered / eng if eng > 0 else 0
+                rec = covered / n_docs if n_docs > 0 else 0
+                print(f"    {prox:>6d} {covered:>8d} {eng:>8d} {prec:>7.4f} {rec:>7.4f}")
+
+    # ================================================================
+    # Greedy set cover — find minimum queries to cover all docs
+    # ================================================================
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"GREEDY SET COVER")
+        print(f"{'='*70}")
+
+    for target_prox in [50, 100, 200]:
+        uncovered = set(all_doc_ids)
+        selected = []
+        total_engine_count = 0
+
+        while uncovered:
+            # Find candidate covering most uncovered docs
+            best = None
+            best_new = 0
+            for c in candidates:
+                covered = c["covered_by_prox"].get(target_prox, set())
+                new_covered = len(covered & uncovered)
+                if new_covered > best_new:
+                    best_new = new_covered
+                    best = c
+            if best is None or best_new == 0:
+                break
+
+            covered = best["covered_by_prox"][target_prox]
+            eng_count = best["engine_counts"].get(target_prox, 0)
+            uncovered -= covered
+            total_engine_count += eng_count
+            selected.append({
+                "desc": best["desc"],
+                "type": best["type"],
+                "new_covered": best_new,
+                "total_covered": len(covered),
+                "engine_count": eng_count,
+            })
+
+        total_covered = n_docs - len(uncovered)
+
+        if verbose:
+            print(f"\n  prox={target_prox}: {len(selected)} queries cover "
+                  f"{total_covered}/{n_docs} docs, ~{total_engine_count:,d} total engine hits")
+            print(f"  {'#':>3s} {'Type':<15s} {'New':>5s} {'Tot':>5s} {'Engine':>8s}  Query")
+            for i, s in enumerate(selected):
+                print(f"  {i+1:>3d} {s['type']:<15s} {s['new_covered']:>5d} "
+                      f"{s['total_covered']:>5d} {s['engine_count']:>8d}  {s['desc']}")
+            print(f"  Uncovered: {len(uncovered)} docs")
+
+    return {
+        "candidates": candidates,
+        "n_docs": n_docs,
+    }

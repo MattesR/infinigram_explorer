@@ -66,3 +66,48 @@ def enrich_all_in_dir(directory: str, searcher, pattern: str = "*_missed.jsonl")
     print(f"Found {len(files)} files matching {pattern} in {directory}")
     for f in files:
         enrich_jsonl(str(f), searcher)
+
+
+def replace_text_from_searcher(path: str, searcher, output_path: str = None):
+    """
+    Replace the 'text' field in a JSONL file with full document text
+    from a Pyserini LuceneSearcher.
+
+    Looks up each doc_id and replaces whatever is in 'text' with the
+    full segment/body from the index.
+
+    Args:
+        path: Path to JSONL file with {"doc_id": "...", "text": "...", ...} lines.
+        searcher: LuceneSearcher instance.
+        output_path: Output path. Defaults to overwriting the input file.
+    """
+    if output_path is None:
+        output_path = path
+
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    found = 0
+    missing = 0
+    for record in records:
+        did = record.get("doc_id", "")
+        if not did:
+            continue
+        doc = searcher.doc(did)
+        if doc:
+            raw = json.loads(doc.raw())
+            text = raw.get("segment", raw.get("body", raw.get("text", "")))
+            record["text"] = text
+            found += 1
+        else:
+            missing += 1
+
+    with open(output_path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+
+    print(f"Replaced text for {found}/{len(records)} docs ({missing} not found) in {output_path}")
