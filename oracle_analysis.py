@@ -23,7 +23,8 @@ import json
 import numpy as np
 from itertools import combinations, product
 from collections import defaultdict
-from llm_keyword_filter import STOPWORDS
+import json
+from llm_keyword_filter import load_all_expansions, STOPWORDS
 
 
 def _case_variants(word, tokenizer, engine):
@@ -45,6 +46,20 @@ def _case_variants(word, tokenizer, engine):
             seen.add(ids_key)
             valid.append(ids)
     return valid
+
+
+ 
+def _keyword_in_doc(keyword, doc_tokens, tokenizer, engine, max_prox=None):
+    """
+    Check if a keyword's content words all appear in doc_tokens.
+    If max_prox is set, check they appear within max_prox tokens of each other.
+    Returns (present: bool, min_span: int or None).
+    """
+    words = keyword.strip().split()
+    content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+    if not content:
+        return False, None
+
 
 
 def _build_piece_token_patterns(keyword, tokenizer, engine):
@@ -95,6 +110,21 @@ def _find_word_positions(doc_tokens, word_variants):
         for pos in _find_token_positions(doc_tokens, variant):
             positions.append((pos, pos + len(variant)))
     return sorted(positions)
+
+
+def _build_keyword_cnf(keyword, tokenizer, engine):
+    """Build CNF clauses for a keyword (one clause per content word, case variants OR'd)."""
+    words = keyword.strip().split()
+    content = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+    if not content:
+        return None
+    clauses = []
+    for w in content:
+        variants = _case_variants(w, tokenizer, engine)
+        if not variants:
+            return None
+        clauses.append(variants)
+    return clauses
 
 
 def _compute_min_span(word_positions_list):
@@ -798,4 +828,313 @@ def find_optimal_queries(
     return {
         "candidates": candidates,
         "n_docs": n_docs,
+    }
+
+
+
+def find_tightest_per_doc(
+    found_path: str,
+    qid: str,
+    expansions_path: str,
+    tokenizer,
+    engine,
+    prox: int = 50,
+    max_clause_freq: int = 80000000,
+    verbose: bool = True,
+):
+    """
+    For each relevant document, find the tightest CNF query that retrieves it.
+
+    Rules:
+    - At most one keyword per KEY aspect
+    - Optionally one ASSOCIATED term
+    - Cross-aspect AND only
+    - All queries use the same proximity value
+
+    Returns dict with per-doc tightest queries and aggregate statistics.
+    """
+    # Load docs
+    docs = []
+    with open(found_path) as f:
+        for line in f:
+            obj = json.loads(line.strip())
+            if obj.get("text"):
+                docs.append(obj)
+
+    # Load keywords
+    data = load_all_expansions(expansions_path).get(qid, {})
+    key_entities = data.get("KEY_ENTITIES", {})
+    associated = data.get("ASSOCIATED_TERMS", data.get("ASSOCIATED", []))
+
+    # Flatten key entities
+    aspect_keywords = {}  # aspect_name -> [kw, ...]
+    for name, terms in key_entities.items():
+        if isinstance(terms, dict):
+            flat = []
+            for level in ["lexical", "conceptual", "referential"]:
+                flat.extend(terms.get(level, []))
+            terms = flat
+        aspect_keywords[name] = [name] + (terms if isinstance(terms, list) else [])
+
+    aspect_names = list(aspect_keywords.keys())
+
+    if verbose:
+        print(f"\nFinding tightest queries for {len(docs)} docs, {qid}")
+        print(f"  Aspects: {aspect_names}")
+        print(f"  Keywords per aspect: {[len(v) for v in aspect_keywords.values()]}")
+        print(f"  Associated: {len(associated)}")
+        print(f"  Proximity: {prox}")
+
+    # For each doc, find which keywords match
+    if verbose:
+        print(f"\n  Checking keyword matches per document...")
+
+    doc_results = []
+    single_term_docs = []
+
+    for doc_idx, doc in enumerate(docs):
+        text = doc["text"]
+        tokens = list(tokenizer.encode(text, add_special_tokens=False))
+
+        # Check each keyword from each aspect
+        aspect_matches = {}  # aspect_name -> [(keyword, min_span), ...]
+        for aspect_name, keywords in aspect_keywords.items():
+            matches = []
+            for kw in keywords:
+                present, span = _keyword_in_doc(kw, tokens, tokenizer, engine)
+                if present:
+                    matches.append((kw, span))
+            aspect_matches[aspect_name] = matches
+
+        # Check associated terms
+        assoc_matches = []
+        for kw in associated:
+            present, span = _keyword_in_doc(kw, tokens, tokenizer, engine)
+            if present:
+                assoc_matches.append((kw, span))
+
+        # Count aspects with matches
+        aspects_with_matches = [name for name in aspect_names if aspect_matches[name]]
+        n_aspects = len(aspects_with_matches)
+
+        if n_aspects == 0:
+            # No keywords match at all
+            doc_results.append({
+                "doc_id": doc["doc_id"],
+                "relevance": doc.get("relevance", 1),
+                "n_aspects": 0,
+                "tightest_queries": [],
+                "assoc_matches": [],
+            })
+            single_term_docs.append(doc["doc_id"])
+            continue
+
+        if n_aspects == 1 and not assoc_matches:
+            single_term_docs.append(doc["doc_id"])
+
+        # Build tightest queries: one keyword per matching aspect
+        # Try all combinations of one keyword per aspect (only matching aspects)
+        tightest_queries = []
+
+        if n_aspects >= 2:
+            # Cross-aspect combinations
+            match_lists = [aspect_matches[name] for name in aspects_with_matches]
+            for combo in product(*match_lists):
+                # combo is ((kw1, span1), (kw2, span2), ...)
+                kw_list = [kw for kw, span in combo]
+                desc = " AND ".join(f"({kw})" for kw in kw_list)
+
+                # Build CNF
+                cnf = []
+                for kw, span in combo:
+                    clauses = _build_keyword_cnf(kw, tokenizer, engine)
+                    if clauses:
+                        cnf.extend(clauses)
+
+                if cnf:
+                    # Get engine count
+                    try:
+                        result = engine.count_cnf(
+                            cnf, max_clause_freq=max_clause_freq,
+                            max_diff_tokens=prox)
+                        count = result.get("count", 0)
+                    except Exception:
+                        count = -1
+
+                    tightest_queries.append({
+                        "desc": desc,
+                        "keywords": kw_list,
+                        "aspects": list(aspects_with_matches),
+                        "n_aspects": n_aspects,
+                        "engine_count": count,
+                        "cnf": cnf,
+                    })
+
+        # Also try: aspect keywords AND associated term
+        for name in aspects_with_matches:
+            for kw_key, span_key in aspect_matches[name]:
+                for kw_assoc, span_assoc in assoc_matches:
+                    desc = f"({kw_key}) AND ({kw_assoc})"
+                    cnf = []
+                    clauses_key = _build_keyword_cnf(kw_key, tokenizer, engine)
+                    clauses_assoc = _build_keyword_cnf(kw_assoc, tokenizer, engine)
+                    if clauses_key and clauses_assoc:
+                        cnf = clauses_key + clauses_assoc
+                        try:
+                            result = engine.count_cnf(
+                                cnf, max_clause_freq=max_clause_freq,
+                                max_diff_tokens=prox)
+                            count = result.get("count", 0)
+                        except Exception:
+                            count = -1
+
+                        tightest_queries.append({
+                            "desc": desc,
+                            "keywords": [kw_key, kw_assoc],
+                            "aspects": [name],
+                            "n_aspects": 1,
+                            "has_assoc": True,
+                            "engine_count": count,
+                            "cnf": cnf,
+                        })
+
+        # Sort by engine count (tightest first)
+        tightest_queries.sort(key=lambda q: q["engine_count"] if q["engine_count"] >= 0 else float('inf'))
+
+        doc_results.append({
+            "doc_id": doc["doc_id"],
+            "relevance": doc.get("relevance", 1),
+            "n_aspects": n_aspects,
+            "tightest_queries": tightest_queries,
+            "best_count": tightest_queries[0]["engine_count"] if tightest_queries else None,
+            "best_query": tightest_queries[0]["desc"] if tightest_queries else None,
+            "assoc_matches": [kw for kw, _ in assoc_matches],
+            "aspect_matches": {name: [kw for kw, _ in matches]
+                               for name, matches in aspect_matches.items()},
+        })
+
+        if verbose and (doc_idx + 1) % 50 == 0:
+            print(f"    Processed {doc_idx + 1}/{len(docs)} docs...")
+
+    # ================================================================
+    # Aggregate statistics
+    # ================================================================
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"TIGHTEST QUERY ANALYSIS ({len(doc_results)} docs, prox={prox})")
+        print(f"{'='*70}")
+
+        # Distribution of best query counts
+        best_counts = [r["best_count"] for r in doc_results if r.get("best_count") is not None]
+        if best_counts:
+            best_counts_sorted = sorted(best_counts)
+            print(f"\n  Best (tightest) query engine count per doc:")
+            print(f"    min: {best_counts_sorted[0]}")
+            print(f"    median: {best_counts_sorted[len(best_counts_sorted)//2]}")
+            print(f"    p90: {best_counts_sorted[int(len(best_counts_sorted)*0.9)]}")
+            print(f"    max: {best_counts_sorted[-1]}")
+            print(f"    sum (theoretical min docs to pull): {sum(best_counts_sorted):,d}")
+
+            # Unique queries: many docs share the same tightest query
+            unique_best = set(r["best_query"] for r in doc_results if r.get("best_query"))
+            print(f"    unique tightest queries: {len(unique_best)}")
+
+        # Distribution of aspect coverage
+        aspect_dist = defaultdict(int)
+        for r in doc_results:
+            aspect_dist[r["n_aspects"]] += 1
+        print(f"\n  Aspect coverage:")
+        for n in sorted(aspect_dist.keys()):
+            print(f"    {n} aspects: {aspect_dist[n]} docs")
+
+        # Single-term docs
+        print(f"\n  Docs reachable only by single term: {len(single_term_docs)}")
+
+        # Most common tightest queries
+        query_doc_count = defaultdict(list)
+        for r in doc_results:
+            if r.get("best_query"):
+                query_doc_count[r["best_query"]].append(r["doc_id"])
+
+        print(f"\n  Most common tightest queries:")
+        print(f"  {'Docs':>5s} {'Engine':>8s} {'Prec':>7s}  Query")
+        for query_desc, doc_ids in sorted(query_doc_count.items(),
+                                           key=lambda x: -len(x[1]))[:20]:
+            # Find engine count for this query
+            eng_count = None
+            for r in doc_results:
+                if r.get("best_query") == query_desc:
+                    eng_count = r["best_count"]
+                    break
+            prec = len(doc_ids) / eng_count if eng_count and eng_count > 0 else 0
+            eng_str = f"{eng_count:,d}" if eng_count is not None else "?"
+            print(f"  {len(doc_ids):>5d} {eng_str:>8s} {prec:>7.4f}  {query_desc}")
+
+        # Theoretical minimum: greedy set cover by efficiency
+        print(f"\n{'='*70}")
+        print(f"MINIMUM COST SET COVER (prox={prox})")
+        print(f"{'='*70}")
+
+        # Collect all unique queries with their doc coverage and engine count
+        all_queries = {}  # desc -> {doc_ids, engine_count, cnf}
+        for r in doc_results:
+            for q in r.get("tightest_queries", []):
+                desc = q["desc"]
+                if desc not in all_queries:
+                    all_queries[desc] = {
+                        "doc_ids": set(),
+                        "engine_count": q["engine_count"],
+                        "type": "cross" if q.get("n_aspects", 0) >= 2 else "key_assoc",
+                    }
+                all_queries[desc]["doc_ids"].add(r["doc_id"])
+
+        uncovered = set(r["doc_id"] for r in doc_results)
+        selected = []
+        total_engine = 0
+
+        while uncovered:
+            best_q = None
+            best_eff = -1
+            for desc, info in all_queries.items():
+                new_covered = len(info["doc_ids"] & uncovered)
+                if new_covered == 0:
+                    continue
+                eng = info["engine_count"] if info["engine_count"] > 0 else 1
+                eff = new_covered / eng
+                if eff > best_eff:
+                    best_eff = eff
+                    best_q = desc
+
+            if best_q is None:
+                break
+
+            info = all_queries[best_q]
+            new_covered = info["doc_ids"] & uncovered
+            uncovered -= new_covered
+            total_engine += info["engine_count"]
+            selected.append({
+                "desc": best_q,
+                "new_covered": len(new_covered),
+                "total_covered": len(info["doc_ids"]),
+                "engine_count": info["engine_count"],
+                "type": info["type"],
+            })
+
+        total_covered = len(doc_results) - len(uncovered)
+        print(f"\n  {len(selected)} queries cover {total_covered}/{len(doc_results)} docs")
+        print(f"  Total engine count: {total_engine:,d} (theoretical min docs to pull)")
+        print(f"\n  {'#':>3s} {'Type':<10s} {'New':>5s} {'Tot':>5s} {'Engine':>8s} {'Eff':>8s}  Query")
+        for i, s in enumerate(selected):
+            eff = s["new_covered"] / s["engine_count"] if s["engine_count"] > 0 else 0
+            print(f"  {i+1:>3d} {s['type']:<10s} {s['new_covered']:>5d} {s['total_covered']:>5d} "
+                  f"{s['engine_count']:>8,d} {eff:>8.4f}  {s['desc']}")
+        if uncovered:
+            print(f"  Uncovered: {len(uncovered)} docs")
+
+    return {
+        "doc_results": doc_results,
+        "single_term_docs": single_term_docs,
+        "aspect_names": aspect_names,
+        "aspect_keywords": aspect_keywords,
+        "associated": associated,
     }
