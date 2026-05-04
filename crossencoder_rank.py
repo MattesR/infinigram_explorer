@@ -198,22 +198,24 @@ def evaluate_batch(
 
         header = f"  {'':>15s}"
         for k in top_k_list:
-            header += f" {'R@'+str(k):>8s} {'nDCG@'+str(k):>8s}"
+            header += f" {'R@'+str(k):>8s} {'nDCG@'+str(k):>8s} {'%Pool':>6s}"
         print(header)
 
         print(f"  {'Average':>15s}", end="")
         for k in top_k_list:
             recalls = [r["cutoffs"][k]["recall"] for r in all_results]
             ndcgs = [r["cutoffs"][k]["ndcg"] for r in all_results]
-            print(f" {sum(recalls)/n:>8.4f} {sum(ndcgs)/n:>8.4f}", end="")
+            pool_pcts = [r["cutoffs"][k]["found"] / r["pool_found"]
+                        if r["pool_found"] > 0 else 0 for r in all_results]
+            print(f" {sum(recalls)/n:>8.4f} {sum(ndcgs)/n:>8.4f} {sum(pool_pcts)/n:>5.0%}", end="")
         print()
 
         # Per-query
         print(f"\n{'QID':<15s} {'Input':>6s} {'Rel':>5s} {'Pool':>5s} {'MRR':>5s} {'Time':>6s}", end="")
         for k in top_k_list:
-            print(f" {'R@'+str(k):>7s} {'nD@'+str(k):>6s}", end="")
+            print(f" {'R@'+str(k):>7s} {'nD@'+str(k):>6s} {'%P':>5s}", end="")
         print()
-        print("-" * (45 + 14 * len(top_k_list)))
+        print("-" * (45 + 19 * len(top_k_list)))
 
         for r in all_results:
             print(f"{r['qid']:<15s} {r['n_input_docs']:>6d} {r['n_relevant']:>5d} "
@@ -221,7 +223,8 @@ def evaluate_batch(
             for k in top_k_list:
                 recall = r["cutoffs"][k]["recall"]
                 ndcg = r["cutoffs"][k]["ndcg"]
-                print(f" {recall:>7.3f} {ndcg:>6.3f}", end="")
+                pool_pct = r["cutoffs"][k]["found"] / r["pool_found"] if r["pool_found"] > 0 else 0
+                print(f" {recall:>7.3f} {ndcg:>6.3f} {pool_pct:>4.0%}", end="")
             print()
 
     return all_results, model

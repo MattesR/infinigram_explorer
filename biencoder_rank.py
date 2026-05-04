@@ -210,9 +210,9 @@ def evaluate_batch(
         # Per-query
         print(f"\n{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Pool':>5s} {'MRR':>5s} {'Time':>5s}", end="")
         for k in top_k_list:
-            print(f" {'R@'+str(k):>7s} {'nD@'+str(k):>6s}", end="")
+            print(f" {'R@'+str(k):>7s} {'nD@'+str(k):>6s} {'%P':>5s}", end="")
         print()
-        print("-" * (45 + 14 * len(top_k_list)))
+        print("-" * (45 + 19 * len(top_k_list)))
 
         for r in all_results:
             print(f"{r['qid']:<15s} {r['n_docs']:>6d} {r['n_relevant']:>5d} "
@@ -220,7 +220,8 @@ def evaluate_batch(
             for k in top_k_list:
                 recall = r["cutoffs"][k]["recall"]
                 ndcg = r["cutoffs"][k]["ndcg"]
-                print(f" {recall:>7.3f} {ndcg:>6.3f}", end="")
+                pool_pct = r["cutoffs"][k]["found"] / r["pool_found"] if r["pool_found"] > 0 else 0
+                print(f" {recall:>7.3f} {ndcg:>6.3f} {pool_pct:>4.0%}", end="")
             print()
 
     return all_results, model
