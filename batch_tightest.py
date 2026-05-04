@@ -190,7 +190,7 @@ def batch_tightest_analysis(
                 elif r["recall"] >= 0.95 and (df_prox[df_prox["prox"] < r["prox"]]["recall"].max() < 0.95
                                                if len(df_prox[df_prox["prox"] < r["prox"]]) > 0 else True):
                     marker = "  <-- 95% recall"
-                print(f"  {r['prox']:>6d} {r['docs_covered']:>8d} {r['recall']:>8.4f}{marker}")
+                print(f"  {r['prox']:>6f} {r['docs_covered']:>8f} {r['recall']:>8.4f}{marker}")
 
             # Recommendation
             for target in [0.90, 0.95]:
