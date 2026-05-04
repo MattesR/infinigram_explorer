@@ -248,7 +248,6 @@ def compare_recall_ceiling(
     qrels_path: str,
     engine,
     tokenizer,
-    pipeline=None,
     index_dir: str = "../msmarco_segmented_index/",
     expansions_paths: dict = None,
     progressive_paths: dict = None,
@@ -264,13 +263,13 @@ def compare_recall_ceiling(
     inspection_dir: str = "./inspection",
     corpus_dir: str = "../data/infinigram_index/msmarco_v2.1_doc_segmented",
     # Progressive mode params
-    max_standalone_key: int = 1000,
-    max_standalone_assoc: int = 200,
+    max_standalone_key: int = 1500,
+    max_standalone_assoc: int = 1500,
     prox_peek: int = 10,
-    max_docs: int = 10000,
+    max_docs: int = 20000,
     max_combo_grab: int = 5000,
     prox_cross: int = 50,
-    prox_assoc: int = 80,
+    prox_assoc: int = 50,
     # Return docs for reranking
     return_docs: bool = False,
 ):

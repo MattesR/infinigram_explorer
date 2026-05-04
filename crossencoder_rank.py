@@ -92,6 +92,8 @@ def evaluate_single(
     batch_size: int = 32,
 ):
     """Evaluate cross-encoder reranking for a single query."""
+    from ir_metrics import compute_metrics
+
     if top_k_list is None:
         top_k_list = [10, 20, 50, 100]
 
@@ -112,19 +114,8 @@ def evaluate_single(
                                   top_k=max_k, batch_size=batch_size)
     elapsed = time.perf_counter() - t0
 
-    results = {}
-    for k in top_k_list:
-        top_ids = {did for _, did in ranked[:k]}
-        found = top_ids & set(relevant.keys())
-        recall = len(found) / len(relevant) if relevant else 0
-        precision = len(found) / min(k, len(ranked)) if ranked else 0
-        pool_pct = len(found) / pool_found if pool_found > 0 else 0
-        results[k] = {
-            "recall": recall,
-            "precision": precision,
-            "found": len(found),
-            "pool_pct": pool_pct,
-        }
+    ranked_ids = [did for _, did in ranked]
+    cutoffs = compute_metrics(ranked_ids, qrels, qid, top_k_list=top_k_list)
 
     return {
         "qid": qid,
@@ -133,7 +124,7 @@ def evaluate_single(
         "pool_found": pool_found,
         "pool_recall": pool_found / len(relevant) if relevant else 0,
         "time_seconds": round(elapsed, 2),
-        "cutoffs": results,
+        "cutoffs": cutoffs,
     }
 
 
@@ -202,34 +193,35 @@ def evaluate_batch(
         print(f"  Pool avg recall: {avg_pool_recall:.4f}")
         print(f"  Total time: {total_time:.1f}s ({total_time/n:.1f}s per topic)")
         print(f"  Avg input docs: {avg_input:.0f}")
+        avg_mrr = sum(r["cutoffs"]["mrr"] for r in all_results) / n
+        print(f"  MRR: {avg_mrr:.4f}")
 
         header = f"  {'':>15s}"
         for k in top_k_list:
-            header += f" {'R@'+str(k):>10s} {'%Pool@'+str(k):>10s}"
+            header += f" {'R@'+str(k):>8s} {'nDCG@'+str(k):>8s}"
         print(header)
 
         print(f"  {'Average':>15s}", end="")
         for k in top_k_list:
             recalls = [r["cutoffs"][k]["recall"] for r in all_results]
-            pool_pcts = [r["cutoffs"][k]["pool_pct"] for r in all_results]
-            print(f" {sum(recalls)/n:>10.4f} {sum(pool_pcts)/n:>10.1%}", end="")
+            ndcgs = [r["cutoffs"][k]["ndcg"] for r in all_results]
+            print(f" {sum(recalls)/n:>8.4f} {sum(ndcgs)/n:>8.4f}", end="")
         print()
 
         # Per-query
-        print(f"\n{'QID':<15s} {'Input':>6s} {'Rel':>5s} {'Pool':>5s} {'Ceil':>5s} {'Time':>6s}", end="")
+        print(f"\n{'QID':<15s} {'Input':>6s} {'Rel':>5s} {'Pool':>5s} {'MRR':>5s} {'Time':>6s}", end="")
         for k in top_k_list:
-            print(f" {'R@'+str(k):>7s} {'%P@'+str(k):>6s}", end="")
+            print(f" {'R@'+str(k):>7s} {'nD@'+str(k):>6s}", end="")
         print()
         print("-" * (45 + 14 * len(top_k_list)))
 
         for r in all_results:
-            pool_ceil = r["pool_found"] / r["n_relevant"] if r["n_relevant"] else 0
             print(f"{r['qid']:<15s} {r['n_input_docs']:>6d} {r['n_relevant']:>5d} "
-                  f"{r['pool_found']:>5d} {pool_ceil:>4.0%} {r['time_seconds']:>5.1f}s", end="")
+                  f"{r['pool_found']:>5d} {r['cutoffs']['mrr']:>5.3f} {r['time_seconds']:>5.1f}s", end="")
             for k in top_k_list:
                 recall = r["cutoffs"][k]["recall"]
-                pool_pct = r["cutoffs"][k]["pool_pct"]
-                print(f" {recall:>7.3f} {pool_pct:>5.0%}", end="")
+                ndcg = r["cutoffs"][k]["ndcg"]
+                print(f" {recall:>7.3f} {ndcg:>6.3f}", end="")
             print()
 
     return all_results, model

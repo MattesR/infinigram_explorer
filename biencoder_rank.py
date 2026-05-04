@@ -88,6 +88,8 @@ def evaluate_single(
     batch_size: int = 256,
 ):
     """Evaluate bi-encoder reranking for a single query."""
+    from ir_metrics import compute_metrics
+
     if top_k_list is None:
         top_k_list = [10, 100, 1000, 2000]
 
@@ -99,17 +101,25 @@ def evaluate_single(
                                batch_size=batch_size)
     elapsed = time.perf_counter() - t0
 
+    # Build ranked doc list with texts for downstream use
+    doc_map = {}
+    for d in docs:
+        did = d.get("doc_id", "")
+        if did and did not in doc_map:
+            doc_map[did] = d
+
+    ranked_docs = []
+    for score, did in ranked:
+        doc = doc_map.get(did, {"doc_id": did, "text": ""})
+        ranked_docs.append({"doc_id": did, "text": doc.get("text", ""), "score": score})
+
     # All relevant in pool
     doc_ids_all = {d.get("doc_id") for d in docs if d.get("doc_id")}
     pool_found = len(doc_ids_all & set(relevant.keys()))
 
-    results = {}
-    for k in top_k_list:
-        top_ids = {did for _, did in ranked[:k]}
-        found = top_ids & set(relevant.keys())
-        recall = len(found) / len(relevant) if relevant else 0
-        precision = len(found) / min(k, len(ranked)) if ranked else 0
-        results[k] = {"recall": recall, "precision": precision, "found": len(found)}
+    # Compute metrics
+    ranked_ids = [did for _, did in ranked]
+    cutoffs = compute_metrics(ranked_ids, qrels, qid, top_k_list=top_k_list)
 
     return {
         "qid": qid,
@@ -118,7 +128,8 @@ def evaluate_single(
         "pool_found": pool_found,
         "pool_recall": pool_found / len(relevant) if relevant else 0,
         "time_seconds": round(elapsed, 2),
-        "cutoffs": results,
+        "cutoffs": cutoffs,
+        "ranked_docs": ranked_docs,
     }
 
 
@@ -179,35 +190,37 @@ def evaluate_batch(
         print(f"  Pool avg recall: {avg_pool_recall:.4f}")
         print(f"  Total time: {total_time:.1f}s ({total_time/n:.1f}s per topic)")
         print(f"  Avg docs per topic: {sum(r['n_docs'] for r in all_results)/n:.0f}")
+        avg_mrr = sum(r["cutoffs"]["mrr"] for r in all_results) / n
+        print(f"  MRR: {avg_mrr:.4f}")
 
         header = f"  {'':>15s}"
         for k in top_k_list:
-            header += f" {'R@'+str(k):>10s} {'R/Pool@'+str(k):>10s}"
+            header += f" {'R@'+str(k):>8s} {'nDCG@'+str(k):>8s} {'%Pool':>6s}"
         print(header)
 
         print(f"  {'Average':>15s}", end="")
         for k in top_k_list:
             recalls = [r["cutoffs"][k]["recall"] for r in all_results]
-            pool_recalls = [r["cutoffs"][k]["found"] / r["pool_found"]
-                           if r["pool_found"] > 0 else 0 for r in all_results]
-            print(f" {sum(recalls)/n:>10.4f} {sum(pool_recalls)/n:>10.4f}", end="")
+            ndcgs = [r["cutoffs"][k]["ndcg"] for r in all_results]
+            pool_pcts = [r["cutoffs"][k]["found"] / r["pool_found"]
+                        if r["pool_found"] > 0 else 0 for r in all_results]
+            print(f" {sum(recalls)/n:>8.4f} {sum(ndcgs)/n:>8.4f} {sum(pool_pcts)/n:>5.0%}", end="")
         print()
 
         # Per-query
-        print(f"\n{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Pool':>5s} {'Ceil':>5s} {'Time':>5s}", end="")
+        print(f"\n{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Pool':>5s} {'MRR':>5s} {'Time':>5s}", end="")
         for k in top_k_list:
-            print(f" {'R@'+str(k):>7s} {'%P@'+str(k):>6s}", end="")
+            print(f" {'R@'+str(k):>7s} {'nD@'+str(k):>6s}", end="")
         print()
         print("-" * (45 + 14 * len(top_k_list)))
 
         for r in all_results:
-            pool_ceil = r["pool_found"] / r["n_relevant"] if r["n_relevant"] else 0
             print(f"{r['qid']:<15s} {r['n_docs']:>6d} {r['n_relevant']:>5d} "
-                  f"{r['pool_found']:>5d} {pool_ceil:>4.0%} {r['time_seconds']:>4.1f}s", end="")
+                  f"{r['pool_found']:>5d} {r['cutoffs']['mrr']:>5.3f} {r['time_seconds']:>4.1f}s", end="")
             for k in top_k_list:
                 recall = r["cutoffs"][k]["recall"]
-                pool_rel = r["cutoffs"][k]["found"] / r["pool_found"] if r["pool_found"] > 0 else 0
-                print(f" {recall:>7.3f} {pool_rel:>5.0%}", end="")
+                ndcg = r["cutoffs"][k]["ndcg"]
+                print(f" {recall:>7.3f} {ndcg:>6.3f}", end="")
             print()
 
     return all_results, model
