@@ -291,8 +291,6 @@ def evaluate_ranking(
 
 def evaluate_batch(
     retrieval_results: list,
-    peek_per_qid: dict,
-    executed_per_qid: dict,
     qrels_path: str,
     expansions_path: str,
     top_k_list: list = None,
@@ -303,7 +301,12 @@ def evaluate_batch(
     specificity_weight: float = 1.0,
     verbose: bool = True,
 ):
-    """Evaluate TF scoring for multiple queries."""
+    """
+    Evaluate TF scoring for multiple queries.
+
+    Args:
+        retrieval_results: List of result dicts with docs, peek, executed.
+    """
     if top_k_list is None:
         top_k_list = [10, 100, 1000, 2000]
 
@@ -314,12 +317,10 @@ def evaluate_batch(
     for r in retrieval_results:
         qid = r["qid"]
         docs = r.get("docs", [])
-        if not docs:
-            continue
+        peek = r.get("peek")
+        executed = r.get("executed", [])
 
-        peek = peek_per_qid.get(qid)
-        executed = executed_per_qid.get(qid, [])
-        if peek is None:
+        if not docs or peek is None:
             continue
 
         query_data = all_expansions.get(qid, {})
@@ -382,8 +383,6 @@ def evaluate_batch(
 
 def grid_search_scorer(
     retrieval_results: list,
-    peek_per_qid: dict,
-    executed_per_qid: dict,
     qrels_path: str,
     expansions_path: str,
     param_grid: dict = None,
@@ -394,8 +393,8 @@ def grid_search_scorer(
     Grid search over scorer hyperparameters.
 
     Args:
+        retrieval_results: List of result dicts with docs, peek, executed.
         param_grid: Dict of param_name -> list of values.
-            Default tests aspect_weight, key_tf_weight, verb_weight, specificity_weight.
     """
     from itertools import product
 
@@ -428,7 +427,7 @@ def grid_search_scorer(
         label = " | ".join(f"{k}={v}" for k, v in config.items())
 
         eval_results = evaluate_batch(
-            retrieval_results, peek_per_qid, executed_per_qid,
+            retrieval_results,
             qrels_path, expansions_path,
             top_k_list=top_k_list,
             verbose=False,
