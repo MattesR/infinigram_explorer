@@ -182,28 +182,32 @@ def evaluate_batch(
 
         header = f"  {'':>15s}"
         for k in top_k_list:
-            header += f" {'R@'+str(k):>10s} {'P@'+str(k):>10s}"
+            header += f" {'R@'+str(k):>10s} {'R/Pool@'+str(k):>10s}"
         print(header)
 
         print(f"  {'Average':>15s}", end="")
         for k in top_k_list:
             recalls = [r["cutoffs"][k]["recall"] for r in all_results]
-            precisions = [r["cutoffs"][k]["precision"] for r in all_results]
-            print(f" {sum(recalls)/n:>10.4f} {sum(precisions)/n:>10.4f}", end="")
+            pool_recalls = [r["cutoffs"][k]["found"] / r["pool_found"]
+                           if r["pool_found"] > 0 else 0 for r in all_results]
+            print(f" {sum(recalls)/n:>10.4f} {sum(pool_recalls)/n:>10.4f}", end="")
         print()
 
         # Per-query
-        print(f"\n{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Pool':>6s} {'Time':>6s}", end="")
+        print(f"\n{'QID':<15s} {'Retr':>6s} {'Rel':>5s} {'Pool':>5s} {'Ceil':>5s} {'Time':>5s}", end="")
         for k in top_k_list:
-            print(f" {'R@'+str(k):>7s}", end="")
+            print(f" {'R@'+str(k):>7s} {'%P@'+str(k):>6s}", end="")
         print()
-        print("-" * (40 + 8 * len(top_k_list)))
+        print("-" * (45 + 14 * len(top_k_list)))
 
         for r in all_results:
+            pool_ceil = r["pool_found"] / r["n_relevant"] if r["n_relevant"] else 0
             print(f"{r['qid']:<15s} {r['n_docs']:>6d} {r['n_relevant']:>5d} "
-                  f"{r['pool_found']:>6d} {r['time_seconds']:>5.1f}s", end="")
+                  f"{r['pool_found']:>5d} {pool_ceil:>4.0%} {r['time_seconds']:>4.1f}s", end="")
             for k in top_k_list:
-                print(f" {r['cutoffs'][k]['recall']:>7.3f}", end="")
+                recall = r["cutoffs"][k]["recall"]
+                pool_rel = r["cutoffs"][k]["found"] / r["pool_found"] if r["pool_found"] > 0 else 0
+                print(f" {recall:>7.3f} {pool_rel:>5.0%}", end="")
             print()
 
     return all_results, model
