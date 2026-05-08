@@ -28,10 +28,10 @@ DEFAULT_EXPERIMENT_CONFIG = {
     "topics_path": "./topics_rag24_test.txt",
     "qrels_path": "./qrels.rag24.test-umbrela-all.txt",
     "expansions_path": "./kiss.jsonl",
-    "out_path": None,  # defaults to config dir
+    "out_path": None,  # defaults to config file's directory
 
     # Index and tokenizer
-    "index_dir": "/home/mruc/msmarco_segmented_index/",
+    "index_dir": "/home/mruc/first_index/",
     "tokenizer_name": "meta-llama/Llama-2-7b-hf",
 
     # Stages to run
@@ -62,11 +62,13 @@ def load_config(config_path):
     for k, v in user_config.items():
         if k in DEFAULT_CONFIG:
             pipeline_cfg[k] = v
+    # Pass index_dir through to pipeline
+    pipeline_cfg["index_dir"] = config["index_dir"]
     config["pipeline"] = pipeline_cfg
 
-    # Default out_path to config directory
+    # Default out_path to config file's directory
     if config["out_path"] is None:
-        config["out_path"] = str(Path(config_path).parent)
+        config["out_path"] = str(Path(config_path).parent.resolve())
 
     return config
 
@@ -206,14 +208,13 @@ def run_from_config(config_path, engine=None, tokenizer=None, verbose=True):
         print(f"  Topics: {config.get('max_topics', 'all')}")
         print(f"{'='*70}")
 
-    # Save config copy
-    config_copy_path = os.path.join(out_path, "config.yaml")
-    with open(config_copy_path, "w") as f:
+    # Save resolved config (separate file, never overwrites original)
+    resolved_path = os.path.join(out_path, "config_resolved.yaml")
+    with open(resolved_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
     # Load resources
     resources = load_resources(config, engine=engine, tokenizer=tokenizer)
-
 
     # Run pipeline
     if verbose:
