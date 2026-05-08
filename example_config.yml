@@ -1,20 +1,56 @@
-## This is an example config file for reference.
-## best to put it in a folder and then also store the model there
-## either data_dir or hf_dataset has to be part of the config
-## you can specify an out_dir that it different from the config
-## if no outdir is in the config, the path of the config will be taken as an outdir 
-## this is where to model will be saved at the end
-data_dir: ./path/to/json/files 
-## OR
-huggingface_url: https://huggingface.co/datasets/allenai/olmo-mix-1124 # or whatever
-subset: #can be a list or a string, must be a subset for which a loader exists on hf hub.
-  - wiki
-  - arxiv
-vector_size: 300 #same size as google news and other static embeddings
-window: 5
-min_count: 10 
-max_sentences: 1000 
-workers: 4 ## you can either put an int or  ALL, which will be num_cores - 1, or MAX which will be num_cores 
-sg: 1 ## skip-gram, 0 for cbow
-epochs: 5
-buffered: False ## If True, will use one cpu core for predownloading batches.
+# Experiment configuration
+# Copy this file and modify for each experiment
+
+# Paths
+topics_path: ./topics_rag24_test.txt
+qrels_path: ./qrels.rag24.test-umbrela-all.txt
+expansions_path: ./kiss.jsonl
+out_path: ./runs/baseline/
+
+# Index
+index_dir: ../msmarco_segmented_index/
+infini_index_dir: /home/mruc/first_index/
+tokenizer_name: meta-llama/Llama-2-7b-hf
+
+# Stages to run (comment out to skip)
+stages:
+  - retrieval
+  - biencoder
+  - crossencoder
+
+# Models
+biencoder_model: sentence-transformers/all-MiniLM-L6-v2
+crossencoder_model: cross-encoder/ms-marco-MiniLM-L-12-v2
+
+# Limits
+max_topics: 10  # set to null for all 301
+
+# Eval cutoffs
+top_k_list: [10, 100, 1000]
+
+# ── Pipeline hyperparameters ──
+
+# Peek and grab
+max_standalone_key: 1500
+max_standalone_assoc: 750
+prox_peek: 10
+max_clause_freq: 80000000
+
+# Combination queries
+max_docs: 20000
+prox_cross: 100
+prox_assoc: 100
+max_total: 200
+
+# Bi-encoder
+biencoder_top_k: 1000
+biencoder_batch_size: 256
+biencoder_max_doc_length: 512
+
+# Cross-encoder
+crossencoder_top_k: 100
+crossencoder_batch_size: 32
+crossencoder_max_length: 512
+
+# Document resolution
+max_doc_len: 2000
