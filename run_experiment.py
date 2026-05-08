@@ -31,8 +31,7 @@ DEFAULT_EXPERIMENT_CONFIG = {
     "out_path": None,  # defaults to config dir
 
     # Index and tokenizer
-    "index_dir": "../msmarco_segmented_index/",
-    "infini_index_dir": "/home/mruc/first_index/",
+    "index_dir": "/home/mruc/msmarco_segmented_index/",
     "tokenizer_name": "meta-llama/Llama-2-7b-hf",
 
     # Stages to run
@@ -94,9 +93,9 @@ def load_resources(config, engine=None, tokenizer=None):
     # Engine
     if engine is None:
         from infini_gram.engine import InfiniGramEngine
-        print(f"Loading engine: {config['infini_index_dir']}")
+        print(f"Loading engine: {config['index_dir']}")
         engine = InfiniGramEngine(
-            index_dir=config["infini_index_dir"],
+            index_dir=config["index_dir"],
             eos_token_id=tokenizer.eos_token_id,
         )
     resources["engine"] = engine
@@ -215,8 +214,6 @@ def run_from_config(config_path, engine=None, tokenizer=None, verbose=True):
     # Load resources
     resources = load_resources(config, engine=engine, tokenizer=tokenizer)
 
-    # Update pipeline config with index_dir
-    config["pipeline"]["index_dir"] = config["index_dir"]
 
     # Run pipeline
     if verbose:

@@ -8,8 +8,7 @@ expansions_path: ./kiss.jsonl
 out_path: ./runs/baseline/
 
 # Index
-index_dir: ../msmarco_segmented_index/
-infini_index_dir: /home/mruc/first_index/
+index_dir:  /home/mruc/msmarco_segmented_index/
 tokenizer_name: meta-llama/Llama-2-7b-hf
 
 # Stages to run (comment out to skip)
