@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def _build_pieces_from_expansion(qid, expansion, tokenizer, engine):
+def _build_pieces_from_expansion(expansion, tokenizer, engine):
     """Build CNF pieces directly from expansion dict (no file needed)."""
     from progressive_queries import _make_term_piece
 

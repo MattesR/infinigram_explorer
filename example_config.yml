@@ -33,7 +33,7 @@ top_k_list: [10, 100, 1000]
 max_standalone_key: 1500
 max_standalone_assoc: 750
 prox_peek: 10
-max_clause_freq: 80000000
+max_clause_freq: 2000000
 
 # Combination queries
 max_docs: 20000
