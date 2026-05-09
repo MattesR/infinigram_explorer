@@ -205,6 +205,8 @@ def build_index(corpus_dir, index_dir, cpus=16, mem=64, tokenizer="llama"):
         mem: RAM in GB
         tokenizer: Tokenizer name (llama, gpt2, olmo)
     """
+    corpus_dir = os.path.abspath(corpus_dir)
+    index_dir = os.path.abspath(index_dir)
     os.makedirs(index_dir, exist_ok=True)
 
     # Estimate tokens to determine shards
