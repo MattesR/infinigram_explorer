@@ -46,7 +46,7 @@ def load_topics(path):
     return topics
 
 
-def submit_batch(topics_path, model="claude-sonnet-4-6"):
+def submit_batch(topics_path, model="claude-opus-4-6"):
     client = anthropic.Anthropic()
     topics = load_topics(topics_path)
 
@@ -99,32 +99,36 @@ def wait_for_completion(batch_id, poll_interval=30):
 
 def collect_results(batch_id, output_path):
     client = anthropic.Anthropic()
-
+ 
     # Check status first
     status = client.messages.batches.retrieve(batch_id)
     if status.processing_status != "ended":
         print(f"Batch not done yet: {status.processing_status}")
         print(f"Request counts: {status.request_counts}")
         return None
-
+ 
     print(f"Collecting results from batch {batch_id}...")
     results = {}
     errors = []
-
+ 
     for result in client.messages.batches.results(batch_id):
         qid = result.custom_id
-
+ 
         if result.result.type != "succeeded":
             errors.append((qid, result.result.type))
             continue
-
+ 
+        if not result.result.message.content:
+            errors.append((qid, "empty_content"))
+            continue
+ 
         text = result.result.message.content[0].text
-
+ 
         # Strip markdown code fences if present
         text = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.MULTILINE)
         text = re.sub(r'\n?```\s*$', '', text, flags=re.MULTILINE)
         text = text.strip()
-
+ 
         try:
             parsed = json.loads(text)
             results[qid] = parsed
@@ -132,26 +136,33 @@ def collect_results(batch_id, output_path):
             # Store raw text if JSON parsing fails
             results[qid] = {"raw": text}
             errors.append((qid, "json_parse_error"))
-
+ 
     print(f"Collected {len(results)} results, {len(errors)} errors")
-
+ 
     if errors:
         print(f"Errors:")
         for qid, err in errors[:10]:
             print(f"  {qid}: {err}")
-
+ 
+    # Save errors
+    errors_path = output_path.replace(".jsonl", "_errors.json").replace(".json", "_errors.json")
+    with open(errors_path, "w") as f:
+        json.dump([{"qid": qid, "error": err} for qid, err in errors], f, indent=2)
+    if errors:
+        print(f"Errors saved to {errors_path}")
+ 
     # Save
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Saved to {output_path}")
-
+ 
     # Also save as JSONL for easier streaming
     jsonl_path = output_path.replace(".json", ".jsonl")
     with open(jsonl_path, "w") as f:
         for qid, data in results.items():
             f.write(json.dumps({"qid": qid, **data}) + "\n")
     print(f"Also saved as {jsonl_path}")
-
+ 
     return results
 
 

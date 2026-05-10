@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def _build_pieces_from_expansion(expansion, tokenizer, engine):
+def _build_pieces_from_expansion(qid, expansion, tokenizer, engine):
     """Build CNF pieces directly from expansion dict (no file needed)."""
     from progressive_queries import _make_term_piece
 
@@ -147,7 +147,7 @@ def run_pipeline(
 
     from progressive_queries import peek_and_grab
 
-    pieces = _build_pieces_from_expansion(qid, expansion, tokenizer, engine)
+    pieces = _build_pieces_from_expansion(expansion, tokenizer, engine)
     peek = peek_and_grab(
         pieces, engine, tokenizer,
         max_standalone_key=cfg["max_standalone_key"],
