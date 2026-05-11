@@ -386,7 +386,7 @@ def beam_search_delayed_prune(
 
 def load_default_engine(with_embedding_model=True):
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", add_bos_token=False, add_eos_token=False)
-    engine = InfiniGramEngine(index_dir="/home/mruc/first_index/", eos_token_id=tokenizer.eos_token_id)
+    engine = InfiniGramEngine(index_dir="/home/mruc/msmarco_segmented_index/", eos_token_id=tokenizer.eos_token_id)
     if with_embedding_model:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model_id = "google/embeddinggemma-300M"

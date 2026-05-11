@@ -4,7 +4,6 @@ import beam_search, bs_utils
 from similarity_search import similarity_search
 from sentence_transformers import SparseEncoder, SentenceTransformer
 from transformers import AutoTokenizer, AutoModel
-from transformers import AutoTokenizer, AutoModel
 from bs_utils import get_tokens_from_splade
 import pandas as pd
 import numpy as np
@@ -19,9 +18,11 @@ from llm_keyword_filter import load_faceted_keywords, STOPWORDS, load_all_expans
 from progressive_queries import build_pieces, peek_and_grab, build_combination_queries
 from adaptive_queries import run_adaptive
 from trec_output import load_qrels
+from infini_gram.engine import InfiniGramEngine
 
 print('populating the variables')
-tokenizer,engine = beam_search.load_default_engine(with_embedding_model=False)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", add_bos_token=False, add_eos_token=False)
+engine = InfiniGramEngine(index_dir="/home/mruc/msmarco_segmented_index/", eos_token_id=tokenizer.eos_token_id)
 # splade = SparseEncoder("naver/splade-cocondenser-ensembledistil")
 first_query = "what makes up a community, including its definitions in various contexts like science and what it means to be a 'civilized community."
 input_ids = tokenizer.encode('community')
