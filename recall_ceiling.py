@@ -357,6 +357,7 @@ def compare_recall_ceiling(
     all_results = {mode: [] for mode in modes}
 
     for qid, query_text in tqdm(topics, desc="Topics"):
+        print(f"  {qid}", end=" ", flush=True)
         for mode in modes:
             kwargs = {
                 "max_standalone": max_standalone,

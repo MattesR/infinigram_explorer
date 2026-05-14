@@ -147,35 +147,43 @@ def resolve_all_queries(
             by_shard[s] = []
         by_shard[s].append((doc_idx, q_indices))
 
-    documents = []
+    def _process_shard(s, doc_list):
+        """Process all documents in one shard. Thread-safe (separate files)."""
+        shard_docs = []
 
-    for s, doc_list in by_shard.items():
         tok_path = index_dir / f"tokenized.{s}"
         off_path = index_dir / f"offset.{s}"
         metaoff_path = index_dir / f"metaoff.{s}"
         metadata_path = index_dir / f"metadata.{s}"
 
-        tok_size = tok_path.stat().st_size
         meta_size = metadata_path.stat().st_size
-
-        doc_offsets = np.memmap(off_path, dtype="<u8", mode="r")
-        tok_tokens = np.memmap(tok_path, dtype=dtype, mode="r")
         metaoff = np.memmap(metaoff_path, dtype="<u8", mode="r")
+
+        # Only load token files if we need text
+        tok_tokens = None
+        doc_offsets = None
+        tok_size = 0
+        if not ids_only:
+            tok_size = tok_path.stat().st_size
+            doc_offsets = np.memmap(off_path, dtype="<u8", mode="r")
+            tok_tokens = np.memmap(tok_path, dtype=dtype, mode="r")
 
         with open(metadata_path, "rb") as meta_f:
             for doc_idx, q_indices in tqdm(doc_list, desc=f"Shard {s}", leave=False):
-                # Read tokens
-                doc_start = int(doc_offsets[doc_idx])
-                if doc_idx + 1 < len(doc_offsets):
-                    doc_end = int(doc_offsets[doc_idx + 1])
-                else:
-                    doc_end = tok_size
+                # Read tokens (skip if ids_only)
+                tokens = None
+                if not ids_only:
+                    doc_start = int(doc_offsets[doc_idx])
+                    if doc_idx + 1 < len(doc_offsets):
+                        doc_end = int(doc_offsets[doc_idx + 1])
+                    else:
+                        doc_end = tok_size
 
-                doc_start_tok = doc_start // token_width
-                doc_end_tok = doc_end // token_width
-                n_tokens = min(doc_end_tok - doc_start_tok, max_doc_len)
+                    doc_start_tok = doc_start // token_width
+                    doc_end_tok = doc_end // token_width
+                    n_tokens = min(doc_end_tok - doc_start_tok, max_doc_len)
 
-                tokens = tok_tokens[doc_start_tok : doc_start_tok + n_tokens].copy()
+                    tokens = tok_tokens[doc_start_tok : doc_start_tok + n_tokens].copy()
 
                 # Read metadata
                 meta_start = int(metaoff[doc_idx])
@@ -204,7 +212,7 @@ def resolve_all_queries(
                 if tokenizer is not None and not ids_only:
                     text = tokenizer.decode(tokens.tolist()[:max_doc_len], skip_special_tokens=True)
 
-                documents.append({
+                shard_docs.append({
                     "shard": s,
                     "doc_index": doc_idx,
                     "doc_id": doc_id,
@@ -213,6 +221,17 @@ def resolve_all_queries(
                     "text": text,
                     "from_queries": sorted(q_indices),
                 })
+
+        return shard_docs
+
+    # Process shards in parallel (thread-safe: each shard has separate files)
+    documents = []
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(by_shard)) as pool:
+        futures = [pool.submit(_process_shard, s, doc_list)
+                   for s, doc_list in by_shard.items()]
+        for future in futures:
+            documents.extend(future.result())
 
     print(f"\nDone! {len(documents)} unique documents resolved.")
     n_multi = sum(1 for d in documents if len(d["from_queries"]) > 1)
