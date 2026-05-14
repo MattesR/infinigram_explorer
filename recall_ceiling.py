@@ -67,7 +67,38 @@ def retrieval_recall(
 
     t0 = time.perf_counter()
 
-    if mode == "progressive":
+    if mode == "ceiling":
+        from progressive_queries import build_pieces
+        from adaptive_queries import run_adaptive
+
+        pieces = build_pieces(qid, expansions_path, tokenizer, engine, verbose=False)
+
+        # Grab every piece independently — no thresholds, no combos
+        all_queries = []
+        for aspect_name, piece_list in pieces["key_pieces"].items():
+            for p in piece_list:
+                prox = prox_peek if len(p["cnf"]) > 1 else None
+                all_queries.append({
+                    "type": "cnf",
+                    "cnf": p["cnf"],
+                    "max_diff_tokens": prox,
+                    "description": p["description"],
+                    "level": "ceiling_key",
+                })
+        for p in pieces["associated"]:
+            prox = prox_peek if len(p["cnf"]) > 1 else None
+            all_queries.append({
+                "type": "cnf",
+                "cnf": p["cnf"],
+                "max_diff_tokens": prox,
+                "description": p["description"],
+                "level": "ceiling_assoc",
+            })
+
+        executed = run_adaptive(engine, all_queries, max_clause_freq=max_clause_freq, verbose=False)
+        peek = None
+
+    elif mode == "progressive":
         from progressive_queries import build_pieces, peek_and_grab, build_combination_queries
         from adaptive_queries import run_adaptive
 
@@ -248,9 +279,11 @@ def compare_recall_ceiling(
     qrels_path: str,
     engine,
     tokenizer,
+    pipeline=None,
     index_dir: str = "../msmarco_segmented_index/",
     expansions_paths: dict = None,
     progressive_paths: dict = None,
+    ceiling_paths: dict = None,
     include_splade: bool = False,
     max_topics: int = None,
     max_standalone: int = 5000,
@@ -263,13 +296,13 @@ def compare_recall_ceiling(
     inspection_dir: str = "./inspection",
     corpus_dir: str = "../data/infinigram_index/msmarco_v2.1_doc_segmented",
     # Progressive mode params
-    max_standalone_key: int = 1500,
-    max_standalone_assoc: int = 1500,
+    max_standalone_key: int = 1000,
+    max_standalone_assoc: int = 200,
     prox_peek: int = 10,
-    max_docs: int = 20000,
+    max_docs: int = 10000,
     max_combo_grab: int = 5000,
     prox_cross: int = 50,
-    prox_assoc: int = 50,
+    prox_assoc: int = 80,
     # Return docs for reranking
     return_docs: bool = False,
 ):
@@ -285,6 +318,7 @@ def compare_recall_ceiling(
     modes = []
     mode_expansions = {}   # label -> path (llm_adaptive)
     mode_progressive = {}  # label -> path (progressive)
+    mode_ceiling = {}      # label -> path (ceiling)
 
     if expansions_paths:
         for label, path in expansions_paths.items():
@@ -295,6 +329,11 @@ def compare_recall_ceiling(
         for label, path in progressive_paths.items():
             modes.append(label)
             mode_progressive[label] = path
+
+    if ceiling_paths:
+        for label, path in ceiling_paths.items():
+            modes.append(label)
+            mode_ceiling[label] = path
 
     if include_splade:
         modes.append("splade_adaptive")
@@ -344,9 +383,28 @@ def compare_recall_ceiling(
                 if corpus_dir:
                     kwargs["corpus_dir"] = corpus_dir
 
-            if mode in mode_progressive:
+            if mode in mode_ceiling:
+                actual_mode = "ceiling"
+                kwargs["expansions_path"] = mode_ceiling[mode]
+
+                from llm_keyword_filter import load_all_expansions
+                exp_data = load_all_expansions(mode_ceiling[mode]).get(qid, {})
+                if "raw" in exp_data or "KEY_ENTITIES" not in exp_data:
+                    skipped_qids = all_results.setdefault("_skipped", [])
+                    skipped_qids.append(qid)
+                    continue
+
+            elif mode in mode_progressive:
                 actual_mode = "progressive"
                 kwargs["expansions_path"] = mode_progressive[mode]
+
+                from llm_keyword_filter import load_all_expansions
+                exp_data = load_all_expansions(mode_progressive[mode]).get(qid, {})
+                if "raw" in exp_data or "KEY_ENTITIES" not in exp_data:
+                    skipped_qids = all_results.setdefault("_skipped", [])
+                    skipped_qids.append(qid)
+                    continue
+
             elif mode in mode_expansions:
                 actual_mode = "llm_adaptive"
                 kwargs["expansions_path"] = mode_expansions[mode]
@@ -365,6 +423,13 @@ def compare_recall_ceiling(
                     all_results[mode].append(result)
             except Exception as e:
                 print(f"  [{qid}] {mode} ERROR: {e}")
+
+    # Report skipped queries
+    skipped = all_results.pop("_skipped", [])
+    if skipped:
+        print(f"\n  Skipped {len(skipped)} queries with broken/missing expansions: {skipped[:10]}")
+        if len(skipped) > 10:
+            print(f"    ... and {len(skipped) - 10} more")
 
     # Print comparison table
     print(f"\n{'='*80}")
@@ -440,4 +505,77 @@ def compare_recall_ceiling(
             print(f"    {mode_a} wins: {a_wins}, {mode_b} wins: {b_wins}, ties: {ties}")
             print(f"    Avg recall diff: {avg_diff:+.4f}")
 
+    all_results["_skipped"] = skipped
     return all_results
+
+
+def df_from_results(results):
+    """
+    Convert results dict to a pandas DataFrame.
+
+    Args:
+        results: Dict of mode -> list of result dicts, as returned by
+                 compare_recall_ceiling. Also accepts a plain list of
+                 result dicts (single mode).
+
+    Returns DataFrame with one row per (mode, qid).
+    """
+    import pandas as pd
+
+    rows = []
+
+    # Handle both dict and list input
+    if isinstance(results, list):
+        results = {"default": results}
+
+    # Remove metadata keys
+    skipped = results.pop("_skipped", [])
+
+    for mode, results_list in results.items():
+        if mode.startswith("_"):
+            continue
+        for r in results_list:
+            rows.append({
+                "mode": mode,
+                "qid": r["qid"],
+                "n_relevant": r.get("n_relevant", 0),
+                "n_retrieved": r.get("n_retrieved", 0),
+                "n_found": r.get("n_found", 0),
+                "recall": r.get("recall", 0),
+                "n_queries": r.get("n_queries", 0),
+                "time_query": r.get("time_query", 0),
+                "time_resolve": r.get("time_resolve", 0),
+                "time_total": r.get("time_query", 0) + r.get("time_resolve", 0),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def save_csv(results, path, print_summary=True):
+    """
+    Save results to CSV and optionally print summary.
+
+    Args:
+        results: Dict of mode -> list of result dicts, or a list.
+        path: Output CSV path.
+        print_summary: Print per-mode averages.
+    """
+    df = df_from_results(results)
+    df.to_csv(path, index=False)
+    print(f"Saved {len(df)} rows to {path}")
+
+    if print_summary and not df.empty:
+        summary = df.groupby("mode").agg({
+            "qid": "count",
+            "recall": ["mean", "median", "min", "max"],
+            "n_retrieved": "mean",
+            "n_found": "mean",
+            "n_relevant": "mean",
+            "time_total": "mean",
+        })
+        summary.columns = ["topics", "avg_recall", "med_recall", "min_recall",
+                           "max_recall", "avg_retrieved", "avg_found",
+                           "avg_relevant", "avg_time"]
+        print(f"\n{summary.to_string()}")
+
+    return df

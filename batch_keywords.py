@@ -29,7 +29,7 @@ Find the top five most important terms that could replace the key entity in a do
    
 2. ASSOCIATED_TERMS: Terms that don't fit to any entity but are relevant to the entire query. Think about good individual key phrases for finding relevant documents to the query that might have no overlap with the key entities. Find the top ten most impactful additional terms for the query. Specific terms and references are better than generic terms. 
 
-3. VERBS: For the relevant verbs in the query, find verbs that could instead be used in relevant documents.
+3. VERBS: For the relevant verbs in the query, find the top five verbs that could instead be used in relevant documents. 
 
 Format: JSON object. KEY_ENTITIES  keys contain term lists. An "ASSOCIATED" key contains topic-level terms. Order by specificity. Every term must be a phrase (1-4 words) that literally appears in real documents. Return ONLY valid JSON."""
 
