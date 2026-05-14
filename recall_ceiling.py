@@ -177,6 +177,7 @@ def retrieval_recall(
         index_dir=index_dir,
         tokenizer=tokenizer,
         max_doc_len=200 if save_inspection else 50,
+        ids_only=(mode == "ceiling"),
     )
     t_resolve = time.perf_counter() - t0
 

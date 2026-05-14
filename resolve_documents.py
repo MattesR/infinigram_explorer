@@ -24,11 +24,12 @@ def resolve_all_queries(
     queries: list[dict],
     index_dir: str,
     tokenizer=None,
-    max_doc_len: int = 20000,
+    max_doc_len: int = 200,
     token_width: int = 2,
     top_splade_filter: int = None,
     top_tokens: list[tuple] = None,
     scoring_terms: list[dict] = None,
+    ids_only: bool = False,
 ) -> list[dict]:
     """
     Take all queries with ptrs_by_shard/segment_by_shard, resolve to unique
@@ -198,10 +199,10 @@ def resolve_all_queries(
                     if doc_id is None:
                         doc_id = parsed_meta.get("docid", None)
 
-                # Decode text
+                # Decode text (skip if ids_only)
                 text = None
-                if tokenizer is not None:
-                    text = tokenizer.decode(tokens.tolist(), skip_special_tokens=True)
+                if tokenizer is not None and not ids_only:
+                    text = tokenizer.decode(tokens.tolist()[:max_doc_len], skip_special_tokens=True)
 
                 documents.append({
                     "shard": s,
