@@ -24,8 +24,8 @@ print('populating the variables')
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", add_bos_token=False, add_eos_token=False)
 engine = InfiniGramEngine(index_dir="/home/mruc/msmarco_segmented_index/", eos_token_id=tokenizer.eos_token_id)
 # splade = SparseEncoder("naver/splade-cocondenser-ensembledistil")
-first_query = "what makes up a community, including its definitions in various contexts like science and what it means to be a 'civilized community."
-input_ids = tokenizer.encode('community')
+# first_query = "what makes up a community, including its definitions in various contexts like science and what it means to be a 'civilized community."
+# input_ids = tokenizer.encode('community')
 qrels = load_qrels("./qrels.rag24.test-umbrela-all.txt")
 # q_query = splade.encode(first_query)
 # tokenizer_splade = AutoTokenizer.from_pretrained("naver/splade-cocondenser-ensembledistil")

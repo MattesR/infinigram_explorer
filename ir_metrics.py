@@ -1,71 +1,121 @@
 """
-Standard IR evaluation metrics.
+Standard IR evaluation metrics using pytrec_eval.
 
 Usage:
     from ir_metrics import compute_metrics
-    
-    metrics = compute_metrics(ranked_doc_ids, qrels, qid, top_k_list=[10, 100, 1000])
+
+    metrics = compute_metrics(ranked_doc_ids, ranked_scores, qrels, qid, top_k_list=[10, 100, 1000])
 """
 
-import math
+import pytrec_eval
 
 
-def compute_metrics(ranked_doc_ids, qrels, qid, top_k_list=None):
+def compute_metrics(ranked_doc_ids, qrels, qid, top_k_list=None, ranked_scores=None):
     """
-    Compute IR metrics for a ranked list of doc IDs.
+    Compute IR metrics for a ranked list of doc IDs using pytrec_eval.
 
     Args:
         ranked_doc_ids: List of doc IDs in ranked order (best first).
         qrels: Full qrels dict {qid: {doc_id: relevance}}.
         qid: Query ID.
         top_k_list: Cutoffs to evaluate at.
+        ranked_scores: Optional list of scores (same order as doc_ids).
+            If not provided, uses inverse rank as score.
 
     Returns dict with per-cutoff metrics and overall metrics.
     """
     if top_k_list is None:
         top_k_list = [10, 100, 1000]
 
-    relevant = {did: rel for did, rel in qrels.get(qid, {}).items() if rel > 0}
-    n_relevant = len(relevant)
+    # Build run dict: doc_id -> score
+    run = {}
+    for i, did in enumerate(ranked_doc_ids):
+        if ranked_scores is not None:
+            run[did] = float(ranked_scores[i])
+        else:
+            run[did] = float(len(ranked_doc_ids) - i)  # higher rank = higher score
 
-    results = {}
+    # Build qrel for this query
+    qrel_single = {qid: {str(did): int(rel) for did, rel in qrels.get(qid, {}).items()}}
+    run_single = {qid: {str(did): score for did, score in run.items()}}
 
+    # Build measure set
+    measures = set()
     for k in top_k_list:
-        top_k_ids = ranked_doc_ids[:k]
+        measures.add(f"ndcg_cut_{k}")
+        measures.add(f"recall_{k}")
+        measures.add(f"P_{k}")
+    measures.add("recip_rank")
+    measures.add("map")
 
-        # Recall
-        found = set(top_k_ids) & set(relevant.keys())
-        recall = len(found) / n_relevant if n_relevant else 0
+    evaluator = pytrec_eval.RelevanceEvaluator(qrel_single, measures)
+    eval_result = evaluator.evaluate(run_single)
 
-        # Precision
-        precision = len(found) / min(k, len(ranked_doc_ids)) if ranked_doc_ids else 0
+    query_metrics = eval_result.get(qid, {})
 
-        # nDCG@k
-        dcg = 0.0
-        for i, did in enumerate(top_k_ids):
-            rel = relevant.get(did, 0)
-            dcg += rel / math.log2(i + 2)  # i+2 because rank starts at 1
-
-        # Ideal DCG: sort all relevant by relevance descending
-        ideal_rels = sorted(relevant.values(), reverse=True)[:k]
-        idcg = sum(rel / math.log2(i + 2) for i, rel in enumerate(ideal_rels))
-        ndcg = dcg / idcg if idcg > 0 else 0
-
+    # Organize results
+    results = {}
+    for k in top_k_list:
         results[k] = {
-            "recall": recall,
-            "precision": precision,
-            "found": len(found),
-            "ndcg": ndcg,
+            "ndcg": query_metrics.get(f"ndcg_cut_{k}", 0),
+            "recall": query_metrics.get(f"recall_{k}", 0),
+            "precision": query_metrics.get(f"P_{k}", 0),
+            "found": int(query_metrics.get(f"recall_{k}", 0) *
+                        len({d: r for d, r in qrels.get(qid, {}).items() if r > 0})),
         }
 
-    # MRR (reciprocal rank of first relevant doc)
-    mrr = 0.0
-    for i, did in enumerate(ranked_doc_ids):
-        if did in relevant:
-            mrr = 1.0 / (i + 1)
-            break
-
-    results["mrr"] = mrr
-    results["n_relevant"] = n_relevant
+    results["mrr"] = query_metrics.get("recip_rank", 0)
+    results["map"] = query_metrics.get("map", 0)
+    results["n_relevant"] = len({d: r for d, r in qrels.get(qid, {}).items() if r > 0})
 
     return results
+
+
+def compute_metrics_batch(runs, qrels, top_k_list=None):
+    """
+    Compute metrics for multiple queries at once (more efficient).
+
+    Args:
+        runs: Dict of qid -> {doc_id: score}
+        qrels: Dict of qid -> {doc_id: relevance}
+        top_k_list: Cutoffs.
+
+    Returns dict of qid -> metrics dict.
+    """
+    if top_k_list is None:
+        top_k_list = [10, 100, 1000]
+
+    # Convert to string keys for pytrec_eval
+    qrel_str = {str(qid): {str(did): int(rel) for did, rel in docs.items()}
+                for qid, docs in qrels.items()}
+    run_str = {str(qid): {str(did): float(score) for did, score in docs.items()}
+               for qid, docs in runs.items()}
+
+    measures = set()
+    for k in top_k_list:
+        measures.add(f"ndcg_cut_{k}")
+        measures.add(f"recall_{k}")
+        measures.add(f"P_{k}")
+    measures.add("recip_rank")
+    measures.add("map")
+
+    evaluator = pytrec_eval.RelevanceEvaluator(qrel_str, measures)
+    all_results = evaluator.evaluate(run_str)
+
+    organized = {}
+    for qid, query_metrics in all_results.items():
+        results = {}
+        n_rel = len({d: r for d, r in qrels.get(qid, qrels.get(str(qid), {})).items() if r > 0})
+        for k in top_k_list:
+            results[k] = {
+                "ndcg": query_metrics.get(f"ndcg_cut_{k}", 0),
+                "recall": query_metrics.get(f"recall_{k}", 0),
+                "precision": query_metrics.get(f"P_{k}", 0),
+                "found": int(query_metrics.get(f"recall_{k}", 0) * n_rel),
+            }
+        results["mrr"] = query_metrics.get("recip_rank", 0)
+        results["map"] = query_metrics.get("map", 0)
+        results["n_relevant"] = n_rel
+        organized[qid] = results
+
+    return organized
