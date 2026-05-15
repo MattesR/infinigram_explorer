@@ -25,7 +25,7 @@ from trec_output import load_qrels
 from full_eval import load_topics
 from resolve_documents import resolve_all_queries
 from llm_keyword_filter import STOPWORDS
-import numpy as np
+
 
 def retrieval_recall(
     qid: str,
@@ -54,6 +54,7 @@ def retrieval_recall(
     max_combo_grab: int = 5000,
     prox_cross: int = 50,
     prox_assoc: int = 80,
+    ceiling_ablation: str = "full",
 ):
     """
     Run retrieval (no scoring/filtering) and compute raw recall against qrels.
@@ -73,27 +74,64 @@ def retrieval_recall(
 
         pieces = build_pieces(qid, expansions_path, tokenizer, engine, verbose=False)
 
-        # Grab every piece independently — no thresholds, no combos
+        # Ablation levels:
+        # "full" = key names + expansions + associated (default)
+        # "keys_expanded" = key names + expansions, no associated
+        # "keys_only" = only the aspect name keywords, no expansions, no associated
+
+        max_ceiling_count = 500000
         all_queries = []
+        skipped_broad = 0
+
         for aspect_name, piece_list in pieces["key_pieces"].items():
             for p in piece_list:
+                # For keys_only: skip expansion terms (only keep aspect name)
+                if ceiling_ablation == "keys_only":
+                    if p["description"].lower() != aspect_name.lower():
+                        continue
+
                 prox = prox_peek if len(p["cnf"]) > 1 else None
+                try:
+                    kwargs = {"max_clause_freq": max_clause_freq}
+                    if prox:
+                        kwargs["max_diff_tokens"] = prox
+                    cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
+                except Exception:
+                    cnt = 0
+                if cnt > max_ceiling_count:
+                    skipped_broad += 1
+                    continue
                 all_queries.append({
                     "type": "cnf",
                     "cnf": p["cnf"],
                     "max_diff_tokens": prox,
                     "description": p["description"],
+                    "estimated_count": cnt,
                     "level": "ceiling_key",
                 })
-        for p in pieces["associated"]:
-            prox = prox_peek if len(p["cnf"]) > 1 else None
-            all_queries.append({
-                "type": "cnf",
-                "cnf": p["cnf"],
-                "max_diff_tokens": prox,
-                "description": p["description"],
-                "level": "ceiling_assoc",
-            })
+
+        # Associated terms: only for "full" ablation
+        if ceiling_ablation == "full":
+            for p in pieces["associated"]:
+                prox = prox_peek if len(p["cnf"]) > 1 else None
+                try:
+                    kwargs = {"max_clause_freq": max_clause_freq}
+                    if prox:
+                        kwargs["max_diff_tokens"] = prox
+                    cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
+                except Exception:
+                    cnt = 0
+                if cnt > max_ceiling_count:
+                    skipped_broad += 1
+                    continue
+                all_queries.append({
+                    "type": "cnf",
+                    "cnf": p["cnf"],
+                    "max_diff_tokens": prox,
+                    "description": p["description"],
+                    "estimated_count": cnt,
+                    "level": "ceiling_assoc",
+                })
 
         executed = run_adaptive(engine, all_queries, max_clause_freq=max_clause_freq, verbose=False)
         peek = None
@@ -304,6 +342,8 @@ def compare_recall_ceiling(
     max_combo_grab: int = 5000,
     prox_cross: int = 50,
     prox_assoc: int = 80,
+    # Ceiling mode
+    ceiling_ablation: str = "full",
     # Return docs for reranking
     return_docs: bool = False,
 ):
@@ -375,6 +415,7 @@ def compare_recall_ceiling(
                 "max_combo_grab": max_combo_grab,
                 "prox_cross": prox_cross,
                 "prox_assoc": prox_assoc,
+                "ceiling_ablation": ceiling_ablation,
             }
 
             if save_inspection:
