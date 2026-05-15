@@ -53,16 +53,20 @@ def recalc_from_pickle(
     run_name = Path(results_path).parent.name
 
     rows = []
+    n_skipped = 0
 
     for r in results:
         qid = r["qid"]
         relevant = {did: rel for did, rel in qrels.get(qid, {}).items() if rel > 0}
 
-        # Pool
-        if "pool" in stages and r.get("pool_docs"):
-            pool_ids = [d["doc_id"] for d in r["pool_docs"]]
-            pool_found = len(set(pool_ids) & set(relevant.keys()))
+        # Common pool stats
+        pool_ids = [d["doc_id"] for d in r.get("pool_docs", [])] if r.get("pool_docs") else []
+        pool_found = len(set(pool_ids) & set(relevant.keys()))
+        pool_recall = pool_found / len(relevant) if relevant else 0
+        pool_size = len(pool_ids)
 
+        # Pool
+        if "pool" in stages and pool_ids:
             metrics = compute_metrics(pool_ids, qrels, qid, top_k_list=top_k_list)
 
             row = {
@@ -71,8 +75,8 @@ def recalc_from_pickle(
                 "qid": qid,
                 "n_relevant": len(relevant),
                 "pool_found": pool_found,
-                "pool_recall": pool_found / len(relevant) if relevant else 0,
-                "pool_size": len(pool_ids),
+                "pool_recall": pool_recall,
+                "pool_size": pool_size,
                 "mrr": metrics["mrr"],
                 "map": metrics.get("map", 0),
             }
@@ -87,8 +91,6 @@ def recalc_from_pickle(
         if "biencoder" in stages and r.get("biencoder_ranked"):
             bi_ids = [d["doc_id"] for d in r["biencoder_ranked"]]
             bi_scores = [d.get("score", len(bi_ids) - i) for i, d in enumerate(r["biencoder_ranked"])]
-            pool_ids = [d["doc_id"] for d in r.get("pool_docs", [])]
-            pool_found = len(set(pool_ids) & set(relevant.keys()))
 
             metrics = compute_metrics(bi_ids, qrels, qid, top_k_list=top_k_list,
                                        ranked_scores=bi_scores)
@@ -99,7 +101,9 @@ def recalc_from_pickle(
                 "qid": qid,
                 "n_relevant": len(relevant),
                 "pool_found": pool_found,
-                "n_input": r.get("pool_size", len(pool_ids)),
+                "pool_recall": pool_recall,
+                "pool_size": pool_size,
+                "n_input": r.get("pool_size", pool_size),
                 "n_output": len(bi_ids),
                 "mrr": metrics["mrr"],
                 "map": metrics.get("map", 0),
@@ -115,8 +119,6 @@ def recalc_from_pickle(
         if "crossencoder" in stages and r.get("crossencoder_ranked"):
             ce_ids = [d["doc_id"] for d in r["crossencoder_ranked"]]
             ce_scores = [d.get("score", len(ce_ids) - i) for i, d in enumerate(r["crossencoder_ranked"])]
-            pool_ids = [d["doc_id"] for d in r.get("pool_docs", [])]
-            pool_found = len(set(pool_ids) & set(relevant.keys()))
 
             metrics = compute_metrics(ce_ids, qrels, qid, top_k_list=top_k_list,
                                        ranked_scores=ce_scores)
@@ -127,6 +129,8 @@ def recalc_from_pickle(
                 "qid": qid,
                 "n_relevant": len(relevant),
                 "pool_found": pool_found,
+                "pool_recall": pool_recall,
+                "pool_size": pool_size,
                 "n_input": len(r.get("biencoder_ranked", [])),
                 "n_output": len(ce_ids),
                 "mrr": metrics["mrr"],
@@ -139,6 +143,10 @@ def recalc_from_pickle(
                 row[f"found_{k}"] = metrics[k]["found"]
             rows.append(row)
 
+        if not pool_ids and not r.get("biencoder_ranked") and not r.get("crossencoder_ranked"):
+            n_skipped += 1
+            continue
+
     df = pd.DataFrame(rows)
 
     if output_csv is None:
@@ -148,6 +156,8 @@ def recalc_from_pickle(
 
     if verbose:
         print(f"Recalculated metrics for {len(results)} queries from {results_path}")
+        if n_skipped:
+            print(f"  Skipped {n_skipped} queries with no results")
         print(f"Saved to {output_csv}")
         _print_summary(df, top_k_list)
 
@@ -155,33 +165,52 @@ def recalc_from_pickle(
 
 
 def recalc_all_runs(
-    runs_dir: str,
-    qrels_path: str,
+    base_dir: str,
     stages: list = None,
     top_k_list: list = None,
+    qrels_filename: str = "qrels.txt",
+    results_filename: str = "results.pkl",
     verbose: bool = True,
 ):
     """
     Recalculate metrics for all results.pkl files in a directory tree.
+    Expects qrels to be in the same folder as results.pkl.
+
+    Directory structure:
+        base_dir/
+            dataset1/
+                qrels.txt
+                results.pkl
+            dataset2/
+                qrels.txt
+                results.pkl
 
     Returns combined DataFrame across all runs.
     """
     if top_k_list is None:
         top_k_list = [10, 100, 1000]
 
-    pkl_files = sorted(glob(os.path.join(runs_dir, "**/results.pkl"), recursive=True))
+    pkl_files = sorted(glob(os.path.join(base_dir, f"**/{results_filename}"), recursive=True))
 
     if verbose:
-        print(f"Found {len(pkl_files)} result files in {runs_dir}")
+        print(f"Found {len(pkl_files)} result files in {base_dir}")
 
     all_dfs = []
     for pkl_path in pkl_files:
-        run_name = Path(pkl_path).parent.name
+        run_dir = Path(pkl_path).parent
+        run_name = run_dir.name
+        qrels_path = run_dir / qrels_filename
+
+        if not qrels_path.exists():
+            if verbose:
+                print(f"  {run_name}: no {qrels_filename}, skipping")
+            continue
+
         if verbose:
             print(f"\n  Processing: {run_name}")
         try:
             df = recalc_from_pickle(
-                pkl_path, qrels_path,
+                str(pkl_path), str(qrels_path),
                 stages=stages, top_k_list=top_k_list,
                 verbose=False,
             )
@@ -196,7 +225,7 @@ def recalc_all_runs(
     combined = pd.concat(all_dfs, ignore_index=True)
 
     # Save combined CSV
-    combined_path = os.path.join(runs_dir, "all_metrics.csv")
+    combined_path = os.path.join(base_dir, "all_metrics.csv")
     combined.to_csv(combined_path, index=False)
 
     if verbose:
@@ -217,6 +246,9 @@ def _print_summary(df, top_k_list):
         print(f"\n  {stage.upper()} ({n} queries):")
         print(f"    MRR: {sdf['mrr'].mean():.4f}")
         print(f"    MAP: {sdf['map'].mean():.4f}")
+        if "pool_recall" in sdf.columns:
+            print(f"    Pool recall: {sdf['pool_recall'].mean():.4f}")
+            print(f"    Avg pool size: {sdf['pool_size'].mean():.0f}")
         header = "    "
         for k in top_k_list:
             header += f"{'nDCG@'+str(k):>10s} {'R@'+str(k):>8s}"

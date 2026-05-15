@@ -25,7 +25,7 @@ from trec_output import load_qrels
 from full_eval import load_topics
 from resolve_documents import resolve_all_queries
 from llm_keyword_filter import STOPWORDS
-
+import numpy as np
 
 def retrieval_recall(
     qid: str,
@@ -581,3 +581,29 @@ def save_csv(results, path, print_summary=True):
         print(f"\n{summary.to_string()}")
 
     return df
+
+
+def pool_metrics(df, common_only=True):
+    if common_only:
+        common_qids = set.intersection(*[set(df[df["mode"] == m]["qid"]) for m in df["mode"].unique()])
+        df = df[df["qid"].isin(common_qids)]
+        print(f"Filtering to {len(common_qids)} common qids\n")
+
+    for mode in df["mode"].unique():
+        mdf = df[df["mode"] == mode]
+        recall = mdf["recall"]
+        precision = mdf["n_found"] / mdf["n_retrieved"]
+
+        # CVaR (Conditional Value at Risk) = mean of bottom 10% recalls
+        sorted_recall = recall.sort_values()
+        n_tail = max(1, int(len(sorted_recall) * 0.1))
+        cvar = sorted_recall.iloc[:n_tail].mean()
+
+        print(f"{mode} ({len(mdf)} queries):")
+        print(f"  Mean Recall:       {recall.mean():.4f}")
+        print(f"  Std Recall:        {recall.std():.4f}")
+        print(f"  Median Recall:     {recall.median():.4f}")
+        print(f"  CVaR (bottom 10%): {cvar:.4f}")
+        print(f"  Avg Retrieved:     {mdf['n_retrieved'].mean():.0f}")
+        print(f"  Mean Prec@Pool:    {precision.mean():.6f}")
+        print()

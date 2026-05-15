@@ -270,12 +270,16 @@ def peek_and_grab(
     if verbose:
         total_grabbed = sum(q["estimated_count"] for q in grabbed)
         n_rem_key = sum(len(v) for v in remaining_key_pieces.values())
+        total_remaining_key = sum(p["count"] for pieces in remaining_key_pieces.values() for p in pieces)
+        total_remaining_assoc = sum(p["count"] for p in remaining_assoc_pieces)
+        total_all = total_grabbed + total_remaining_key + total_remaining_assoc
         print(f"\n{'='*70}")
         print(f"Peek summary:")
         print(f"  Grabbed: {len(grabbed)} queries, ~{total_grabbed:,d} docs")
         print(f"  Grabbed aspects: {grabbed_aspects or 'none'}")
-        print(f"  Remaining key: {n_rem_key}")
-        print(f"  Remaining associated: {len(remaining_assoc_pieces)}")
+        print(f"  Remaining key: {n_rem_key} pieces, ~{total_remaining_key:,d} docs")
+        print(f"  Remaining associated: {len(remaining_assoc_pieces)} pieces, ~{total_remaining_assoc:,d} docs")
+        print(f"  Total all pieces: ~{total_all:,d} docs (upper bound)")
         print(f"{'='*70}")
 
     return {
