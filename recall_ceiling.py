@@ -79,9 +79,7 @@ def retrieval_recall(
         # "keys_expanded" = key names + expansions, no associated
         # "keys_only" = only the aspect name keywords, no expansions, no associated
 
-        max_ceiling_count = 500000
         all_queries = []
-        skipped_broad = 0
 
         for aspect_name, piece_list in pieces["key_pieces"].items():
             for p in piece_list:
@@ -98,8 +96,7 @@ def retrieval_recall(
                     cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
                 except Exception:
                     cnt = 0
-                if cnt > max_ceiling_count:
-                    skipped_broad += 1
+                if cnt == 0:
                     continue
                 all_queries.append({
                     "type": "cnf",
@@ -121,8 +118,7 @@ def retrieval_recall(
                     cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
                 except Exception:
                     cnt = 0
-                if cnt > max_ceiling_count:
-                    skipped_broad += 1
+                if cnt == 0:
                     continue
                 all_queries.append({
                     "type": "cnf",
