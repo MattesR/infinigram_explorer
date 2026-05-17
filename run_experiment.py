@@ -31,7 +31,7 @@ DEFAULT_EXPERIMENT_CONFIG = {
     "out_path": None,  # defaults to config file's directory
 
     # Index and tokenizer
-    "index_dir": "/home/mruc/first_index/",
+    "index_dir": "/home/mruc/msmarco_segmented_index/",
     "tokenizer_name": "meta-llama/Llama-2-7b-hf",
 
     # Stages to run

@@ -25,6 +25,12 @@ from trec_output import load_qrels
 from full_eval import load_topics
 from resolve_documents import resolve_all_queries
 from llm_keyword_filter import STOPWORDS
+from itertools import product as _itertools_product
+
+
+def _cross_product(piece_lists):
+    """Cross-product of piece lists. Each item is a tuple of one piece per list."""
+    return list(_itertools_product(*piece_lists))
 
 
 def retrieval_recall(
@@ -75,59 +81,167 @@ def retrieval_recall(
         pieces = build_pieces(qid, expansions_path, tokenizer, engine, verbose=False)
 
         # Ablation levels:
-        # "full" = key names + expansions + associated (default)
+        # "full" = key names + expansions + associated, all fired independently (default)
         # "keys_expanded" = key names + expansions, no associated
         # "keys_only" = only the aspect name keywords, no expansions, no associated
+        # "3way_and" = all possible 3-way AND combinations (aspect×aspect×aspect,
+        #              aspect×aspect×associated)
+        # "2way_and" = all possible 2-way AND combinations (aspect×aspect,
+        #              aspect×associated)
 
         all_queries = []
 
-        for aspect_name, piece_list in pieces["key_pieces"].items():
-            for p in piece_list:
-                # For keys_only: skip expansion terms (only keep aspect name)
-                if ceiling_ablation == "keys_only":
-                    if p["description"].lower() != aspect_name.lower():
-                        continue
+        if ceiling_ablation in ("3way_and", "2way_and"):
+            from itertools import combinations
 
-                prox = prox_peek if len(p["cnf"]) > 1 else None
-                try:
-                    kwargs = {"max_clause_freq": max_clause_freq}
-                    if prox:
-                        kwargs["max_diff_tokens"] = prox
-                    cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
-                except Exception:
-                    cnt = 0
-                if cnt == 0:
-                    continue
-                all_queries.append({
-                    "type": "cnf",
-                    "cnf": p["cnf"],
-                    "max_diff_tokens": prox,
-                    "description": p["description"],
-                    "estimated_count": cnt,
-                    "level": "ceiling_key",
-                })
+            # Collect all pieces grouped by source
+            # Each aspect is a source, all associated terms are individual sources
+            source_pieces = {}  # source_name -> [piece, ...]
 
-        # Associated terms: only for "full" ablation
-        if ceiling_ablation == "full":
+            for aspect_name, piece_list in pieces["key_pieces"].items():
+                source_pieces[f"key:{aspect_name}"] = []
+                for p in piece_list:
+                    source_pieces[f"key:{aspect_name}"].append(p)
+
             for p in pieces["associated"]:
-                prox = prox_peek if len(p["cnf"]) > 1 else None
-                try:
-                    kwargs = {"max_clause_freq": max_clause_freq}
-                    if prox:
-                        kwargs["max_diff_tokens"] = prox
-                    cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
-                except Exception:
-                    cnt = 0
-                if cnt == 0:
-                    continue
-                all_queries.append({
-                    "type": "cnf",
-                    "cnf": p["cnf"],
-                    "max_diff_tokens": prox,
-                    "description": p["description"],
-                    "estimated_count": cnt,
-                    "level": "ceiling_assoc",
-                })
+                # Each associated term is its own source
+                source_pieces[f"assoc:{p['description']}"] = [p]
+
+            source_names = list(source_pieces.keys())
+            aspect_sources = [s for s in source_names if s.startswith("key:")]
+            assoc_sources = [s for s in source_names if s.startswith("assoc:")]
+
+            if ceiling_ablation == "3way_and":
+                # Generate all 3-way combinations of sources
+                # At least 2 must be aspects (aspect×aspect×aspect or aspect×aspect×assoc)
+                combos_3 = []
+                # 3 aspects
+                for combo in combinations(aspect_sources, 3):
+                    combos_3.append(combo)
+                # 2 aspects + 1 associated
+                for a_combo in combinations(aspect_sources, 2):
+                    for assoc in assoc_sources:
+                        combos_3.append((*a_combo, assoc))
+
+                # For each combo, fire all piece combinations
+                for combo in combos_3:
+                    has_assoc = any(s.startswith("assoc:") for s in combo)
+                    level = "ceiling_3way_with_assoc" if has_assoc else "ceiling_3way_keys"
+                    # Get piece lists for each source
+                    piece_lists = [source_pieces[s] for s in combo]
+                    # Cross-product of pieces
+                    for piece_combo in _cross_product(piece_lists):
+                        cnf = []
+                        descs = []
+                        for p in piece_combo:
+                            cnf.extend(p["cnf"])
+                            descs.append(p["description"])
+
+                        desc = " AND ".join(descs)
+                        try:
+                            cnt = engine.count_cnf(
+                                cnf, max_clause_freq=max_clause_freq,
+                                max_diff_tokens=prox_cross,
+                            ).get("count", 0)
+                        except Exception:
+                            cnt = 0
+                        if cnt == 0:
+                            continue
+                        all_queries.append({
+                            "type": "cnf",
+                            "cnf": cnf,
+                            "max_diff_tokens": prox_cross,
+                            "description": desc,
+                            "estimated_count": cnt,
+                            "level": level,
+                        })
+
+            elif ceiling_ablation == "2way_and":
+                # Generate all 2-way combinations
+                # aspect×aspect
+                combos_2 = list(combinations(aspect_sources, 2))
+                # aspect×associated
+                for aspect in aspect_sources:
+                    for assoc in assoc_sources:
+                        combos_2.append((aspect, assoc))
+
+                for combo in combos_2:
+                    has_assoc = any(s.startswith("assoc:") for s in combo)
+                    level = "ceiling_2way_with_assoc" if has_assoc else "ceiling_2way_keys"
+                    piece_lists = [source_pieces[s] for s in combo]
+                    for piece_combo in _cross_product(piece_lists):
+                        cnf = []
+                        descs = []
+                        for p in piece_combo:
+                            cnf.extend(p["cnf"])
+                            descs.append(p["description"])
+
+                        desc = " AND ".join(descs)
+                        try:
+                            cnt = engine.count_cnf(
+                                cnf, max_clause_freq=max_clause_freq,
+                                max_diff_tokens=prox_cross,
+                            ).get("count", 0)
+                        except Exception:
+                            cnt = 0
+                        if cnt == 0:
+                            continue
+                        all_queries.append({
+                            "type": "cnf",
+                            "cnf": cnf,
+                            "max_diff_tokens": prox_cross,
+                            "description": desc,
+                            "estimated_count": cnt,
+                            "level": level,
+                        })
+
+        else:
+            # Original ceiling modes: fire pieces independently
+            for aspect_name, piece_list in pieces["key_pieces"].items():
+                for p in piece_list:
+                    if ceiling_ablation == "keys_only":
+                        if p["description"].lower() != aspect_name.lower():
+                            continue
+
+                    prox = prox_peek if len(p["cnf"]) > 1 else None
+                    try:
+                        kwargs = {"max_clause_freq": max_clause_freq}
+                        if prox:
+                            kwargs["max_diff_tokens"] = prox
+                        cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
+                    except Exception:
+                        cnt = 0
+                    if cnt == 0:
+                        continue
+                    all_queries.append({
+                        "type": "cnf",
+                        "cnf": p["cnf"],
+                        "max_diff_tokens": prox,
+                        "description": p["description"],
+                        "estimated_count": cnt,
+                        "level": "ceiling_key",
+                    })
+
+            if ceiling_ablation == "full":
+                for p in pieces["associated"]:
+                    prox = prox_peek if len(p["cnf"]) > 1 else None
+                    try:
+                        kwargs = {"max_clause_freq": max_clause_freq}
+                        if prox:
+                            kwargs["max_diff_tokens"] = prox
+                        cnt = engine.count_cnf(p["cnf"], **kwargs).get("count", 0)
+                    except Exception:
+                        cnt = 0
+                    if cnt == 0:
+                        continue
+                    all_queries.append({
+                        "type": "cnf",
+                        "cnf": p["cnf"],
+                        "max_diff_tokens": prox,
+                        "description": p["description"],
+                        "estimated_count": cnt,
+                        "level": "ceiling_assoc",
+                    })
 
         executed = run_adaptive(engine, all_queries, max_clause_freq=max_clause_freq, verbose=False)
         peek = None
@@ -236,6 +350,14 @@ def retrieval_recall(
     if mode == "progressive":
         result["peek"] = peek
         result["executed"] = executed
+
+    # Store lightweight query summary for ceiling mode (no pointers)
+    if mode == "ceiling":
+        result["query_summary"] = [
+            {"level": q["level"], "description": q["description"],
+             "estimated_count": q.get("estimated_count", 0)}
+            for q in all_queries
+        ]
 
     # Save inspection files if requested
     if save_inspection and inspection_dir:
@@ -618,29 +740,3 @@ def save_csv(results, path, print_summary=True):
         print(f"\n{summary.to_string()}")
 
     return df
-
-
-def pool_metrics(df, common_only=True):
-    if common_only:
-        common_qids = set.intersection(*[set(df[df["mode"] == m]["qid"]) for m in df["mode"].unique()])
-        df = df[df["qid"].isin(common_qids)]
-        print(f"Filtering to {len(common_qids)} common qids\n")
-
-    for mode in df["mode"].unique():
-        mdf = df[df["mode"] == mode]
-        recall = mdf["recall"]
-        precision = mdf["n_found"] / mdf["n_retrieved"]
-
-        # CVaR (Conditional Value at Risk) = mean of bottom 10% recalls
-        sorted_recall = recall.sort_values()
-        n_tail = max(1, int(len(sorted_recall) * 0.1))
-        cvar = sorted_recall.iloc[:n_tail].mean()
-
-        print(f"{mode} ({len(mdf)} queries):")
-        print(f"  Mean Recall:       {recall.mean():.4f}")
-        print(f"  Std Recall:        {recall.std():.4f}")
-        print(f"  Median Recall:     {recall.median():.4f}")
-        print(f"  CVaR (bottom 10%): {cvar:.4f}")
-        print(f"  Avg Retrieved:     {mdf['n_retrieved'].mean():.0f}")
-        print(f"  Mean Prec@Pool:    {precision.mean():.6f}")
-        print()
