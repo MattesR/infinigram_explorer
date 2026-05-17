@@ -226,6 +226,10 @@ def resolve_all_queries(
 
     # Process shards in parallel (thread-safe: each shard has separate files)
     documents = []
+    if not by_shard:
+        print("No documents to resolve.")
+        return documents
+
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=len(by_shard)) as pool:
         futures = [pool.submit(_process_shard, s, doc_list)

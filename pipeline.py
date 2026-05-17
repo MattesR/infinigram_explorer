@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
 
     # Step 4: Resolve
     "max_doc_len": 2000,
-    "index_dir": "/home/mruc/msmarco_segmented_index/",
+    "index_dir": "../msmarco_segmented_index/",
 
     # Step 5: Bi-encoder
     "biencoder_top_k": 1000,
@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def _build_pieces_from_expansion(expansion, tokenizer, engine):
+def _build_pieces_from_expansion(qid, expansion, tokenizer, engine):
     """Build CNF pieces directly from expansion dict (no file needed)."""
     from progressive_queries import _make_term_piece
 
@@ -147,7 +147,7 @@ def run_pipeline(
 
     from progressive_queries import peek_and_grab
 
-    pieces = _build_pieces_from_expansion(expansion, tokenizer, engine)
+    pieces = _build_pieces_from_expansion(qid, expansion, tokenizer, engine)
     peek = peek_and_grab(
         pieces, engine, tokenizer,
         max_standalone_key=cfg["max_standalone_key"],
@@ -199,6 +199,13 @@ def run_pipeline(
         tokenizer=tokenizer,
         max_doc_len=cfg["max_doc_len"],
     )
+
+    if not pool_docs:
+        print(f"  [{qid}] WARNING: 0 docs resolved")
+        print(f"    All queries: {len(all_queries)}, Executed: {len(executed)}")
+        print(f"    Grabbed: {len(peek.get('grabbed', []))}")
+        for q in all_queries[:5]:
+            print(f"      {q.get('description', '?')}: cnt={q.get('estimated_count', '?')}")
 
     # Deduplicate
     seen = set()
