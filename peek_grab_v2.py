@@ -141,11 +141,13 @@ def peek_and_grab_v2(
           f"{len(remaining_key)} key + {len(remaining_assoc)} assoc remaining")
 
     # ================================================================
-    # Phase 2: Combo peek (2-way ANDs from remaining KEY pieces only)
+    # Phase 2: Combo peek (2-way ANDs from remaining pieces)
+    #   - key × key (cross-aspect)
+    #   - key × assoc
     # ================================================================
     if verbose:
         print(f"\n{'='*70}")
-        print(f"Phase 2: Combo peek — 2-way ANDs from remaining key pieces")
+        print(f"Phase 2: Combo peek — 2-way ANDs from remaining pieces")
         print(f"{'='*70}")
 
     # Group remaining key pieces by aspect
@@ -158,6 +160,7 @@ def peek_and_grab_v2(
     combo_queries = []
     n_combo_checked = 0
 
+    # Key × key (cross-aspect)
     if len(aspect_names) >= 2:
         for a, b in combinations(aspect_names, 2):
             for p_a in remaining_by_aspect[a]:
@@ -184,12 +187,42 @@ def peek_and_grab_v2(
                         "max_diff_tokens": prox_cross,
                         "description": desc,
                         "estimated_count": cnt,
-                        "level": "S_combo",
-                        "aspects": (a, b),
+                        "level": "S_combo_kk",
                     })
 
                     if verbose:
-                        print(f"  {desc}: {cnt:>10,d}")
+                        print(f"  [k×k] {desc}: {cnt:>10,d}")
+
+    # Key × assoc
+    for desc_k, info_k in remaining_key.items():
+        for desc_a, info_a in remaining_assoc.items():
+            cnf = info_k["piece"]["cnf"] + info_a["piece"]["cnf"]
+            desc = f"({info_k['piece']['description']}) AND ({info_a['piece']['description']})"
+
+            try:
+                cnt = engine.count_cnf(
+                    cnf, max_clause_freq=max_clause_freq,
+                    max_diff_tokens=prox_cross,
+                ).get("count", 0)
+            except Exception:
+                cnt = 0
+
+            n_combo_checked += 1
+
+            if cnt == 0:
+                continue
+
+            combo_queries.append({
+                "type": "cnf",
+                "cnf": cnf,
+                "max_diff_tokens": prox_cross,
+                "description": desc,
+                "estimated_count": cnt,
+                "level": "S_combo_ka",
+            })
+
+            if verbose:
+                print(f"  [k×a] {desc}: {cnt:>10,d}")
 
     # Sort by count (tightest first)
     combo_queries.sort(key=lambda q: q["estimated_count"])
