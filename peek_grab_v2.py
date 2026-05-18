@@ -33,7 +33,6 @@ def peek_and_grab_v2(
     prox_cross=50,
     max_budget=20000,
     max_assoc_combo=50000,
-    max_tighten_attempts=20,
     verbose=True,
     _pieces=None,
 ):
@@ -238,124 +237,47 @@ def peek_and_grab_v2(
                 if verbose:
                     print(f"  [k×a] {desc}: {cnt:>10,d}")
 
-    # Sort by count (tightest first)
-    combo_queries.sort(key=lambda q: q["estimated_count"])
+    # Sort: k×k first (by count asc), then k×a (by count asc)
+    combo_kk = sorted([q for q in combo_queries if q["level"] == "S_combo_kk"],
+                       key=lambda q: q["estimated_count"])
+    combo_ka = sorted([q for q in combo_queries if q["level"] == "S_combo_ka"],
+                       key=lambda q: q["estimated_count"])
+    combo_queries = combo_kk + combo_ka
 
     combo_total = sum(q["estimated_count"] for q in combo_queries)
     remaining_assoc_total = sum(i["count"] for i in remaining_assoc.values())
 
     print(f"  [{qid}] Phase 2: {n_combo_checked} combos checked, "
-          f"{len(combo_queries)} with hits (~{combo_total:,d} docs). "
+          f"{len(combo_kk)} k×k + {len(combo_ka)} k×a with hits (~{combo_total:,d} docs). "
           f"Total so far: ~{grabbed_total + combo_total:,d} / {max_budget:,d} budget")
 
-    # Sort by count (tightest first)
-    combo_queries.sort(key=lambda q: q["estimated_count"])
-
-    combo_total = sum(q["estimated_count"] for q in combo_queries)
-    remaining_assoc_total = sum(i["count"] for i in remaining_assoc.values())
-
     # ================================================================
-    # Phase 3: Tighten broad queries if over budget
+    # Phase 3: Budget cut — only keep combos that fit
     # ================================================================
     budget = max_budget
-    all_fire_queries = list(grabbed) + list(combo_queries)
-    current_total = sum(q["estimated_count"] for q in all_fire_queries)
-    tightened = []
+    budget_remaining = budget - grabbed_total
+    tightened = []  # kept for compatibility
 
-    if current_total > budget and remaining_assoc and all_fire_queries:
-        if verbose:
-            print(f"\n{'='*70}")
-            print(f"Phase 3: Over budget ({current_total:,d} > {budget:,d}), tightening broadest queries")
-            print(f"{'='*70}")
+    if combo_total > budget_remaining:
+        kept_combos = []
+        running = 0
+        skipped_combos = 0
+        for q in combo_queries:
+            if running + q["estimated_count"] <= budget_remaining:
+                kept_combos.append(q)
+                running += q["estimated_count"]
+            else:
+                skipped_combos += 1
 
-        # Sort ALL queries by count descending — tighten broadest first
-        all_fire_queries.sort(key=lambda q: q["estimated_count"], reverse=True)
-
-        i = 0
-        attempts = 0
-        while current_total > budget and i < len(all_fire_queries) and attempts < max_tighten_attempts:
-            query_q = all_fire_queries[i]
-            original_count = query_q["estimated_count"]
-
-            # Skip if already tight enough
-            if original_count <= 100:
-                i += 1
-                continue
-
-            attempts += 1
-
-            if verbose:
-                print(f"\n  Tightening: {query_q['description']} ({original_count:,d}) [{query_q['level']}]")
-
-            # AND this query with each remaining assoc term
-            # Skip assoc terms already used in this query
-            already_used = query_q.get("assoc_used", "")
-            replacement_queries = []
-            for desc, assoc_info in remaining_assoc.items():
-                if desc == already_used or f"({desc})" in query_q["description"]:
-                    continue
-                cnf = query_q["cnf"] + assoc_info["piece"]["cnf"]
-                new_desc = f"{query_q['description']} AND ({desc})"
-
-                try:
-                    cnt = engine.count_cnf(
-                        cnf, max_clause_freq=max_clause_freq,
-                        max_diff_tokens=prox_cross,
-                    ).get("count", 0)
-                except Exception:
-                    cnt = 0
-
-                if cnt == 0:
-                    continue
-
-                replacement_queries.append({
-                    "type": "cnf",
-                    "cnf": cnf,
-                    "max_diff_tokens": prox_cross,
-                    "description": new_desc,
-                    "estimated_count": cnt,
-                    "level": "S_tightened",
-                    "original": query_q["description"],
-                })
-
-                if verbose:
-                    print(f"    {new_desc}: {cnt:>10,d}")
-
-            replacement_total = sum(q["estimated_count"] for q in replacement_queries)
-
-            # Only replace if tightening actually reduces the count
-            if replacement_total >= original_count or not replacement_queries:
-                if verbose:
-                    print(f"    Tightening didn't help ({replacement_total:,d} >= {original_count:,d}), keeping original")
-                i += 1
-                continue
-
-            # Replace original with tightened versions
-            all_fire_queries.pop(i)
-            all_fire_queries.extend(replacement_queries)
-            tightened.append({
-                "original": query_q["description"],
-                "original_level": query_q["level"],
-                "original_count": original_count,
-                "replacements": len(replacement_queries),
-                "replacement_total": replacement_total,
-            })
-
-            current_total = current_total - original_count + replacement_total
-
-            if verbose:
-                print(f"    Replaced {original_count:,d} with {replacement_total:,d} "
-                      f"({len(replacement_queries)} queries). New total: {current_total:,d}")
-
-            # Don't increment i — next broadest is now at position i
-
-        print(f"  [{qid}] Phase 3: tightened {len(tightened)} broad queries. "
-              f"Final total: ~{current_total:,d} / {budget:,d} budget")
+        print(f"  [{qid}] Phase 3: budget cut — kept {len(kept_combos)} combos (~{running:,d} docs), "
+              f"skipped {skipped_combos}. Total: ~{grabbed_total + running:,d} / {budget:,d}")
+        combo_queries = kept_combos
+        combo_total = running
     else:
-        if current_total <= budget:
-            print(f"  [{qid}] Phase 3: skipped (under budget: ~{current_total:,d} / {budget:,d})")
-        elif not remaining_assoc:
-            print(f"  [{qid}] Phase 3: skipped (no assoc terms for tightening, ~{current_total:,d} docs)")
+        print(f"  [{qid}] Phase 3: all combos fit (~{grabbed_total + combo_total:,d} / {budget:,d})")
+
+    all_fire_queries = list(grabbed) + list(combo_queries)
+    current_total = grabbed_total + combo_total
 
     # Split back into grabbed and combos for clarity
     grabbed = [q for q in all_fire_queries if q["level"].startswith("S0")]
