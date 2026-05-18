@@ -58,7 +58,6 @@ DEFAULT_CONFIG = {
     "max_budget": 20000,
     "prox_cross": 100,
     "max_assoc_combo": 50000,
-    "max_tighten_attempts": 20,
 
     # Resolve
     "max_doc_len": 2000,
@@ -159,7 +158,6 @@ def run_pipeline(
         prox_cross=cfg["prox_cross"],
         max_budget=cfg["max_budget"],
         max_assoc_combo=cfg.get("max_assoc_combo", 50000),
-        max_tighten_attempts=cfg.get("max_tighten_attempts", 20),
         verbose=verbose,
         # Pass pre-built pieces
         _pieces=_build_pieces_from_expansion(qid, expansion, tokenizer, engine),
