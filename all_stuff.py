@@ -19,6 +19,7 @@ from progressive_queries import build_pieces, peek_and_grab, build_combination_q
 from adaptive_queries import run_adaptive
 from trec_output import load_qrels
 from infini_gram.engine import InfiniGramEngine
+from peek_grab_v2 import peek_and_grab_v2
 
 print('populating the variables')
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", add_bos_token=False, add_eos_token=False)

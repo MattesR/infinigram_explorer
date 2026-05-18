@@ -262,8 +262,14 @@ def peek_and_grab_v2(
         kept_combos = []
         running = 0
         skipped_combos = 0
+        cheap_ka_threshold = max_standalone_assoc / 2
+
         for q in combo_queries:
-            if running + q["estimated_count"] <= budget_remaining:
+            # Always add cheap k×a combos (let budget overflow)
+            if q["level"] == "S_combo_ka" and q["estimated_count"] <= cheap_ka_threshold:
+                kept_combos.append(q)
+                running += q["estimated_count"]
+            elif running + q["estimated_count"] <= budget_remaining:
                 kept_combos.append(q)
                 running += q["estimated_count"]
             else:
