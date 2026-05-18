@@ -48,28 +48,26 @@ from ir_metrics import compute_metrics
 
 
 DEFAULT_CONFIG = {
-    # Step 2: Peek and grab
+    # Peek and grab
     "max_standalone_key": 1500,
     "max_standalone_assoc": 750,
     "prox_peek": 10,
-    "max_clause_freq": 80000000,
+    "max_clause_freq": 2000000,
 
-    # Step 3: Combination queries
-    "max_docs": 20000,
+    # Budget and proximity
+    "max_budget": 20000,
     "prox_cross": 100,
-    "prox_assoc": 100,
-    "max_total": 200,
 
-    # Step 4: Resolve
+    # Resolve
     "max_doc_len": 2000,
     "index_dir": "../msmarco_segmented_index/",
 
-    # Step 5: Bi-encoder
+    # Bi-encoder
     "biencoder_top_k": 1000,
     "biencoder_batch_size": 256,
     "biencoder_max_doc_length": 512,
 
-    # Step 6: Cross-encoder
+    # Cross-encoder
     "crossencoder_top_k": 100,
     "crossencoder_batch_size": 32,
     "crossencoder_max_length": 512,
@@ -141,43 +139,30 @@ def run_pipeline(
     timings = {}
 
     # ================================================================
-    # Step 1-2: Build pieces + Peek and grab
+    # Step 1-2: Two-phase peek and grab
     # ================================================================
     t0 = time.perf_counter()
 
-    from progressive_queries import peek_and_grab
+    from peek_grab_v2 import peek_and_grab_v2
 
-    pieces = _build_pieces_from_expansion(qid, expansion, tokenizer, engine)
-    peek = peek_and_grab(
-        pieces, engine, tokenizer,
+    peek_result = peek_and_grab_v2(
+        qid=qid,
+        expansions_path=None,  # not used, pieces built below
+        tokenizer=tokenizer,
+        engine=engine,
         max_standalone_key=cfg["max_standalone_key"],
         max_standalone_assoc=cfg["max_standalone_assoc"],
+        max_clause_freq=cfg["max_clause_freq"],
         prox_peek=cfg["prox_peek"],
-        max_clause_freq=cfg["max_clause_freq"],
-        verbose=verbose,
-    )
-
-    timings["peek"] = time.perf_counter() - t0
-
-    # ================================================================
-    # Step 3: Combination queries
-    # ================================================================
-    t0 = time.perf_counter()
-
-    from progressive_queries import build_combination_queries
-
-    combo = build_combination_queries(
-        peek, engine, tokenizer,
-        max_docs=cfg["max_docs"],
-        max_total=cfg["max_total"],
         prox_cross=cfg["prox_cross"],
-        prox_assoc=cfg["prox_assoc"],
-        max_clause_freq=cfg["max_clause_freq"],
+        max_budget=cfg["max_budget"],
         verbose=verbose,
+        # Pass pre-built pieces
+        _pieces=_build_pieces_from_expansion(qid, expansion, tokenizer, engine),
     )
 
-    all_queries = peek["grabbed"] + combo
-    timings["combo"] = time.perf_counter() - t0
+    all_queries = peek_result["grabbed"] + peek_result["combo_queries"]
+    timings["peek_and_combo"] = time.perf_counter() - t0
 
     # ================================================================
     # Step 4: Execute and resolve
@@ -293,7 +278,7 @@ def run_pipeline(
     return {
         "qid": qid,
         "query_text": query_text,
-        "peek": peek,
+        "peek_result": peek_result,
         "pool_docs": pool_docs,
         "pool_size": len(pool_docs),
         "executed_queries": executed,

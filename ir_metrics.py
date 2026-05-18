@@ -8,6 +8,7 @@ Usage:
 """
 
 import pytrec_eval
+import numpy as np
 
 
 def compute_metrics(ranked_doc_ids, qrels, qid, top_k_list=None, ranked_scores=None):
@@ -119,3 +120,23 @@ def compute_metrics_batch(runs, qrels, top_k_list=None):
         organized[qid] = results
 
     return organized
+
+
+def pool_metrics(df):
+    for mode in df["mode"].unique():
+        mdf = df[df["mode"] == mode]
+        recall = mdf["recall"]
+        precision = mdf["n_found"] / mdf["n_retrieved"]
+        
+        # CVaR (Conditional Value at Risk) = mean of bottom 10% recalls
+        sorted_recall = recall.sort_values()
+        n_tail = max(1, int(len(sorted_recall) * 0.1))
+        cvar = sorted_recall.iloc[:n_tail].mean()
+        
+        print(f"\n{mode} ({len(mdf)} queries):")
+        print(f"  Mean Recall:       {recall.mean():.4f}")
+        print(f"  Std Recall:        {recall.std():.4f}")
+        print(f"  Median Recall:     {recall.median():.4f}")
+        print(f"  CVaR (bottom 10%): {cvar:.4f}")
+        print(f"  Avg Retrieved:     {mdf['n_retrieved'].mean():.0f}")
+        print(f"  Mean Prec@Pool:    {precision.mean():.6f}")

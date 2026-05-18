@@ -8,7 +8,7 @@ expansions_path: ./kiss.jsonl
 out_path: ./runs/baseline/
 
 # Index
-index_dir:  /home/mruc/msmarco_segmented_index/
+index_dir: /home/mruc/first_index/
 tokenizer_name: meta-llama/Llama-2-7b-hf
 
 # Stages to run (comment out to skip)
@@ -35,11 +35,9 @@ max_standalone_assoc: 750
 prox_peek: 10
 max_clause_freq: 2000000
 
-# Combination queries
-max_docs: 20000
+# Budget and proximity
+max_budget: 20000
 prox_cross: 100
-prox_assoc: 100
-max_total: 200
 
 # Bi-encoder
 biencoder_top_k: 1000
