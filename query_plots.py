@@ -464,7 +464,7 @@ def plot_engine_count_distribution(curves, output_path, figsize=(5.5, 3.5)):
                 color='#7f8c8d', ha='center', va='top')
 
     # Legend outside above plot
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.35),
+    ax.legend(loc='upper left', bbox_to_anchor=(0.5, 1.35),
               ncol=1, frameon=False, fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.75])
