@@ -193,7 +193,7 @@ def run_pipeline(
     if not pool_docs:
         print(f"  [{qid}] WARNING: 0 docs resolved")
         print(f"    All queries: {len(all_queries)}, Executed: {len(executed)}")
-        print(f"    Grabbed: {len(peek.get('grabbed', []))}")
+        print(f"    Grabbed: {len(peek_result.get('grabbed', []))}")
         for q in all_queries[:5]:
             print(f"      {q.get('description', '?')}: cnt={q.get('estimated_count', '?')}")
 
@@ -211,7 +211,8 @@ def run_pipeline(
 
     if verbose:
         print(f"  [{qid}] Pool: {len(pool_docs)} docs, "
-              f"{len(executed)} queries, {timings['peek']+timings['combo']+timings['resolve']:.1f}s")
+              f"{len(executed)} queries, "
+              f"{timings.get('peek_and_combo', 0) + timings.get('resolve', 0):.1f}s")
 
     # ================================================================
     # Step 5: Bi-encoder reranking
