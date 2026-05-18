@@ -51,4 +51,4 @@ crossencoder_batch_size: 32
 crossencoder_max_length: 512
 
 # Document resolution
-max_doc_len: 2000
+max_doc_len: 20000

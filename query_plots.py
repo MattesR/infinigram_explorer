@@ -38,8 +38,8 @@ STEP_COLORS = {
     'standalone': '#7f8c8d',
 }
 STEP_LABELS = {
-    '3way_and': '3-way AND',
-    '2way_and': '2-way AND',
+    '3way_and': '3-Term AND',
+    '2way_and': '2-Term AND',
     'standalone': 'Standalone',
 }
 
@@ -331,9 +331,10 @@ def plot_proximity_curve(prox_data, output_path, figsize=(4, 3)):
     print(f"  Saved: {output_path}")
 
 
-def plot_combined_waterfall(curves, output_path, figsize=(5.5, 3)):
+def plot_combined_waterfall(curves, output_path, figsize=(6, 3.2)):
     """
     Side-by-side: recall contribution (left) vs cost (right) by query type.
+    Legend outside the plot. All segments labeled.
     """
     type_order = ["3way_and", "2way_and", "standalone"]
 
@@ -364,17 +365,17 @@ def plot_combined_waterfall(curves, output_path, figsize=(5.5, 3)):
         r_bottoms.append(r_bottoms[-1] + m)
 
     for i, (mean, bottom, color, label) in enumerate(zip(r_means, r_bottoms, colors, labels)):
-        bar = ax1.bar(['Recall'], [mean], bottom=bottom, color=color,
-                       edgecolor='white', linewidth=0.5, width=0.45, label=label)
-        if mean > 3:
+        ax1.bar(['Recall'], [mean], bottom=bottom, color=color,
+                edgecolor='white', linewidth=0.5, width=0.45, label=label)
+        # Always label, even small segments
+        if mean > 1:
             ax1.text(0, bottom + mean / 2, f'{mean:.1f}%',
                     ha='center', va='center', fontsize=8, color='white', fontweight='bold')
 
     ax1.set_ylabel('Recall (%)')
-    ax1.set_ylim(0, sum(r_means) * 1.1)
-    ax1.legend(loc='upper left', framealpha=0.9, edgecolor='none')
+    ax1.set_ylim(0, sum(r_means) * 1.15)
 
-    # Right: engine count
+    # Right: engine count — always show labels
     e_means = [np.mean(engine_contribs[t]) for t in type_order]
     e_bottoms = [0]
     for m in e_means[:-1]:
@@ -382,15 +383,25 @@ def plot_combined_waterfall(curves, output_path, figsize=(5.5, 3)):
 
     for i, (mean, bottom, color) in enumerate(zip(e_means, e_bottoms, colors)):
         ax2.bar(['Cost'], [mean], bottom=bottom, color=color,
-                 edgecolor='white', linewidth=0.5, width=0.45)
-        if mean > 3:
+                edgecolor='white', linewidth=0.5, width=0.45)
+        # Label all segments — use offset for tiny ones
+        if mean > sum(e_means) * 0.05:
             ax2.text(0, bottom + mean / 2, f'{mean:.0f}k',
                     ha='center', va='center', fontsize=8, color='white', fontweight='bold')
+        elif mean > 0:
+            ax2.annotate(f'{mean:.0f}k', xy=(0, bottom + mean / 2),
+                        xytext=(0.35, bottom + mean / 2),
+                        fontsize=7, color=color, fontweight='bold',
+                        arrowprops=dict(arrowstyle='-', color=color, lw=0.5))
 
     ax2.set_ylabel('Documents retrieved (thousands)')
-    ax2.set_ylim(0, sum(e_means) * 1.1)
+    ax2.set_ylim(0, sum(e_means) * 1.15)
 
-    fig.tight_layout(w_pad=2)
+    # Legend outside the plot area
+    fig.legend(labels, loc='upper center', bbox_to_anchor=(0.5, 1.08),
+               ncol=3, frameon=False, fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.savefig(output_path)
     plt.close(fig)
     print(f"  Saved: {output_path}")
