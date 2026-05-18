@@ -32,6 +32,7 @@ def peek_and_grab_v2(
     prox_peek=10,
     prox_cross=50,
     max_budget=20000,
+    max_tighten_attempts=20,
     verbose=True,
     _pieces=None,
 ):
@@ -136,10 +137,8 @@ def peek_and_grab_v2(
     remaining_key = {d: i for d, i in all_key_pieces.items() if not i["grabbed"] and i["count"] > 0}
     remaining_assoc = {d: i for d, i in all_assoc_pieces.items() if not i["grabbed"] and i["count"] > 0}
 
-    if verbose:
-        print(f"\n  Grabbed: {len(grabbed)} pieces, ~{grabbed_total:,d} docs")
-        print(f"  Remaining key: {len(remaining_key)} pieces")
-        print(f"  Remaining assoc: {len(remaining_assoc)} pieces")
+    print(f"  [{qid}] Phase 1: {len(grabbed)} standalone grabbed (~{grabbed_total:,d} docs), "
+          f"{len(remaining_key)} key + {len(remaining_assoc)} assoc remaining")
 
     # ================================================================
     # Phase 2: Combo peek (2-way ANDs from remaining KEY pieces only)
@@ -157,6 +156,7 @@ def peek_and_grab_v2(
 
     aspect_names = list(remaining_by_aspect.keys())
     combo_queries = []
+    n_combo_checked = 0
 
     if len(aspect_names) >= 2:
         for a, b in combinations(aspect_names, 2):
@@ -173,6 +173,8 @@ def peek_and_grab_v2(
                     except Exception:
                         cnt = 0
 
+                    n_combo_checked += 1
+
                     if cnt == 0:
                         continue
 
@@ -188,6 +190,16 @@ def peek_and_grab_v2(
 
                     if verbose:
                         print(f"  {desc}: {cnt:>10,d}")
+
+    # Sort by count (tightest first)
+    combo_queries.sort(key=lambda q: q["estimated_count"])
+
+    combo_total = sum(q["estimated_count"] for q in combo_queries)
+    remaining_assoc_total = sum(i["count"] for i in remaining_assoc.values())
+
+    print(f"  [{qid}] Phase 2: {n_combo_checked} combos checked, "
+          f"{len(combo_queries)} with hits (~{combo_total:,d} docs). "
+          f"Total so far: ~{grabbed_total + combo_total:,d} / {max_budget:,d} budget")
 
     # Sort by count (tightest first)
     combo_queries.sort(key=lambda q: q["estimated_count"])
@@ -213,7 +225,8 @@ def peek_and_grab_v2(
         all_fire_queries.sort(key=lambda q: q["estimated_count"], reverse=True)
 
         i = 0
-        while current_total > budget and i < len(all_fire_queries):
+        attempts = 0
+        while current_total > budget and i < len(all_fire_queries) and attempts < max_tighten_attempts:
             query_q = all_fire_queries[i]
             original_count = query_q["estimated_count"]
 
@@ -221,6 +234,8 @@ def peek_and_grab_v2(
             if original_count <= 100:
                 i += 1
                 continue
+
+            attempts += 1
 
             if verbose:
                 print(f"\n  Tightening: {query_q['description']} ({original_count:,d}) [{query_q['level']}]")
@@ -257,6 +272,13 @@ def peek_and_grab_v2(
 
             replacement_total = sum(q["estimated_count"] for q in replacement_queries)
 
+            # Only replace if tightening actually reduces the count
+            if replacement_total >= original_count or not replacement_queries:
+                if verbose:
+                    print(f"    Tightening didn't help ({replacement_total:,d} >= {original_count:,d}), keeping original")
+                i += 1
+                continue
+
             # Replace original with tightened versions
             all_fire_queries.pop(i)
             all_fire_queries.extend(replacement_queries)
@@ -276,18 +298,70 @@ def peek_and_grab_v2(
 
             # Don't increment i — next broadest is now at position i
 
+        print(f"  [{qid}] Phase 3: tightened {len(tightened)} broad queries. "
+              f"Final total: ~{current_total:,d} / {budget:,d} budget")
+    else:
+        if current_total <= budget:
+            print(f"  [{qid}] Phase 3: skipped (under budget: ~{current_total:,d} / {budget:,d})")
+        elif not remaining_assoc:
+            print(f"  [{qid}] Phase 3: skipped (no assoc terms for tightening, ~{current_total:,d} docs)")
+
     # Split back into grabbed and combos for clarity
     grabbed = [q for q in all_fire_queries if q["level"].startswith("S0")]
     combo_queries = [q for q in all_fire_queries if not q["level"].startswith("S0")]
 
-    # Re-sort combos by count (tightest first)
+    # Sort combos by count (tightest first)
     combo_queries.sort(key=lambda q: q["estimated_count"])
     grabbed_total = sum(q["estimated_count"] for q in grabbed)
     combo_total = sum(q["estimated_count"] for q in combo_queries)
+    current_total = grabbed_total + combo_total
 
-    # Re-sort after tightening
-    combo_queries.sort(key=lambda q: q["estimated_count"])
-    combo_total = sum(q["estimated_count"] for q in combo_queries)
+    # ================================================================
+    # Phase 4: Fill remaining budget with cheapest remaining pieces
+    # ================================================================
+    filled = []
+    if current_total < budget:
+        # Collect all remaining pieces (key + assoc) not yet in queries
+        fired_descs = {q["description"] for q in grabbed + combo_queries}
+        remaining_all = []
+
+        for desc, info in remaining_key.items():
+            if desc not in fired_descs:
+                remaining_all.append(info)
+        for desc, info in remaining_assoc.items():
+            if desc not in fired_descs:
+                remaining_all.append(info)
+
+        # Sort by count ascending (cheapest first)
+        remaining_all.sort(key=lambda x: x["count"])
+
+        for info in remaining_all:
+            if current_total + info["count"] > budget:
+                continue
+            p = info["piece"]
+            prox = prox_peek if len(p["cnf"]) > 1 else None
+            q = {
+                "type": "cnf",
+                "cnf": p["cnf"],
+                "max_diff_tokens": prox,
+                "description": p["description"],
+                "estimated_count": info["count"],
+                "level": "S_fill",
+            }
+            grabbed.append(q)
+            all_fire_queries.append(q)
+            current_total += info["count"]
+            filled.append({"description": p["description"], "count": info["count"]})
+
+            if verbose:
+                print(f"  Fill: {p['description']}: {info['count']:>10,d}  (total: {current_total:,d})")
+
+        grabbed_total = sum(q["estimated_count"] for q in grabbed)
+
+        print(f"  [{qid}] Phase 4: filled {len(filled)} standalone pieces (~{sum(f['count'] for f in filled):,d} docs). "
+              f"Final total: ~{current_total:,d} / {budget:,d} budget")
+    else:
+        print(f"  [{qid}] Phase 4: skipped (at budget: ~{current_total:,d} / {budget:,d})")
 
     elapsed = time.perf_counter() - t0
 
@@ -311,6 +385,7 @@ def peek_and_grab_v2(
         "grabbed": grabbed,
         "combo_queries": combo_queries,
         "tightened": tightened,
+        "filled": filled,
         "remaining_key": remaining_key,
         "remaining_assoc": remaining_assoc,
         "all_key_pieces": all_key_pieces,

@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
     # Budget and proximity
     "max_budget": 20000,
     "prox_cross": 100,
+    "max_tighten_attempts": 20,
 
     # Resolve
     "max_doc_len": 2000,
@@ -156,6 +157,7 @@ def run_pipeline(
         prox_peek=cfg["prox_peek"],
         prox_cross=cfg["prox_cross"],
         max_budget=cfg["max_budget"],
+        max_tighten_attempts=cfg.get("max_tighten_attempts", 20),
         verbose=verbose,
         # Pass pre-built pieces
         _pieces=_build_pieces_from_expansion(qid, expansion, tokenizer, engine),
@@ -165,12 +167,15 @@ def run_pipeline(
     timings["peek_and_combo"] = time.perf_counter() - t0
 
     # ================================================================
-    # Step 4: Execute and resolve
+    # Step 2: Execute and resolve
     # ================================================================
     t0 = time.perf_counter()
 
     from adaptive_queries import run_adaptive
     from resolve_documents import resolve_all_queries
+
+    if verbose:
+        print(f"  [{qid}] Executing {len(all_queries)} queries...")
 
     executed = run_adaptive(
         engine, all_queries,

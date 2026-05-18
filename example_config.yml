@@ -38,6 +38,7 @@ max_clause_freq: 2000000
 # Budget and proximity
 max_budget: 20000
 prox_cross: 100
+max_tighten_attempts: 20
 
 # Bi-encoder
 biencoder_top_k: 1000
