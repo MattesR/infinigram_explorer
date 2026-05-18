@@ -193,11 +193,17 @@ def peek_and_grab_v2(
                     if verbose:
                         print(f"  [k×k] {desc}: {cnt:>10,d}")
 
-    # Key × assoc
-    for desc_k, info_k in remaining_key.items():
+    # Key × assoc (only aspect name piece per aspect, not all expansions)
+    for aspect_name in aspect_names:
+        # Get only the first piece (aspect name itself)
+        aspect_pieces = remaining_by_aspect[aspect_name]
+        first_piece = aspect_pieces[0] if aspect_pieces else None
+        if first_piece is None:
+            continue
+
         for desc_a, info_a in remaining_assoc.items():
-            cnf = info_k["piece"]["cnf"] + info_a["piece"]["cnf"]
-            desc = f"({info_k['piece']['description']}) AND ({info_a['piece']['description']})"
+            cnf = first_piece["piece"]["cnf"] + info_a["piece"]["cnf"]
+            desc = f"({first_piece['piece']['description']}) AND ({info_a['piece']['description']})"
 
             try:
                 cnt = engine.count_cnf(
