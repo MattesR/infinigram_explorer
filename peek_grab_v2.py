@@ -221,6 +221,10 @@ def peek_and_grab_v2(
                 if cnt == 0:
                     continue
 
+                # Skip if combo is too broad (treat like standalone threshold)
+                if cnt > max_standalone_key:
+                    continue
+
                 combo_queries.append({
                     "type": "cnf",
                     "cnf": cnf,
