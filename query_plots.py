@@ -407,10 +407,10 @@ def plot_combined_waterfall(curves, output_path, figsize=(6, 3.2)):
     print(f"  Saved: {output_path}")
 
 
-def plot_engine_count_distribution(curves, output_path, figsize=(5, 3.5)):
+def plot_engine_count_distribution(curves, output_path, figsize=(5.5, 3.5)):
     """
     Per-topic engine count distribution by query type.
-    Shows CDF curves — for each type, what fraction of topics pull <= X docs.
+    Shows KDE density curves on log scale.
     """
     type_order = ["3way_and", "2way_and", "standalone"]
     type_engines = {t: [] for t in type_order}
@@ -427,28 +427,47 @@ def plot_engine_count_distribution(curves, output_path, figsize=(5, 3.5)):
     fig, ax = plt.subplots(figsize=figsize)
 
     for t in type_order:
-        vals = sorted(type_engines[t])
-        if not vals:
+        vals = np.array(type_engines[t])
+        if len(vals) < 5:
             continue
-        n = len(vals)
-        cdf_y = np.arange(1, n + 1) / n
-        ax.plot([v / 1000 for v in vals], cdf_y,
-                color=STEP_COLORS[t], linewidth=1.8,
-                label=f"{STEP_LABELS[t]} ({n} topics)")
+
+        # KDE on log-transformed values for better density estimation on skewed data
+        log_vals = np.log10(vals)
+        from scipy.stats import gaussian_kde
+        kde = gaussian_kde(log_vals, bw_method=0.3)
+
+        # Plot range: from smallest to largest across all types
+        x_range = np.linspace(log_vals.min() - 0.5, log_vals.max() + 0.5, 300)
+        density = kde(x_range)
+
+        # Normalize density so each curve peaks at 1 (makes comparison fair across types)
+        density = density / density.max()
+
+        ax.fill_between(10**x_range, density, alpha=0.2, color=STEP_COLORS[t])
+        ax.plot(10**x_range, density, color=STEP_COLORS[t], linewidth=1.8,
+                label=f"{STEP_LABELS[t]} (n={len(vals)}, med={np.median(vals)/1000:.0f}k)")
 
         # Mark median
-        median_val = np.median(vals) / 1000
-        ax.plot(median_val, 0.5, 'o', color=STEP_COLORS[t], markersize=5, zorder=5)
-        ax.annotate(f'{median_val:.0f}k', xy=(median_val, 0.5),
-                   xytext=(8, -3), textcoords='offset points',
-                   fontsize=7, color=STEP_COLORS[t])
+        median_val = np.median(vals)
+        ax.axvline(median_val, color=STEP_COLORS[t], linestyle='--',
+                   linewidth=0.8, alpha=0.6)
 
-    ax.set_xlabel('Documents retrieved per topic (thousands)')
-    ax.set_ylabel('Fraction of topics')
+    ax.set_xlabel('Documents retrieved per topic')
+    ax.set_ylabel('Density (normalized)')
     ax.set_xscale('log')
-    ax.legend(loc='lower right', framealpha=0.9, edgecolor='none')
-    ax.set_ylim(0, 1.05)
+    ax.set_yticks([])
 
+    # Add reference lines for budget thresholds
+    for budget, label in [(10000, '10k'), (20000, '20k'), (50000, '50k')]:
+        ax.axvline(budget, color='#bdc3c7', linestyle=':', linewidth=0.6, alpha=0.7)
+        ax.text(budget, ax.get_ylim()[1] * 0.95, label, fontsize=6,
+                color='#7f8c8d', ha='center', va='top')
+
+    # Legend outside
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.22),
+              ncol=1, frameon=False, fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.82])
     fig.savefig(output_path)
     plt.close(fig)
     print(f"  Saved: {output_path}")
