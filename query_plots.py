@@ -445,7 +445,7 @@ def plot_engine_count_distribution(curves, output_path, figsize=(5.5, 3.5)):
 
         ax.fill_between(10**x_range, density, alpha=0.2, color=STEP_COLORS[t])
         ax.plot(10**x_range, density, color=STEP_COLORS[t], linewidth=1.8,
-                label=f"{STEP_LABELS[t]} (n={len(vals)}, med={np.median(vals)/1000:.0f}k)")
+                label=f"{STEP_LABELS[t]} (n={len(vals)}, median={np.median(vals):,.0f})")
 
         # Mark median
         median_val = np.median(vals)
@@ -463,11 +463,11 @@ def plot_engine_count_distribution(curves, output_path, figsize=(5.5, 3.5)):
         ax.text(budget, ax.get_ylim()[1] * 0.95, label, fontsize=6,
                 color='#7f8c8d', ha='center', va='top')
 
-    # Legend outside
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.22),
+    # Legend outside above plot
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.35),
               ncol=1, frameon=False, fontsize=8)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.82])
+    fig.tight_layout(rect=[0, 0, 1, 0.75])
     fig.savefig(output_path)
     plt.close(fig)
     print(f"  Saved: {output_path}")
