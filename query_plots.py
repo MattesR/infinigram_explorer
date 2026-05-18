@@ -407,6 +407,53 @@ def plot_combined_waterfall(curves, output_path, figsize=(6, 3.2)):
     print(f"  Saved: {output_path}")
 
 
+def plot_engine_count_distribution(curves, output_path, figsize=(5, 3.5)):
+    """
+    Per-topic engine count distribution by query type.
+    Shows CDF curves — for each type, what fraction of topics pull <= X docs.
+    """
+    type_order = ["3way_and", "2way_and", "standalone"]
+    type_engines = {t: [] for t in type_order}
+
+    for qid, data in curves.items():
+        per_type = defaultdict(int)
+        for step in data["steps"]:
+            qtype = _classify_step(step["query"])
+            per_type[qtype] += step["engine_count"]
+        for t in type_order:
+            if per_type.get(t, 0) > 0:
+                type_engines[t].append(per_type[t])
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for t in type_order:
+        vals = sorted(type_engines[t])
+        if not vals:
+            continue
+        n = len(vals)
+        cdf_y = np.arange(1, n + 1) / n
+        ax.plot([v / 1000 for v in vals], cdf_y,
+                color=STEP_COLORS[t], linewidth=1.8,
+                label=f"{STEP_LABELS[t]} ({n} topics)")
+
+        # Mark median
+        median_val = np.median(vals) / 1000
+        ax.plot(median_val, 0.5, 'o', color=STEP_COLORS[t], markersize=5, zorder=5)
+        ax.annotate(f'{median_val:.0f}k', xy=(median_val, 0.5),
+                   xytext=(8, -3), textcoords='offset points',
+                   fontsize=7, color=STEP_COLORS[t])
+
+    ax.set_xlabel('Documents retrieved per topic (thousands)')
+    ax.set_ylabel('Fraction of topics')
+    ax.set_xscale('log')
+    ax.legend(loc='lower right', framealpha=0.9, edgecolor='none')
+    ax.set_ylim(0, 1.05)
+
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
 def plot_all(curves, output_dir="./plots/", prox_data=None):
     """Generate all paper-ready plots."""
     os.makedirs(output_dir, exist_ok=True)
@@ -418,6 +465,7 @@ def plot_all(curves, output_dir="./plots/", prox_data=None):
     plot_cost_waterfall(curves, os.path.join(output_dir, "cost_waterfall.pdf"))
     plot_combined_waterfall(curves, os.path.join(output_dir, "combined_waterfall.pdf"))
     plot_recall_vs_cost_by_type(curves, os.path.join(output_dir, "recall_vs_cost_scatter.pdf"))
+    plot_engine_count_distribution(curves, os.path.join(output_dir, "engine_count_distribution.pdf"))
 
     if prox_data:
         plot_proximity_curve(prox_data, os.path.join(output_dir, "proximity_curve.pdf"))
