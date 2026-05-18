@@ -268,6 +268,15 @@ def run_from_config(config_path, engine=None, tokenizer=None, verbose=True):
     # Write per-query CSV
     _write_per_query_csv(eval_results, top_k_list, out_path)
 
+    # Write metrics CSV (pytrec_eval based)
+    from recalc_metrics import recalc_from_pickle
+    recalc_from_pickle(
+        results_path, config["qrels_path"],
+        stages=eval_stages, top_k_list=top_k_list,
+        output_csv=os.path.join(out_path, "metrics.csv"),
+        verbose=False,
+    )
+
     # Write eval summary
     summary_path = os.path.join(out_path, "eval_summary.txt")
     import io

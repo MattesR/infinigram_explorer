@@ -32,6 +32,7 @@ def peek_and_grab_v2(
     prox_peek=10,
     prox_cross=50,
     max_budget=20000,
+    max_assoc_combo=50000,
     max_tighten_attempts=20,
     verbose=True,
     _pieces=None,
@@ -193,42 +194,45 @@ def peek_and_grab_v2(
                     if verbose:
                         print(f"  [k×k] {desc}: {cnt:>10,d}")
 
-    # Key × assoc (only aspect name piece per aspect, not all expansions)
-    for aspect_name in aspect_names:
-        # Get only the first piece (aspect name itself)
-        aspect_pieces = remaining_by_aspect[aspect_name]
-        first_piece = aspect_pieces[0] if aspect_pieces else None
-        if first_piece is None:
-            continue
+    # Key × assoc (only pieces from the FIRST aspect × remaining assoc below threshold)
+    if aspect_names:
+        first_aspect = aspect_names[0]
+        first_aspect_pieces = remaining_by_aspect[first_aspect]
 
-        for desc_a, info_a in remaining_assoc.items():
-            cnf = first_piece["piece"]["cnf"] + info_a["piece"]["cnf"]
-            desc = f"({first_piece['piece']['description']}) AND ({info_a['piece']['description']})"
+        for info_k in first_aspect_pieces:
+            for desc_a, info_a in remaining_assoc.items():
+                # Skip broad assoc terms
+                if info_a["count"] > max_assoc_combo:
+                    continue
 
-            try:
-                cnt = engine.count_cnf(
-                    cnf, max_clause_freq=max_clause_freq,
-                    max_diff_tokens=prox_cross,
-                ).get("count", 0)
-            except Exception:
-                cnt = 0
+                cnf = info_k["piece"]["cnf"] + info_a["piece"]["cnf"]
+                desc = f"({info_k['piece']['description']}) AND ({info_a['piece']['description']})"
 
-            n_combo_checked += 1
+                try:
+                    cnt = engine.count_cnf(
+                        cnf, max_clause_freq=max_clause_freq,
+                        max_diff_tokens=prox_cross,
+                    ).get("count", 0)
+                except Exception:
+                    cnt = 0
 
-            if cnt == 0:
-                continue
+                n_combo_checked += 1
 
-            combo_queries.append({
-                "type": "cnf",
-                "cnf": cnf,
-                "max_diff_tokens": prox_cross,
-                "description": desc,
-                "estimated_count": cnt,
-                "level": "S_combo_ka",
-            })
+                if cnt == 0:
+                    continue
 
-            if verbose:
-                print(f"  [k×a] {desc}: {cnt:>10,d}")
+                combo_queries.append({
+                    "type": "cnf",
+                    "cnf": cnf,
+                    "max_diff_tokens": prox_cross,
+                    "description": desc,
+                    "estimated_count": cnt,
+                    "level": "S_combo_ka",
+                    "assoc_used": desc_a,
+                })
+
+                if verbose:
+                    print(f"  [k×a] {desc}: {cnt:>10,d}")
 
     # Sort by count (tightest first)
     combo_queries.sort(key=lambda q: q["estimated_count"])
@@ -280,8 +284,12 @@ def peek_and_grab_v2(
                 print(f"\n  Tightening: {query_q['description']} ({original_count:,d}) [{query_q['level']}]")
 
             # AND this query with each remaining assoc term
+            # Skip assoc terms already used in this query
+            already_used = query_q.get("assoc_used", "")
             replacement_queries = []
             for desc, assoc_info in remaining_assoc.items():
+                if desc == already_used or f"({desc})" in query_q["description"]:
+                    continue
                 cnf = query_q["cnf"] + assoc_info["piece"]["cnf"]
                 new_desc = f"{query_q['description']} AND ({desc})"
 

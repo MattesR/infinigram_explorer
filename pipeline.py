@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
     # Budget and proximity
     "max_budget": 20000,
     "prox_cross": 100,
+    "max_assoc_combo": 50000,
     "max_tighten_attempts": 20,
 
     # Resolve
@@ -157,6 +158,7 @@ def run_pipeline(
         prox_peek=cfg["prox_peek"],
         prox_cross=cfg["prox_cross"],
         max_budget=cfg["max_budget"],
+        max_assoc_combo=cfg.get("max_assoc_combo", 50000),
         max_tighten_attempts=cfg.get("max_tighten_attempts", 20),
         verbose=verbose,
         # Pass pre-built pieces
