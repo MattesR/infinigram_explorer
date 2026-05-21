@@ -33,6 +33,7 @@ def peek_and_grab_v2(
     prox_cross=50,
     max_budget=20000,
     max_assoc_combo=50000,
+    budget_fill=True,
     verbose=True,
     _pieces=None,
 ):
@@ -299,7 +300,7 @@ def peek_and_grab_v2(
     # Phase 4: Fill remaining budget with cheapest remaining pieces
     # ================================================================
     filled = []
-    if current_total < budget:
+    if budget_fill and current_total < budget:
         # Collect all remaining pieces (key + assoc) not yet in queries
         fired_descs = {q["description"] for q in grabbed + combo_queries}
         remaining_all = []

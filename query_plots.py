@@ -407,6 +407,50 @@ def plot_combined_waterfall(curves, output_path, figsize=(6, 3.2)):
     print(f"  Saved: {output_path}")
 
 
+def plot_recall_waterfall_only(curves, output_path, figsize=(3, 3.2)):
+    """Recall contribution by query type. Legend outside."""
+    type_order = ["3way_and", "2way_and", "standalone"]
+    recall_contribs = {t: [] for t in type_order}
+
+    for qid, data in curves.items():
+        n_docs = data["n_docs"]
+        type_docs = defaultdict(int)
+        for step in data["steps"]:
+            qtype = _classify_step(step["query"])
+            type_docs[qtype] += step["new_docs"]
+        for t in type_order:
+            recall_contribs[t].append(type_docs[t] / n_docs * 100 if n_docs else 0)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    labels = [STEP_LABELS[t] for t in type_order]
+    colors = [STEP_COLORS[t] for t in type_order]
+
+    r_means = [np.mean(recall_contribs[t]) for t in type_order]
+    r_bottoms = [0]
+    for m in r_means[:-1]:
+        r_bottoms.append(r_bottoms[-1] + m)
+
+    for mean, bottom, color, label in zip(r_means, r_bottoms, colors, labels):
+        ax.bar(['Recall'], [mean], bottom=bottom, color=color,
+               edgecolor='white', linewidth=0.5, width=0.45, label=label)
+        if mean > 1:
+            ax.text(0, bottom + mean / 2, f'{mean:.1f}%',
+                    ha='center', va='center', fontsize=8, color='white', fontweight='bold')
+
+    ax.set_ylabel('Recall (%)')
+    ax.set_ylim(0, sum(r_means) * 1.15)
+
+    fig.legend(labels, loc='upper center', bbox_to_anchor=(0.5, 1.08),
+               ncol=3, frameon=False, fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+
 def plot_engine_count_distribution(curves, output_path, figsize=(5.5, 3.5)):
     """
     Per-topic engine count distribution by query type.
@@ -460,15 +504,29 @@ def plot_engine_count_distribution(curves, output_path, figsize=(5.5, 3.5)):
     # Add reference lines for budget thresholds
     for budget, label in [(10000, '10k'), (20000, '20k'), (50000, '50k')]:
         ax.axvline(budget, color='#bdc3c7', linestyle=':', linewidth=0.6, alpha=0.7)
-        ax.text(budget, ax.get_ylim()[1] * 0.95, label, fontsize=6,
-                color='#7f8c8d', ha='center', va='top')
+        ax.text(
+            budget,
+            ax.get_ylim()[1] * 0.95,
+            label,
+            fontsize=10,
+            color='#7f8c8d',
+            ha='center',
+            va='top'
+        )
 
-    # Legend outside above plot
-    ax.legend(loc='upper left', bbox_to_anchor=(0.5, 1.35),
-              ncol=1, frameon=False, fontsize=8)
+    # Legend outside plot, above-left
+    ax.legend(
+        loc='lower left',
+        bbox_to_anchor=(0, 1.02),
+        ncol=1,
+        frameon=False,
+        fontsize=10
+    )
 
-    fig.tight_layout(rect=[0, 0, 1, 0.75])
-    fig.savefig(output_path)
+    # Leave a little room at the top for the legend
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    fig.savefig(output_path, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {output_path}")
 

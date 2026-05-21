@@ -20,33 +20,12 @@ import requests
 from itertools import combinations
 from transformers import AutoTokenizer
 from utils import get_token
+from batch_keywords import SYSTEM_PROMPT as EXPANSION_PROMPT
 
 
 API_URL = "https://api.infini-gram.io/"
 DEFAULT_INDEX = "v4_olmo-2-0325-32b-instruct_llama"
-API_DELAY = 0.1  # seconds between API calls
-
-EXPANSION_PROMPT = """For the following search query, generate keyword expansions in JSON format.
-
-Query: {query}
-
-Return ONLY valid JSON with this exact structure:
-{{
-    "KEY_ENTITIES": {{
-        "<aspect1>": ["<expansion1>", "<expansion2>", "<expansion3>", "<expansion4>", "<expansion5>"],
-        "<aspect2>": ["<expansion1>", "<expansion2>", "<expansion3>", "<expansion4>", "<expansion5>"]
-    }},
-    "ASSOCIATED_TERMS": ["<term1>", "<term2>", "<term3>", "<term4>", "<term5>", "<term6>", "<term7>", "<term8>", "<term9>", "<term10>"],
-    "VERBS": {{
-        "<verb1>": ["<synonym1>", "<synonym2>", "<synonym3>", "<synonym4>", "<synonym5>"]
-    }}
-}}
-
-Rules:
-- KEY_ENTITIES: Break the query into 2-4 key aspects. For each aspect, give 5 alternative phrasings.
-- ASSOCIATED_TERMS: 10 domain-specific terms strongly associated with the query topic.
-- VERBS: Main action verb(s) from the query with 5 synonyms each.
-- Keep it simple. Only include terms that would actually appear in relevant documents."""
+API_DELAY = 0.5  # seconds between API calls (rate limit protection)
 
 
 # ================================================================
@@ -113,13 +92,13 @@ def _call_anthropic(query, model):
     import anthropic
 
     client = anthropic.Anthropic(api_key=get_token('ANTHROPIC_API_KEY'))
-    prompt = EXPANSION_PROMPT.format(query=query)
 
     try:
         response = client.messages.create(
             model=model,
             max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
+            system=EXPANSION_PROMPT,
+            messages=[{"role": "user", "content": query}],
         )
         text = response.content[0].text.strip()
         return _parse_expansion(text)
@@ -136,8 +115,6 @@ def _call_openrouter(query, model):
     if not api_key and ("gpt" in model or "o1" in model or "o3" in model):
         return _call_openai(query, model)
 
-    prompt = EXPANSION_PROMPT.format(query=query)
-
     try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -149,7 +126,10 @@ def _call_openrouter(query, model):
                 "model": model,
                 "max_tokens": 2048,
                 "temperature": 0,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "system", "content": EXPANSION_PROMPT},
+                    {"role": "user", "content": query},
+                ],
             },
             timeout=60,
         )
@@ -166,14 +146,16 @@ def _call_openai(query, model):
     from openai import OpenAI
 
     client = OpenAI(api_key=get_token('OPENAI_API_KEY'))
-    prompt = EXPANSION_PROMPT.format(query=query)
 
     try:
         response = client.chat.completions.create(
             model=model,
             max_tokens=2048,
             temperature=0,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": EXPANSION_PROMPT},
+                {"role": "user", "content": query},
+            ],
         )
         text = response.choices[0].message.content.strip()
         return _parse_expansion(text)
@@ -232,32 +214,141 @@ def _api_count(query_ids, index):
         return 0
 
 
-def _api_search(query_ids, index, max_disp_len=500):
-    """Search via API. Same query_ids format as _api_count."""
+def _api_find(query_ids, index, max_clause_freq=500000, verbose=False):
+    """Find matching document pointers via API."""
     time.sleep(API_DELAY)
     payload = {
         "index": index,
-        "query_type": "search_docs",
+        "query_type": "find_cnf",
         "query_ids": query_ids,
-        "max_disp_len": max_disp_len,
+        "max_clause_freq": max_clause_freq,
     }
     try:
-        response = requests.post(API_URL, json=payload, timeout=60)
+        response = requests.post(API_URL, json=payload, timeout=30)
         result = response.json()
-        if "error" in result:
-            # Try alternative query type
-            payload["query_type"] = "search"
-            response = requests.post(API_URL, json=payload, timeout=60)
-            result = response.json()
+        if "message" in result and "cnt" not in result:
+            result["error"] = result["message"]
+        if verbose:
+            print(f"      find_cnf: keys={list(result.keys())}")
+            if "message" in result:
+                print(f"      MESSAGE: {result['message']}")
+            print(f"      cnt={result.get('cnt', '?')}, approx={result.get('approx', '?')}")
+            ptrs = result.get("ptrs_by_shard", result.get("segment_by_shard", []))
+            for s, p in enumerate(ptrs):
+                if isinstance(p, list) and len(p) == 2 and isinstance(p[0], int):
+                    print(f"      shard {s}: range [{p[0]}, {p[1]})")
+                else:
+                    print(f"      shard {s}: {len(p)} pointers")
+            if "error" in result:
+                print(f"      ERROR: {result['error']}")
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+def _api_get_doc(index, shard, ptr, query_ids, max_disp_len=10000):
+    """Retrieve a single document by shard and pointer."""
+    time.sleep(API_DELAY)
+    payload = {
+        "index": index,
+        "query_type": "get_doc_by_ptr",
+        "query_ids": query_ids,
+        "s": shard,
+        "ptr": ptr,
+        "max_disp_len": max_disp_len,
+    }
+    try:
+        response = requests.post(API_URL, json=payload, timeout=30)
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _parse_doc_text(response, tokenizer=None):
+    """
+    Extract text from API response spans.
+    
+    Spans format: list of [text, marker] pairs where:
+    - marker=None: context text
+    - marker="0","1",...: matched text for clause N
+    """
+    if "spans" in response:
+        spans = response["spans"]
+        parts = []
+        for span in spans:
+            if isinstance(span, list) and len(span) >= 1:
+                text = span[0] if isinstance(span[0], str) else ""
+                if text:
+                    # Add space between parts if neither side has whitespace
+                    if parts and parts[-1] and not parts[-1][-1].isspace() and not text[0].isspace():
+                        parts.append(' ')
+                    parts.append(text)
+            elif isinstance(span, str):
+                if span:
+                    if parts and parts[-1] and not parts[-1][-1].isspace() and not span[0].isspace():
+                        parts.append(' ')
+                    parts.append(span)
+        return "".join(parts)
+    elif "text" in response:
+        return response["text"]
+    return ""
+
+
+def _api_search(query_ids, index, max_docs_per_query=10, max_disp_len=10000, max_clause_freq=500000, verbose=False, tokenizer=None):
+    """
+    Search for documents: find_cnf -> get_doc_by_rank for each result.
+    """
+    # Step 1: Find
+    find_result = _api_find(query_ids, index, max_clause_freq=max_clause_freq, verbose=verbose)
+
+    if "error" in find_result:
+        return find_result
+
+    cnt = find_result.get("cnt", 0)
+    # find_cnf returns ptrs_by_shard, find returns segment_by_shard
+    ptrs_by_shard = find_result.get("ptrs_by_shard", [])
+    segment_by_shard = find_result.get("segment_by_shard", [])
+
+    if cnt == 0 or not ptrs_by_shard:
+        return {"cnt": 0, "documents": []}
+
+    # Step 2: Retrieve docs from pointers
+    documents = []
+    n_fetched = 0
+
+    for shard, ptrs in enumerate(ptrs_by_shard):
+        if not ptrs or n_fetched >= max_docs_per_query:
+            continue
+
+        n_to_fetch = min(len(ptrs), max_docs_per_query - n_fetched)
+
+        # Sample evenly
+        if n_to_fetch >= len(ptrs):
+            selected = ptrs
+        else:
+            step = len(ptrs) // n_to_fetch
+            selected = ptrs[::step][:n_to_fetch]
+
+        for ptr in selected:
+            if n_fetched >= max_docs_per_query:
+                break
+            doc = _api_get_doc(index, shard, ptr, query_ids=query_ids, max_disp_len=max_disp_len)
+            if "error" not in doc:
+                doc["shard"] = shard
+                doc["text"] = _parse_doc_text(doc, tokenizer=tokenizer)
+                documents.append(doc)
+                n_fetched += 1
+
+    return {"cnt": cnt, "documents": documents}
 
 
 def retrieve_documents(
     queries: list,
     tokenizer,
     index: str = DEFAULT_INDEX,
+    max_docs_per_query: int = 10,
+    max_queries: int = None,
+    max_disp_len: int = 500,
     verbose: bool = True,
 ):
     """
@@ -267,16 +358,29 @@ def retrieve_documents(
         queries: List of query dicts from peek_and_grab (all_queries).
         tokenizer: HuggingFace tokenizer for decoding.
         index: Infini-gram index name.
+        max_queries: If set, only retrieve from top N queries by estimated count.
 
     Returns list of unique document dicts with doc_id, text, from_queries.
     """
+    # Sort by estimated count descending — most hits first
+    sorted_queries = sorted(queries, key=lambda q: q.get("estimated_count", 0), reverse=True)
+
+    if max_queries and len(sorted_queries) > max_queries:
+        if verbose:
+            print(f"  Limiting to top {max_queries} queries (of {len(sorted_queries)}) by estimated count")
+        sorted_queries = sorted_queries[:max_queries]
+
     doc_map = {}
 
-    for i, q in enumerate(queries):
+    for i, q in enumerate(sorted_queries):
         if verbose:
             print(f"  [{i+1}/{len(queries)}] {q['description']} (est: {q['estimated_count']:,d})")
 
-        result = _api_search(q["cnf"], index)
+        result = _api_search(q["cnf"], index,
+                             max_docs_per_query=max_docs_per_query,
+                             max_disp_len=max_disp_len,
+                             verbose=verbose,
+                             tokenizer=tokenizer)
 
         if "error" in result:
             if verbose:
@@ -295,35 +399,29 @@ def retrieve_documents(
 
         # Parse response
         docs = result.get("documents", [])
+        cnt = result.get("cnt", 0)
 
         if isinstance(docs, list):
             for doc in docs:
                 if doc.get("blocked"):
                     continue
 
-                # Extract text from spans
-                spans = doc.get("spans", [])
-                text = ""
-                if spans and isinstance(spans[0], list) and len(spans[0]) >= 2:
-                    text = spans[0][1] if isinstance(spans[0][1], str) else str(spans[0][1])
-                elif spans and isinstance(spans[0], str):
-                    text = spans[0]
+                text = doc.get("text", "")
 
-                # Extract doc_id from metadata
-                doc_id = f"doc_{doc.get('doc_ix', i)}"
+                # Build doc_id from metadata
+                doc_id = f"doc_{doc.get('doc_ix', 0)}"
                 meta_str = doc.get("metadata", "")
                 if isinstance(meta_str, str) and meta_str:
                     try:
                         meta = json.loads(meta_str)
-                        # Try to find a URL or ID
-                        doc_id = meta.get("path", "")
-                        if "metadata" in meta and isinstance(meta["metadata"], dict):
+                        path = meta.get("path", "")
+                        linenum = meta.get("linenum", "")
+                        if path and linenum != "":
+                            doc_id = f"{path}:{linenum}"
+                        elif "metadata" in meta and isinstance(meta["metadata"], dict):
                             url = meta["metadata"].get("url", "")
                             if url:
                                 doc_id = url
-                            linenum = meta.get("linenum", "")
-                            if linenum:
-                                doc_id = f"{meta.get('path', '')}:{linenum}"
                     except json.JSONDecodeError:
                         pass
 
@@ -707,6 +805,90 @@ def peek_and_grab(
 # Full experiment
 # ================================================================
 
+import re
+def extract_terms(from_queries):
+    terms = []
+    for q in from_queries:
+        terms.extend(re.findall(r'\((.*?)\)', q))
+    return terms
+
+
+
+def fix_doc_text(text, from_queries):
+    """
+    Fix missing spaces around matched keywords in a single text string.
+    
+    Args:
+        text: Document text string.
+        keywords: Set of keyword strings to fix spacing around.
+    
+    Returns fixed text.
+    """
+    import re
+    keywords = extract_terms(from_queries)
+
+    for kw in keywords:
+        escaped = re.escape(kw)
+        # Add space before keyword if preceded by word char
+        text = re.sub(r'(\w)(' + escaped + r')', r'\1 \2', text)
+        # Add space after keyword if followed by word char
+        text = re.sub(r'(' + escaped + r')(\w)', r'\1 \2', text)
+
+    return text
+
+
+def fix_doc_spacing(documents, queries=None):
+    """
+    Fix missing spaces around matched keywords in all document texts.
+    Modifies documents in place.
+    """
+
+    for doc in documents:
+        doc["text"] = fix_doc_text(doc.get("text", ""), doc['from_queries'])
+
+    return documents
+
+
+def save_results(result, path="./api_results.pkl"):
+    import pickle
+
+    # Load existing results if file exists
+    results = []
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            results = pickle.load(f)
+
+    # Check for duplicate (same query + model)
+    key = (result.get("query", ""), result.get("model", ""))
+    for i, r in enumerate(results):
+        if (r.get("query", ""), r.get("model", "")) == key:
+            results[i] = result  # overwrite with latest
+            with open(path, "wb") as f:
+                pickle.dump(results, f)
+            print(f"Updated existing result ({key[1]}: {key[0][:50]}...) in {path} ({len(results)} total)")
+            return
+
+    results.append(result)
+    with open(path, "wb") as f:
+        pickle.dump(results, f)
+    print(f"Saved result ({key[1]}: {key[0][:50]}...) to {path} ({len(results)} total)")
+
+
+def load_results(path="./api_results.pkl"):
+    """Load saved experiment results."""
+    import pickle
+
+    with open(path, "rb") as f:
+        results = pickle.load(f)
+
+    print(f"Loaded {len(results)} results from {path}")
+    for i, r in enumerate(results):
+        print(f"  [{i}] {r.get('model', '?')}: {r.get('query', '?')[:60]}... "
+              f"({r.get('n_documents', 0)} docs)")
+
+    return results
+
+
 def run_experiment(
     query: str,
     model: str = "claude-sonnet-4-20250514",
@@ -716,6 +898,10 @@ def run_experiment(
     max_standalone_key: int = 1500,
     max_budget: int = 20000,
     retrieve_docs: bool = True,
+    max_docs_per_query: int = 10,
+    max_queries: int = None,
+    max_disp_len: int = 500,
+    api_delay: float = 0.5,
     verbose: bool = True,
 ):
     """
@@ -738,6 +924,21 @@ def run_experiment(
     print(f"\nQuery: {query}")
     print(f"Model: {model}")
     print(f"Index: {index}")
+
+    # Set API delay
+    global API_DELAY
+    API_DELAY = api_delay
+
+    # Check if already completed
+    results_path = cache_path.replace(".jsonl", "_results.pkl")
+    if os.path.exists(results_path):
+        import pickle
+        with open(results_path, "rb") as f:
+            existing = pickle.load(f)
+        for r in existing:
+            if r.get("query") == query and r.get("model") == model and r.get("n_documents", 0) > 0:
+                print(f"  [already done] {len(r.get('documents', []))} docs. Skipping.")
+                return r
 
     # Get expansions
     expansion = get_expansions(query, model=model, cache_path=cache_path)
@@ -775,6 +976,9 @@ def run_experiment(
             result["all_queries"],
             tokenizer=tokenizer,
             index=index,
+            max_docs_per_query=max_docs_per_query,
+            max_queries=max_queries,
+            max_disp_len=max_disp_len,
             verbose=verbose,
         )
         result["documents"] = documents
@@ -782,5 +986,8 @@ def run_experiment(
     else:
         result["documents"] = []
         result["n_documents"] = 0
+
+    # Auto-save
+    save_results(result, path=cache_path.replace(".jsonl", "_results.pkl"))
 
     return result

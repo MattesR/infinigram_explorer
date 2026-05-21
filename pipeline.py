@@ -58,6 +58,7 @@ DEFAULT_CONFIG = {
     "max_budget": 20000,
     "prox_cross": 100,
     "max_assoc_combo": 50000,
+    "budget_fill": True,
 
     # Resolve
     "max_doc_len": 2000,
@@ -158,6 +159,7 @@ def run_pipeline(
         prox_cross=cfg["prox_cross"],
         max_budget=cfg["max_budget"],
         max_assoc_combo=cfg.get("max_assoc_combo", 50000),
+        budget_fill=cfg.get("budget_fill", True),
         verbose=verbose,
         # Pass pre-built pieces
         _pieces=_build_pieces_from_expansion(qid, expansion, tokenizer, engine),
@@ -513,4 +515,4 @@ def _print_eval(eval_results, stages, top_k_list):
                       f"{r['cutoffs']['mrr']:>5.3f} {r['time']:>4.1f}s", end="")
             for k in top_k_list:
                 print(f" {r['cutoffs'][k]['recall']:>7.3f} {r['cutoffs'][k]['ndcg']:>6.3f}", end="")
-            print()
+            print()b
