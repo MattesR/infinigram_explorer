@@ -17,11 +17,11 @@ plt.rcParams.update({
     'font.family': 'serif',
     'font.serif': ['Times New Roman', 'DejaVu Serif'],
     'font.size': 9,
-    'axes.labelsize': 10,
+    'axes.labelsize': 11,
     'axes.titlesize': 11,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'legend.fontsize': 10,
     'figure.dpi': 300,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
@@ -447,6 +447,84 @@ def plot_recall_waterfall_only(curves, output_path, figsize=(3, 3.2)):
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.savefig(output_path)
     plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+
+def plot_recall_waterfall_only_tight(curves, output_path, figsize=(3, 2.7)):
+    """Recall contribution by query type. Compact layout with legend above."""
+    type_order = ["3way_and", "2way_and", "standalone"]
+    recall_contribs = {t: [] for t in type_order}
+
+    for qid, data in curves.items():
+        n_docs = data["n_docs"]
+        type_docs = defaultdict(int)
+
+        for step in data["steps"]:
+            qtype = _classify_step(step["query"])
+            type_docs[qtype] += step["new_docs"]
+
+        for t in type_order:
+            recall_contribs[t].append(
+                type_docs[t] / n_docs * 100 if n_docs else 0
+            )
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    labels = [STEP_LABELS[t] for t in type_order]
+    colors = [STEP_COLORS[t] for t in type_order]
+
+    r_means = [np.mean(recall_contribs[t]) for t in type_order]
+
+    r_bottoms = [0]
+    for m in r_means[:-1]:
+        r_bottoms.append(r_bottoms[-1] + m)
+
+    for mean, bottom, color, label in zip(
+        r_means, r_bottoms, colors, labels
+    ):
+        ax.bar(
+            ['Recall'],
+            [mean],
+            bottom=bottom,
+            color=color,
+            edgecolor='white',
+            linewidth=0.5,
+            width=0.45,
+            label=label
+        )
+
+        if mean > 1:
+            ax.text(
+                0,
+                bottom + mean / 2,
+                f'{mean:.1f}%',
+                ha='center',
+                va='center',
+                fontsize=11,
+                color='white',
+                fontweight='bold'
+            )
+
+    ax.set_ylabel('Recall (%)')
+    ax.set_ylim(0, sum(r_means) * 1.15)
+
+    fig.legend(
+        labels,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=3,
+        frameon=False,
+        fontsize=10,
+        columnspacing=0.8,
+        handletextpad=0.4
+    )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+
+    fig.savefig(output_path)
+    plt.close(fig)
+
     print(f"  Saved: {output_path}")
 
 

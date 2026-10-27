@@ -48,8 +48,36 @@ from itertools import combinations
 from math import log
 from urllib.parse import urlparse
 
-from llm_keyword_filter import STOPWORDS, load_all_expansions
 from trec_output import load_qrels
+
+# Same stopword list as llm_keyword_filter.py (copied so this script does not import spaCy).
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
+    "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "can", "shall", "it",
+    "its", "this", "that", "these", "those", "what", "which", "who",
+    "whom", "how", "when", "where", "why", "not", "no", "nor", "if",
+    "then", "than", "so", "up", "out", "about", "into", "through",
+    "during", "before", "after", "above", "below", "between", "under",
+    "again", "further", "once", "here", "there", "all", "each", "every",
+    "both", "few", "more", "most", "other", "some", "such", "only",
+    "own", "same", "too", "very", "just", "also",
+}
+
+
+def load_all_expansions(path):
+    """Keyword expansions from JSONL (one {"qid": ...} per line) or JSON ({qid: {...}})."""
+    if path.endswith(".jsonl"):
+        out = {}
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    entry = json.loads(line)
+                    out[entry.pop("qid")] = entry
+        return out
+    with open(path) as f:
+        return json.load(f)
 
 
 DEFAULTS = dict(

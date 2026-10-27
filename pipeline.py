@@ -41,9 +41,8 @@ Usage:
 
 import time
 from tqdm import tqdm
-from trec_output import load_qrels
-from full_eval import load_topics
-from llm_keyword_filter import load_all_expansions
+
+from utils import load_all_expansions, load_topics, load_qrels
 from ir_metrics import compute_metrics
 
 
@@ -515,4 +514,4 @@ def _print_eval(eval_results, stages, top_k_list):
                       f"{r['cutoffs']['mrr']:>5.3f} {r['time']:>4.1f}s", end="")
             for k in top_k_list:
                 print(f" {r['cutoffs'][k]['recall']:>7.3f} {r['cutoffs'][k]['ndcg']:>6.3f}", end="")
-            print()b
+            print()
