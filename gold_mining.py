@@ -21,11 +21,11 @@ Everything is printed and written to <out_dir>/<qid>/.
 
 Python:
     from gold_mining import analyze_query
-    res = analyze_query("2024-32912", engine, tokenizer, corpus_dir="/path/to/msmarco_v2.1_doc_segmented")
+    res = analyze_query("2024-32912", engine, tokenizer)   # texts from the Lucene index (default path)
 
 CLI:
     python gold_mining.py --qid 2024-32912 --index_dir /home/mruc/msmarco_segmented_index/ \
-        --corpus_dir /path/to/msmarco_v2.1_doc_segmented
+        --lucene_index ../infinisearch_data/lucene_index_msmarco_segmented
 
 Notes
   * Costs are index counts (occurrences, summed over queries). They overstate the number of
@@ -84,7 +84,8 @@ DEFAULTS = dict(
     qrels_path="./qrels.rag24.test-umbrela-all.txt",
     topics_path="./topics_rag24_test.txt",
     expansions_path="./kiss.jsonl",          # Opus expansions used in the paper
-    corpus_dir=None,                         # folder with msmarco_v2.1_doc_segmented_XX.json.gz
+    lucene_index="../infinisearch_data/lucene_index_msmarco_segmented",  # gold texts by id (fast)
+    corpus_dir=None,                         # fallback: folder with msmarco_v2.1_doc_segmented_XX.json.gz
     out_dir="./gold_mining",
     bm25_pool_pkl="./bm_25_baseline_results_large_pool.pkl",
     n_docs_in_index=113_520_750,             # N for the RSJ weight: segments in MS MARCO v2.1 (check)
@@ -124,6 +125,34 @@ def load_topics(path):
     return topics
 
 
+def fetch_segments_lucene(doc_ids, lucene_index):
+    """Look up segments by id in the Pyserini/Lucene index (stored raw JSON). Fast: one lookup per id."""
+    from pyserini.search.lucene import LuceneSearcher
+    searcher = LuceneSearcher(lucene_index)
+    found = {}
+    for did in doc_ids:
+        doc = searcher.doc(did)
+        if doc is None:
+            continue
+        raw = json.loads(doc.raw())
+        found[did] = {
+            "text": raw.get("segment", raw.get("body", raw.get("text", ""))),
+            "url": raw.get("url", ""),
+            "title": raw.get("title", ""),
+        }
+    print(f"  looked up {len(found)} of {len(doc_ids)} segments in {lucene_index}")
+    return found
+
+
+def fetch_texts(doc_ids, lucene_index=None, corpus_dir=None):
+    """Gold texts by id: Lucene index if given, else a scan of the gzipped corpus files."""
+    if lucene_index and os.path.exists(lucene_index):
+        return fetch_segments_lucene(doc_ids, lucene_index)
+    if corpus_dir:
+        return fetch_segments(doc_ids, corpus_dir)
+    raise ValueError(f"Lucene index not found at {lucene_index!r} and no corpus_dir given.")
+
+
 def fetch_segments(doc_ids, corpus_dir):
     """Read segments from the gzipped MS MARCO v2.1 segmented corpus.
 
@@ -160,7 +189,7 @@ def relevant_ids(qrels, qid):
     return {d: g for d, g in qrels.get(qid, {}).items() if g >= 1}
 
 
-def prefetch_relevant_docs(qids, qrels, corpus_dir, out_dir):
+def prefetch_relevant_docs(qids, qrels, out_dir, lucene_index=None, corpus_dir=None):
     """Fetch the relevant segments of several queries in one corpus pass and cache them per query."""
     todo = [q for q in qids if not os.path.exists(_docs_cache_path(out_dir, q))]
     if not todo:
@@ -168,7 +197,7 @@ def prefetch_relevant_docs(qids, qrels, corpus_dir, out_dir):
     all_ids = set()
     for q in todo:
         all_ids |= set(relevant_ids(qrels, q))
-    texts = fetch_segments(all_ids, corpus_dir)
+    texts = fetch_texts(all_ids, lucene_index, corpus_dir)
     for q in todo:
         _write_docs_cache(out_dir, q, relevant_ids(qrels, q), texts)
 
@@ -186,7 +215,7 @@ def _write_docs_cache(out_dir, qid, grades, texts):
                 f.write(json.dumps({"doc_id": did, "grade": g, **texts[did]}) + "\n")
 
 
-def load_relevant_docs(qid, qrels, corpus_dir, out_dir):
+def load_relevant_docs(qid, qrels, out_dir, lucene_index=None, corpus_dir=None):
     """Relevant segments of one query as dicts with doc_id, grade, parent, group, text.
 
     parent = the web page the segment belongs to; group = its domain (used for folds).
@@ -195,9 +224,7 @@ def load_relevant_docs(qid, qrels, corpus_dir, out_dir):
     grades = relevant_ids(qrels, qid)
     path = _docs_cache_path(out_dir, qid)
     if not os.path.exists(path):
-        if corpus_dir is None:
-            raise ValueError(f"No cached texts at {path}; pass corpus_dir to fetch them.")
-        _write_docs_cache(out_dir, qid, grades, fetch_segments(grades, corpus_dir))
+        _write_docs_cache(out_dir, qid, grades, fetch_texts(grades, lucene_index, corpus_dir))
 
     docs = []
     with open(path) as f:
@@ -323,10 +350,15 @@ def index_tokens(tokens, max_len):
 
 
 def phrase_variants(phrase, tokenizer, max_len):
-    """Token ids of the case forms: as written, lowercase, first letter capitalised."""
+    """Token ids of the case forms: as written, lowercase, first letter capitalised, Title Case.
+
+    Title Case matches what the current pipeline gets by capitalising each word separately
+    (needed for names written in lowercase, e.g. Opus' "vietnam war" -> "Vietnam War").
+    """
     lower = phrase.lower()
+    title = " ".join(w[:1].upper() + w[1:] for w in lower.split())
     out = []
-    for form in dict.fromkeys([phrase, lower, lower[:1].upper() + lower[1:]]):
+    for form in dict.fromkeys([phrase, lower, lower[:1].upper() + lower[1:], title]):
         ids = tokenizer.encode(form, add_special_tokens=False)
         if ids and len(ids) <= max_len and ids not in out:
             out.append(ids)
@@ -439,6 +471,8 @@ def build_pairs(terms, per_split, splits, engine, cache, cfg):
     local = []
     for a, b in combinations(keys, 2):
         if _contains(a, b) or _contains(b, a):
+            continue
+        if f"{a} {b}" in terms or f"{b} {a}" in terms:   # just a phrase split into its words
             continue
         ta, tb = terms[a], terms[b]
         if max(ta["count"], tb["count"]) < cfg["broad_floor"]:
@@ -574,7 +608,7 @@ def _write_csv(path, rows, fields):
 
 
 def _fmt_budget(B):
-    return f"{B // 1000}k"
+    return f"{B // 1000}k" if B >= 1000 else str(B)
 
 
 def print_header(qid, query, docs, n_missing, n_folds, cfg):
@@ -667,7 +701,7 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
         query_text = load_topics(cfg["topics_path"]).get(qid, "")
 
     # 1. relevant documents, tokens, folds
-    docs, n_missing = load_relevant_docs(qid, qrels, cfg["corpus_dir"], cfg["out_dir"])
+    docs, n_missing = load_relevant_docs(qid, qrels, cfg["out_dir"], cfg["lucene_index"], cfg["corpus_dir"])
     for d in docs:
         d["tokens"] = tokenizer.encode(d["text"], add_special_tokens=False)
         d["ngrams"] = index_tokens(d["tokens"], cfg["max_tokens"])
@@ -713,11 +747,97 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
         "config": {k: v for k, v in cfg.items() if k != "budgets"} | {"budgets": list(cfg["budgets"])},
         "recall_at": {name: res["recall_at"] for name, res in results.items()},
         "recall_top_at": {name: res["recall_top_at"] for name, res in results.items()},
+        "pools": {name: {"n_selected": len(res["singles"]), "n_pairs": len(res["pairs"]),
+                         "n_steps": len(res["trace"]), "n_warnings": len(res["warnings"])}
+                  for name, res in results.items()},
     }
     save_outputs(qdir, cand_rows, results, summary)
     print(f"\nsaved to {qdir}/")
     return {"docs": docs, "mined_terms": mined_terms, "opus_terms": opus_terms,
             "results": results, "summary": summary}
+
+
+def _stats(values):
+    """Mean, median and CVaR10 (mean of the worst 10%) of a list of numbers."""
+    v = sorted(values)
+    n = len(v)
+    median = v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+    k = max(1, n // 10)
+    return sum(v) / n, median, sum(v[:k]) / k
+
+
+def _load_summary(path):
+    """summary.json with budget keys turned back into ints."""
+    with open(path) as f:
+        s = json.load(f)
+    for key in ("recall_at", "recall_top_at"):
+        s[key] = {pool: {int(B): r for B, r in vals.items()} for pool, vals in s[key].items()}
+    return s
+
+
+def write_summary(summaries, failed, out_dir, budgets):
+    """Average recall per budget over all queries: printed, and saved as summary.md + CSVs."""
+    n = len(summaries)
+    pools = list(summaries[0]["recall_at"])
+    hdr = "| pool | " + " | ".join(_fmt_budget(B) for B in budgets) + " |"
+    sep = "|---|" + "---|" * len(budgets)
+
+    lines = ["# Gold mining summary", "",
+             f"{n} queries analysed, {len(failed)} failed. Recall over all relevant segments "
+             f"(grade >= 1); budget = summed index counts (overstates unique documents).", ""]
+    for title, idx in [("Mean recall", 0), ("Median recall", 1), ("CVaR10 recall (mean of the worst 10% of queries)", 2)]:
+        lines += [f"## {title}", "", hdr, sep]
+        for p in pools:
+            vals = [_stats([s["recall_at"][p][B] for s in summaries])[idx] for B in budgets]
+            lines.append(f"| {p} | " + " | ".join(f"{x:.3f}" for x in vals) + " |")
+        lines.append("")
+    lines += ["## Mean recall on grade >= 2 segments only", "", hdr, sep]
+    for p in pools:
+        vals = [_stats([s["recall_top_at"][p][B] for s in summaries])[0] for B in budgets]
+        lines.append(f"| {p} | " + " | ".join(f"{x:.3f}" for x in vals) + " |")
+    lines.append("")
+
+    bm = [s for s in summaries if s.get("bm25")]
+    if bm:
+        mean_bm = sum(s["bm25"]["recall"] for s in bm) / len(bm)
+        mean_pool = sum(s["bm25"]["pool"] for s in bm) / len(bm)
+        lines += ["## BM25 reference", "",
+                  f"BM25 mean recall **{mean_bm:.3f}** at {mean_pool:,.0f} unique docs ({len(bm)} queries).", ""]
+        for p in pools:
+            for B in [b for b in budgets if b in (25_000, 40_000)]:
+                wins = sum(s["recall_at"][p][B] >= s["bm25"]["recall"] for s in bm)
+                lines.append(f"- {p} at {_fmt_budget(B)} >= BM25 on {wins} of {len(bm)} queries")
+        lines.append("")
+
+    lines += ["## Pool statistics (mean per query)", "",
+              "| pool | selected terms | pairs counted | oracle steps | warnings |", "|---|---|---|---|---|"]
+    for p in pools:
+        m = {k: sum(s["pools"][p][k] for s in summaries) / n
+             for k in ("n_selected", "n_pairs", "n_steps", "n_warnings")}
+        lines.append(f"| {p} | {m['n_selected']:.1f} | {m['n_pairs']:.1f} | {m['n_steps']:.1f} | {m['n_warnings']:.1f} |")
+    lines += ["", f"Mean relevant segments per query: {sum(s['n_relevant'] for s in summaries) / n:.1f}; "
+                  f"relevant segments without text: {sum(s['n_missing_text'] for s in summaries)} in total.", ""]
+    if failed:
+        lines += ["## Failed queries", ""] + [f"- {q}: {err}" for q, err in failed] + [""]
+
+    text = "\n".join(lines)
+    print("\n" + text)
+    with open(os.path.join(out_dir, "summary.md"), "w") as f:
+        f.write(text)
+
+    per_query = []
+    for s in summaries:
+        row = {"qid": s["qid"], "query": s["query"], "n_relevant": s["n_relevant"],
+               "bm25_recall": s["bm25"]["recall"] if s.get("bm25") else ""}
+        for p in pools:
+            for B in budgets:
+                row[f"{p}@{_fmt_budget(B)}"] = round(s["recall_at"][p][B], 4)
+        per_query.append(row)
+    _write_csv(os.path.join(out_dir, "summary_per_query.csv"), per_query, list(per_query[0]))
+    mean_rows = [{"pool": p, **{_fmt_budget(B): round(_stats([s["recall_at"][p][B] for s in summaries])[0], 4)
+                                for B in budgets}} for p in pools]
+    _write_csv(os.path.join(out_dir, "summary_mean.csv"), mean_rows, ["pool"] + [_fmt_budget(B) for B in budgets])
+    print(f"\nsummary written to {out_dir}/summary.md, summary_per_query.csv, summary_mean.csv")
 
 
 def load_resources(index_dir, tokenizer_name):
@@ -733,7 +853,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--qid", nargs="+", help="one or more query ids")
     ap.add_argument("--all_topics", action="store_true", help="run every topic in the topics file")
-    ap.add_argument("--index_dir", required=True)
+    ap.add_argument("--index_dir", help="infini-gram index (not needed with --fetch_only)")
+    ap.add_argument("--fetch_only", action="store_true",
+                    help="only look up the gold texts and cache them in <out_dir>/<qid>/; no infini-gram index needed")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse <out_dir>/<qid>/summary.json of queries that already finished")
+    ap.add_argument("--lucene_index", default=DEFAULTS["lucene_index"])
     ap.add_argument("--corpus_dir", default=None)
     ap.add_argument("--tokenizer", default="meta-llama/Llama-2-7b-hf")
     for key in ["qrels_path", "topics_path", "expansions_path", "out_dir", "bm25_pool_pkl"]:
@@ -743,32 +868,38 @@ def main():
     args = ap.parse_args()
 
     overrides = {k: getattr(args, k) for k in [
-        "corpus_dir", "qrels_path", "topics_path", "expansions_path", "out_dir", "bm25_pool_pkl",
+        "lucene_index", "corpus_dir", "qrels_path", "topics_path", "expansions_path", "out_dir", "bm25_pool_pkl",
         "min_grade", "n_folds", "top_k", "window", "max_candidates"]}
     qids = list(load_topics(args.topics_path)) if args.all_topics else args.qid
     if not qids:
         ap.error("give --qid or --all_topics")
 
-    if len(qids) > 1 and args.corpus_dir:
-        prefetch_relevant_docs(qids, load_qrels(args.qrels_path), args.corpus_dir, args.out_dir)
+    if args.fetch_only or len(qids) > 1:
+        prefetch_relevant_docs(qids, load_qrels(args.qrels_path), args.out_dir,
+                               args.lucene_index, args.corpus_dir)
+    if args.fetch_only:
+        print(f"cached gold texts for {len(qids)} queries in {args.out_dir}/<qid>/relevant_docs.jsonl")
+        return
+    if not args.index_dir:
+        ap.error("--index_dir is required unless --fetch_only")
 
     tokenizer, engine = load_resources(args.index_dir, args.tokenizer)
-    summaries = [analyze_query(q, engine, tokenizer, **overrides)["summary"] for q in qids]
+    summaries, failed = [], []
+    for n, q in enumerate(qids, 1):
+        done = os.path.join(args.out_dir, q, "summary.json")
+        if args.resume and os.path.exists(done):
+            print(f"[{n}/{len(qids)}] {q}: reusing {done}")
+            summaries.append(_load_summary(done))
+            continue
+        print(f"\n[{n}/{len(qids)}] {q}")
+        try:
+            summaries.append(analyze_query(q, engine, tokenizer, **overrides)["summary"])
+        except Exception as e:
+            print(f"FAILED {q}: {e!r}")
+            failed.append((q, repr(e)))
 
-    if len(summaries) > 1:
-        budgets = DEFAULTS["budgets"]
-        print("\nMEAN RECALL AT BUDGET over", len(summaries), "queries")
-        print(f"  {'pool':<16}" + "".join(f"{_fmt_budget(B):>8}" for B in budgets))
-        rows = []
-        for name in summaries[0]["recall_at"]:
-            means = [sum(s["recall_at"][name][B] for s in summaries) / len(summaries) for B in budgets]
-            print(f"  {name:<16}" + "".join(f"{m:>8.3f}" for m in means))
-            rows.append({"pool": name, **{_fmt_budget(B): m for B, m in zip(budgets, means)}})
-        bm = [s["bm25"]["recall"] for s in summaries if s["bm25"]]
-        if bm:
-            print(f"  BM25 reference: mean recall {sum(bm) / len(bm):.3f} at ~25.7k unique docs")
-        _write_csv(os.path.join(args.out_dir, "summary_mean.csv"), rows,
-                   ["pool"] + [_fmt_budget(B) for B in budgets])
+    if summaries:
+        write_summary(summaries, failed, args.out_dir, DEFAULTS["budgets"])
 
 
 if __name__ == "__main__":
