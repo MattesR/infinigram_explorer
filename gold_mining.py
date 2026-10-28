@@ -433,9 +433,10 @@ def offer_weight(r, R, n, N):
     """Robertson-Sparck Jones weight w and offer weight r*w.
 
     r of R relevant units contain the term, n of N documents in the corpus.
-    n is an occurrence count here, so it is clipped to >= r.
+    n is an occurrence count here, not a document count: it is clipped to >= r, and to
+    <= N - R + r, because very common words can occur more often than there are documents.
     """
-    n = max(n, r)
+    n = min(max(n, r), N - R + r)
     w = log(((r + 0.5) * (N - n - R + r + 0.5)) / ((R - r + 0.5) * (n - r + 0.5)))
     return r * w, w
 
