@@ -42,6 +42,7 @@ import json
 import os
 import pickle
 import re
+import time
 from bisect import bisect_left
 from collections import Counter, defaultdict
 from itertools import combinations
@@ -50,8 +51,26 @@ from urllib.parse import urlparse
 
 from trec_output import load_qrels
 
-# Same stopword list as llm_keyword_filter.py (copied so this script does not import spaCy).
-STOPWORDS = {
+# Stopwords = the list from llm_keyword_filter.py plus the NLTK English stopword list
+# (both copied here, so this script needs neither spaCy nor nltk).
+_NLTK_ENGLISH = """
+i me my myself we our ours ourselves you you're you've you'll you'd your yours yourself yourselves
+he him his himself she she's her hers herself it it's its itself they them their theirs themselves
+what which who whom this that that'll these those am is are was were be been being have has had having
+do does did doing a an the and but if or because as until while of at by for with about against between
+into through during before after above below to from up down in out on off over under again further
+then once here there when where why how all any both each few more most other some such no nor not only
+own same so than too very s t can will just don don't should should've now d ll m o re ve y ain aren
+aren't couldn couldn't didn didn't doesn doesn't hadn hadn't hasn hasn't haven haven't isn isn't ma
+mightn mightn't mustn mustn't needn needn't shan shan't shouldn shouldn't wasn wasn't weren weren't won
+won't wouldn wouldn't
+""".split()
+
+# Terms occurring more often than this share of the corpus are never selected: alone they exceed any
+# budget many times over, and as AND partners they add almost no specificity (people, their, life ...).
+MAX_TERM_FRAC = 0.10
+
+STOPWORDS = set(_NLTK_ENGLISH) | {
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
     "been", "being", "have", "has", "had", "do", "does", "did", "will",
@@ -86,7 +105,8 @@ DEFAULTS = dict(
     expansions_path="./kiss.jsonl",          # Opus expansions used in the paper
     lucene_index="../infinisearch_data/lucene_index_msmarco_segmented",  # gold texts by id (fast)
     corpus_dir=None,                         # fallback: folder with msmarco_v2.1_doc_segmented_XX.json.gz
-    out_dir="./gold_mining",
+    data_dir="./gold_mining",                # gold texts (relevant_docs.jsonl) + count cache, shared by runs
+    out_dir="./gold_mining",                 # results of this run
     bm25_pool_pkl="./bm_25_baseline_results_large_pool.pkl",
     n_docs_in_index=113_520_750,             # N for the RSJ weight: segments in MS MARCO v2.1 (check)
     min_grade=2,           # mine only from segments with grade >= min_grade
@@ -100,6 +120,10 @@ DEFAULTS = dict(
     broad_floor=1000,      # a pair needs at least one term with count >= this
     min_pair_cover=2,      # a pair must cover >= this many held-out relevant segments
     max_pairs=400,         # cap on pairs that get counted
+    triples=False,         # experiment: refine low-precision pairs into triples (tau rule)
+    tau=5.0,               # refine a pair when it adds < tau new relevant docs per 1,000 count
+    triples_per_pair=5,    # third terms counted per refined pair (most kept relevant docs first)
+    query_budgets=(10, 20, 50, 100),  # recall is also reported after the first N queries
     beta=10.0,             # smoothing in the greedy score gain / (count + beta)
     budgets=(1_000, 5_000, 10_000, 25_000, 40_000, 100_000),
     max_clause_freq=80_000_000,
@@ -382,24 +406,41 @@ def within_window(pos_a, pos_b, window):
     return False
 
 
+# Bookkeeping of index count calls, reset for every query:
+# COUNT_STATS[(label, kind, field)] with label = which part of the analysis asked
+# (candidates_mined, candidates_opus, or a pool name), kind = piece / pair / triple, and
+# field = requested (every call, cached or not), fresh (actually sent to the engine), seconds.
+COUNT_STATS = defaultdict(float)
+_LABEL = ["-"]
+
+
+def cached_count(engine, clauses, cache, cfg, kind, key, window=None):
+    """One count_cnf call through the cache, recorded in COUNT_STATS. Returns (count, approx)."""
+    COUNT_STATS[(_LABEL[0], kind, "requested")] += 1
+    if key not in cache:
+        kwargs = {"max_clause_freq": cfg["max_clause_freq"]}
+        if window is not None:
+            kwargs["max_diff_tokens"] = window
+        t0 = time.perf_counter()
+        res = engine.count_cnf(clauses, **kwargs)
+        COUNT_STATS[(_LABEL[0], kind, "fresh")] += 1
+        COUNT_STATS[(_LABEL[0], kind, "seconds")] += time.perf_counter() - t0
+        cache[key] = (res.get("count", 0), bool(res.get("approx", False)))
+    value = cache[key]
+    return value if isinstance(value, tuple) else (value, False)   # older caches stored plain counts
+
+
 def count_piece(engine, variants, cache, cfg):
     """Index count of one exact-phrase piece (its case forms OR'ed in one clause)."""
     key = ("piece", tuple(map(tuple, variants)))
-    if key not in cache:
-        res = engine.count_cnf([variants], max_clause_freq=cfg["max_clause_freq"])
-        cache[key] = res.get("count", 0)
-    return cache[key]
+    return cached_count(engine, [variants], cache, cfg, "piece", key)[0]
 
 
 def count_pair(engine, va, vb, cache, cfg):
     """Index count of (a) AND (b) within cfg['window'] tokens. Returns (count, approx)."""
     a, b = sorted([tuple(map(tuple, va)), tuple(map(tuple, vb))])
     key = ("pair", a, b, cfg["window"])
-    if key not in cache:
-        res = engine.count_cnf([va, vb], max_clause_freq=cfg["max_clause_freq"],
-                               max_diff_tokens=cfg["window"])
-        cache[key] = (res.get("count", 0), bool(res.get("approx", False)))
-    return cache[key]
+    return cached_count(engine, [va, vb], cache, cfg, "pair", key, window=cfg["window"])
 
 
 def prepare_terms(phrases, docs, tokenizer, engine, cache, cfg):
@@ -452,7 +493,8 @@ def score_terms(terms, docs, mining_idx, cfg, min_support):
         rows.append({
             "key": t["key"], "phrase": t["phrase"], "r": r, "R": R,
             "count": t["count"], "w": w, "ow": ow,
-            "eligible": r >= min_support and w > 0 and t["count"] > 0,
+            "eligible": (r >= min_support and w > 0
+                         and 0 < t["count"] <= MAX_TERM_FRAC * cfg["n_docs_in_index"]),
         })
     rows.sort(key=lambda x: -x["ow"])
     return rows
@@ -496,12 +538,68 @@ def build_pairs(terms, per_split, splits, engine, cache, cfg):
         if count == 0:
             warnings.append(f"pair matches {len(H)} gold docs locally but count 0: {query}")
             continue
-        pairs.append({"kind": "pair", "query": query, "count": count, "approx": approx, "H": H})
+        pairs.append({"kind": "pair", "query": query, "count": count, "approx": approx, "H": H,
+                      "terms": (a, b)})
     return pairs, warnings
 
 
-def greedy_oracle(candidates, docs, cfg):
-    """Pick, step by step, the candidate with most new relevant docs per count, within the budget."""
+def _has_between(pos, lo, hi):
+    j = bisect_left(pos, lo)
+    return j < len(pos) and pos[j] <= hi
+
+
+def within_span(position_lists, window):
+    """True if one occurrence of every term lies inside some stretch of <= window tokens."""
+    for start in sorted(p for pos in position_lists for p in pos):
+        if all(_has_between(pos, start, start + window) for pos in position_lists):
+            return True
+    return False
+
+
+def triples_for_pair(pair, covered, terms, per_split, split_of, keys, engine, cache, cfg):
+    """Third-term candidates for one pair (tau rule): the triples that keep most of the pair's
+    still uncovered relevant docs, counted in the index (at most `triples_per_pair`).
+
+    A third term c is credited on a held-out doc only if c was selected in that doc's split and
+    a, b and c all occur within one stretch of `window` tokens.
+    """
+    a, b = pair["terms"]
+    still_new = pair["H"] - covered
+    local = []
+    for c in keys:
+        if c in (a, b) or any(_contains(c, x) or _contains(x, c) for x in (a, b)):
+            continue
+        tc = terms[c]
+        H = {i for i in pair["H"] & tc["docs"]
+             if c in per_split[split_of[i]]
+             and within_span([terms[a]["positions"][i], terms[b]["positions"][i], tc["positions"][i]],
+                             cfg["window"])}
+        keep = len(H & still_new)
+        if keep:
+            local.append((keep, c, H))
+    local.sort(key=lambda x: -x[0])
+
+    triples, warnings = [], []
+    for _, c, H in local[:cfg["triples_per_pair"]]:
+        clauses = [terms[a]["variants"], terms[b]["variants"], terms[c]["variants"]]
+        key = ("triple", tuple(sorted(tuple(map(tuple, v)) for v in clauses)), cfg["window"])
+        count, approx = cached_count(engine, clauses, cache, cfg, "triple", key, window=cfg["window"])
+        query = f"({terms[a]['phrase']}) AND ({terms[b]['phrase']}) AND ({terms[c]['phrase']})"
+        if count == 0:
+            warnings.append(f"triple matches {len(H)} gold docs locally but count 0: {query}")
+            continue
+        triples.append({"kind": "triple", "query": query, "count": count, "approx": approx, "H": H,
+                        "pair": pair["query"], "pair_count": pair["count"]})
+    return triples, warnings
+
+
+def greedy_oracle(candidates, docs, cfg, refine=None):
+    """Pick, step by step, the candidate with most new relevant docs per count, within the budget.
+
+    tau rule (only when `refine` is given): before a pair is accepted with fewer than tau new
+    relevant docs per 1,000 count, refine(pair, covered) adds its best triples to the pool and the
+    choice is made again. Each pair is refined at most once; if no triple beats it, it is taken.
+    """
     n_all = len(docs)
     n_top = sum(d["grade"] >= cfg["min_grade"] for d in docs) or 1
     b_max = cfg["budgets"][-1]
@@ -517,17 +615,34 @@ def greedy_oracle(candidates, docs, cfg):
                 best, best_score = c, gain / (c["count"] + cfg["beta"])
         if best is None:
             break
+        gain = len(best["H"] - covered)
+        if (refine is not None and best["kind"] == "pair" and not best.get("refined")
+                and 1000 * gain / best["count"] < cfg["tau"]):
+            best["refined"] = True
+            pool.extend(t for t in refine(best, covered) if t["H"] and t["count"] > 0)
+            continue
         new = best["H"] - covered
         covered |= new
         cost += best["count"]
         pool.remove(best)
         trace.append({
             "step": len(trace) + 1, "kind": best["kind"], "query": best["query"],
-            "count": best["count"], "new_docs": len(new), "cum_cost": cost,
+            "count": best["count"], "new_docs": len(new),
+            "per_1000": 1000 * len(new) / best["count"], "cum_cost": cost,
             "recall": len(covered) / n_all,
             "recall_top": sum(docs[i]["grade"] >= cfg["min_grade"] for i in covered) / n_top,
         })
     return trace
+
+
+def queries_at_budgets(trace, budgets):
+    """Number of CNF queries the oracle set contains at each budget, by kind."""
+    out = {}
+    for B in budgets:
+        steps = [t for t in trace if t["cum_cost"] <= B]
+        kinds = Counter(t["kind"] for t in steps)
+        out[B] = {"total": len(steps), "single": kinds["single"], "pair": kinds["pair"], "triple": kinds["triple"]}
+    return out
 
 
 def recall_at_budgets(trace, budgets, key="recall"):
@@ -536,6 +651,11 @@ def recall_at_budgets(trace, budgets, key="recall"):
         steps = [t for t in trace if t["cum_cost"] <= B]
         out[B] = steps[-1][key] if steps else 0.0
     return out
+
+
+def recall_after_queries(trace, query_budgets):
+    """Recall after the first N queries of the oracle set (all of them if it has fewer)."""
+    return {N: trace[min(N, len(trace)) - 1]["recall"] if trace else 0.0 for N in query_budgets}
 
 
 def run_pool(terms, docs, splits, engine, cache, cfg, min_support):
@@ -561,11 +681,26 @@ def run_pool(terms, docs, splits, engine, cache, cfg, min_support):
     for t in terms.values():
         if t["count"] == 0 and t["docs"]:
             warnings.append(f"term matches {len(t['docs'])} gold docs locally but count 0: {t['phrase']}")
-    trace = greedy_oracle(singles + pairs, docs, cfg)
+
+    triples, refine = [], None
+    if cfg["triples"]:
+        split_of = {i: s for s, (_, eval_idx) in enumerate(splits) for i in eval_idx}
+        keys = sorted(set().union(*per_split)) if per_split else []
+
+        def refine(pair, covered):
+            new, w = triples_for_pair(pair, covered, terms, per_split, split_of, keys, engine, cache, cfg)
+            triples.extend(new)
+            warnings.extend(w)
+            return new
+
+    trace = greedy_oracle(singles + pairs, docs, cfg, refine)
     return {
-        "singles": singles, "pairs": pairs, "trace": trace, "warnings": warnings,
+        "singles": singles, "pairs": pairs, "triples": triples, "trace": trace, "warnings": warnings,
+        "n_refined": sum(1 for p in pairs if p.get("refined")),
         "recall_at": recall_at_budgets(trace, cfg["budgets"]),
         "recall_top_at": recall_at_budgets(trace, cfg["budgets"], key="recall_top"),
+        "queries_at": queries_at_budgets(trace, cfg["budgets"]),
+        "recall_after": recall_after_queries(trace, cfg["query_budgets"]),
     }
 
 
@@ -641,7 +776,8 @@ def print_candidates(rows, heldout, n_total, cfg):
 def print_pool(name, res, docs, cfg):
     n = len(docs)
     print(f"\n--- {name} " + "-" * (95 - len(name)))
-    print(f"selected terms: {len(res['singles'])}   pairs counted: {len(res['pairs'])}")
+    print(f"selected terms: {len(res['singles'])}   pairs counted: {len(res['pairs'])}   "
+          f"triples counted: {len(res['triples'])}")
     print(f"  {'selected term':<40} {'count':>11} {'H':>4}  folds")
     for e in res["singles"][:cfg["show"]]:
         print(f"  {e['query'][:40]:<40} {e['count']:>11,} {len(e['H']):>4}  {e['splits']}")
@@ -650,6 +786,10 @@ def print_pool(name, res, docs, cfg):
         for p in sorted(res["pairs"], key=lambda p: -len(p["H"]))[:cfg["show"] // 2]:
             flag = " (approx)" if p["approx"] else ""
             print(f"  {p['query'][:60]:<60} {p['count']:>11,} {len(p['H']):>4}{flag}")
+    if res["triples"]:
+        print(f"  {'top triples':<75} {'count':>9} {'pair':>9} {'H':>4}")
+        for t in sorted(res["triples"], key=lambda t: -len(t["H"]))[:cfg["show"] // 2]:
+            print(f"  {t['query'][:75]:<75} {t['count']:>9,} {t['pair_count']:>9,} {len(t['H']):>4}")
     print(f"  oracle trace (first {cfg['show']} of {len(res['trace'])} steps), recall over {n} relevant segments")
     print(f"  {'step':>4} {'query':<60} {'count':>9} {'new':>4} {'cum cost':>10} {'recall':>7}")
     for t in res["trace"][:cfg["show"]]:
@@ -671,6 +811,25 @@ def print_comparison(results, bm25, cfg):
         print(f"  BM25 reference: recall {bm25['recall']:.3f} at {bm25['pool']:,} unique docs")
 
 
+def print_index_cost(results, cfg):
+    """CNF queries the oracle set needs per budget, and the count calls made while mining."""
+    budgets = cfg["budgets"]
+    print("\nCNF QUERIES IN THE ORACLE SET (total / of which triples)")
+    print(f"  {'pool':<16}" + "".join(f"{_fmt_budget(B):>10}" for B in budgets))
+    for name, res in results.items():
+        cells = [f"{res['queries_at'][B]['total']}/{res['queries_at'][B]['triple']}" for B in budgets]
+        print(f"  {name:<16}" + "".join(f"{c:>10}" for c in cells))
+    print("RECALL AFTER THE FIRST N QUERIES")
+    qb = cfg["query_budgets"]
+    print(f"  {'pool':<16}" + "".join(f"{N:>10}" for N in qb))
+    for name, res in results.items():
+        print(f"  {name:<16}" + "".join(f"{res['recall_after'][N]:>10.3f}" for N in qb))
+    print("COUNT CALLS WHILE MINING (requested / sent to the engine / engine seconds)")
+    for (label, kind) in sorted({(l, k) for (l, k, _) in COUNT_STATS}):
+        g = lambda f: COUNT_STATS.get((label, kind, f), 0)
+        print(f"  {label:<18} {kind:<7} {int(g('requested')):>6} / {int(g('fresh')):>6} / {g('seconds'):>8.1f}s")
+
+
 def save_outputs(qdir, cand_rows, results, summary):
     _write_csv(os.path.join(qdir, "candidates_mined.csv"), cand_rows,
                ["phrase", "r", "R", "count", "w", "ow", "eligible", "heldout_folds", "heldout_H"])
@@ -681,8 +840,11 @@ def save_outputs(qdir, cand_rows, results, summary):
         _write_csv(os.path.join(qdir, f"{name}_pairs.csv"),
                    [{**p, "H": len(p["H"])} for p in res["pairs"]],
                    ["query", "count", "approx", "H"])
+        _write_csv(os.path.join(qdir, f"{name}_triples.csv"),
+                   [{**t, "H": len(t["H"])} for t in res["triples"]],
+                   ["query", "count", "pair", "pair_count", "approx", "H"])
         _write_csv(os.path.join(qdir, f"{name}_oracle.csv"), res["trace"],
-                   ["step", "kind", "query", "count", "new_docs", "cum_cost", "recall", "recall_top"])
+                   ["step", "kind", "query", "count", "new_docs", "per_1000", "cum_cost", "recall", "recall_top"])
     with open(os.path.join(qdir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -696,13 +858,13 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
     cfg = {**DEFAULTS, **overrides}
     qdir = os.path.join(cfg["out_dir"], qid)
     os.makedirs(qdir, exist_ok=True)
-    cache = _load_cache(cfg["out_dir"])
+    cache = _load_cache(cfg["data_dir"])
     qrels = load_qrels(cfg["qrels_path"])
     if query_text is None:
         query_text = load_topics(cfg["topics_path"]).get(qid, "")
 
     # 1. relevant documents, tokens, folds
-    docs, n_missing = load_relevant_docs(qid, qrels, cfg["out_dir"], cfg["lucene_index"], cfg["corpus_dir"])
+    docs, n_missing = load_relevant_docs(qid, qrels, cfg["data_dir"], cfg["lucene_index"], cfg["corpus_dir"])
     for d in docs:
         d["tokens"] = tokenizer.encode(d["text"], add_special_tokens=False)
         d["ngrams"] = index_tokens(d["tokens"], cfg["max_tokens"])
@@ -717,17 +879,23 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
     n_mined = len(mined)
     mined = dict(sorted(mined.items(), key=lambda kv: (-kv[1]["support"], -len(kv[0])))[:cfg["max_candidates"]])
     print(f"\nmined candidates: {n_mined} with support >= {cfg['min_support']}, counting {len(mined)}")
+    COUNT_STATS.clear()
+    _LABEL[0] = "candidates_mined"
     mined_terms = prepare_terms({k: v["phrase"] for k, v in mined.items()}, docs, tokenizer, engine, cache, cfg)
+    _LABEL[0] = "candidates_opus"
     opus_terms = prepare_terms(opus_phrases(qid, cfg["expansions_path"]), docs, tokenizer, engine, cache, cfg)
-    _save_cache(cfg["out_dir"], cache)
+    _save_cache(cfg["data_dir"], cache)
 
     # 4.-6. selection, pairs, oracle for each vocabulary
-    results = {
-        "mined_heldout": run_pool(mined_terms, docs, heldout_splits, engine, cache, cfg, cfg["min_support"]),
-        "mined_insample": run_pool(mined_terms, docs, insample_splits, engine, cache, cfg, cfg["min_support"]),
-        "opus_heldout": run_pool(opus_terms, docs, heldout_splits, engine, cache, cfg, 1),
-    }
-    _save_cache(cfg["out_dir"], cache)
+    results = {}
+    for name, terms, splits, min_sup in [
+        ("mined_heldout", mined_terms, heldout_splits, cfg["min_support"]),
+        ("mined_insample", mined_terms, insample_splits, cfg["min_support"]),
+        ("opus_heldout", opus_terms, heldout_splits, 1),
+    ]:
+        _LABEL[0] = name
+        results[name] = run_pool(terms, docs, splits, engine, cache, cfg, min_sup)
+    _save_cache(cfg["data_dir"], cache)
 
     # report
     cand_rows = score_terms(mined_terms, docs, insample_splits[0][0], cfg, cfg["min_support"])
@@ -741,6 +909,7 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
         print_pool(name, res, docs, cfg)
     bm25 = bm25_reference(qid, cfg["bm25_pool_pkl"])
     print_comparison(results, bm25, cfg)
+    print_index_cost(results, cfg)
 
     summary = {
         "qid": qid, "query": query_text, "n_relevant": len(docs), "n_missing_text": n_missing,
@@ -748,7 +917,11 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
         "config": {k: v for k, v in cfg.items() if k != "budgets"} | {"budgets": list(cfg["budgets"])},
         "recall_at": {name: res["recall_at"] for name, res in results.items()},
         "recall_top_at": {name: res["recall_top_at"] for name, res in results.items()},
+        "queries_at": {name: res["queries_at"] for name, res in results.items()},
+        "recall_after": {name: res["recall_after"] for name, res in results.items()},
+        "count_calls": [{"label": l, "kind": k, "field": f, "value": v} for (l, k, f), v in COUNT_STATS.items()],
         "pools": {name: {"n_selected": len(res["singles"]), "n_pairs": len(res["pairs"]),
+                         "n_triples": len(res["triples"]), "n_refined": res["n_refined"],
                          "n_steps": len(res["trace"]), "n_warnings": len(res["warnings"])}
                   for name, res in results.items()},
     }
@@ -771,8 +944,9 @@ def _load_summary(path):
     """summary.json with budget keys turned back into ints."""
     with open(path) as f:
         s = json.load(f)
-    for key in ("recall_at", "recall_top_at"):
-        s[key] = {pool: {int(B): r for B, r in vals.items()} for pool, vals in s[key].items()}
+    for key in ("recall_at", "recall_top_at", "recall_after"):
+        if key in s:
+            s[key] = {pool: {int(B): r for B, r in vals.items()} for pool, vals in s[key].items()}
     return s
 
 
@@ -810,12 +984,50 @@ def write_summary(summaries, failed, out_dir, budgets):
                 lines.append(f"- {p} at {_fmt_budget(B)} >= BM25 on {wins} of {len(bm)} queries")
         lines.append("")
 
+    if all("queries_at" in s for s in summaries):
+        lines += ["## CNF queries in the oracle set (mean per query: total, of which triples)", "", hdr, sep]
+        for p in pools:
+            cells = []
+            for B in budgets:
+                tot = sum(s["queries_at"][p][str(B)]["total"] if str(B) in s["queries_at"][p]
+                          else s["queries_at"][p][B]["total"] for s in summaries) / n
+                tri = sum(s["queries_at"][p][str(B)]["triple"] if str(B) in s["queries_at"][p]
+                          else s["queries_at"][p][B]["triple"] for s in summaries) / n
+                cells.append(f"{tot:.1f} ({tri:.1f})")
+            lines.append(f"| {p} | " + " | ".join(cells) + " |")
+        lines.append("")
+    if all("recall_after" in s for s in summaries):
+        qb = sorted(summaries[0]["recall_after"][pools[0]])
+        lines += ["## Mean recall after the first N queries", "",
+                  "Queries in the oracle's order (most new relevant docs per count first).", "",
+                  "| pool | " + " | ".join(str(N) for N in qb) + " |", "|---|" + "---|" * len(qb)]
+        for p in pools:
+            vals = [sum(s["recall_after"][p][N] for s in summaries) / n for N in qb]
+            lines.append(f"| {p} | " + " | ".join(f"{v:.3f}" for v in vals) + " |")
+        lines.append("")
+    if all("count_calls" in s for s in summaries):
+        tot = defaultdict(float)
+        for s in summaries:
+            for c in s["count_calls"]:
+                tot[(c["label"], c["kind"], c["field"])] += c["value"]
+        lines += ["## Count calls while mining (mean per query)", "",
+                  "Requested = every count the miner asked for; sent = not in the cache yet; "
+                  "seconds per call = engine time of sent calls.", "",
+                  "| part | kind | requested | sent to engine | seconds per call |", "|---|---|---|---|---|"]
+        for (label, kind) in sorted({(l, k) for (l, k, _) in tot}):
+            req, fresh, sec = (tot[(label, kind, f)] for f in ("requested", "fresh", "seconds"))
+            per_call = f"{sec / fresh:.3f}" if fresh else "-"
+            lines.append(f"| {label} | {kind} | {req / n:.1f} | {fresh / n:.1f} | {per_call} |")
+        lines.append("")
+
     lines += ["## Pool statistics (mean per query)", "",
-              "| pool | selected terms | pairs counted | oracle steps | warnings |", "|---|---|---|---|---|"]
+              "| pool | selected terms | pairs counted | pairs refined (tau) | triples counted | oracle steps | warnings |",
+              "|---|---|---|---|---|---|---|"]
     for p in pools:
-        m = {k: sum(s["pools"][p][k] for s in summaries) / n
-             for k in ("n_selected", "n_pairs", "n_steps", "n_warnings")}
-        lines.append(f"| {p} | {m['n_selected']:.1f} | {m['n_pairs']:.1f} | {m['n_steps']:.1f} | {m['n_warnings']:.1f} |")
+        m = {k: sum(s["pools"][p].get(k, 0) for s in summaries) / n
+             for k in ("n_selected", "n_pairs", "n_refined", "n_triples", "n_steps", "n_warnings")}
+        lines.append(f"| {p} | {m['n_selected']:.1f} | {m['n_pairs']:.1f} | {m['n_refined']:.1f} | "
+                     f"{m['n_triples']:.1f} | {m['n_steps']:.1f} | {m['n_warnings']:.1f} |")
     lines += ["", f"Mean relevant segments per query: {sum(s['n_relevant'] for s in summaries) / n:.1f}; "
                   f"relevant segments without text: {sum(s['n_missing_text'] for s in summaries)} in total.", ""]
     if failed:
@@ -862,24 +1074,34 @@ def main():
     ap.add_argument("--lucene_index", default=DEFAULTS["lucene_index"])
     ap.add_argument("--corpus_dir", default=None)
     ap.add_argument("--tokenizer", default="meta-llama/Llama-2-7b-hf")
-    for key in ["qrels_path", "topics_path", "expansions_path", "out_dir", "bm25_pool_pkl"]:
+    ap.add_argument("--triples", action="store_true",
+                    help="experiment: refine pairs below tau new relevant docs per 1,000 count into triples")
+    ap.add_argument("--tau", type=float, default=DEFAULTS["tau"])
+    ap.add_argument("--qid_file", help="file with one query id per line")
+    for key in ["qrels_path", "topics_path", "expansions_path", "data_dir", "out_dir", "bm25_pool_pkl"]:
         ap.add_argument(f"--{key}", default=DEFAULTS[key])
     for key in ["min_grade", "n_folds", "top_k", "window", "max_candidates"]:
         ap.add_argument(f"--{key}", type=int, default=DEFAULTS[key])
     args = ap.parse_args()
 
     overrides = {k: getattr(args, k) for k in [
-        "lucene_index", "corpus_dir", "qrels_path", "topics_path", "expansions_path", "out_dir", "bm25_pool_pkl",
+        "lucene_index", "corpus_dir", "qrels_path", "topics_path", "expansions_path", "data_dir", "out_dir",
+        "bm25_pool_pkl", "triples", "tau",
         "min_grade", "n_folds", "top_k", "window", "max_candidates"]}
-    qids = list(load_topics(args.topics_path)) if args.all_topics else args.qid
+    if args.all_topics:
+        qids = list(load_topics(args.topics_path))
+    elif args.qid_file:
+        qids = [l.strip() for l in open(args.qid_file) if l.strip()]
+    else:
+        qids = args.qid
     if not qids:
-        ap.error("give --qid or --all_topics")
+        ap.error("give --qid, --qid_file or --all_topics")
 
     if args.fetch_only or len(qids) > 1:
-        prefetch_relevant_docs(qids, load_qrels(args.qrels_path), args.out_dir,
+        prefetch_relevant_docs(qids, load_qrels(args.qrels_path), args.data_dir,
                                args.lucene_index, args.corpus_dir)
     if args.fetch_only:
-        print(f"cached gold texts for {len(qids)} queries in {args.out_dir}/<qid>/relevant_docs.jsonl")
+        print(f"cached gold texts for {len(qids)} queries in {args.data_dir}/<qid>/relevant_docs.jsonl")
         return
     if not args.index_dir:
         ap.error("--index_dir is required unless --fetch_only")
