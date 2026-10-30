@@ -34,8 +34,11 @@ for TAU in "${TAUS[@]}"; do RUNS+=("$OUT/tau_$TAU"); done
 
 for RUN in "${RUNS[@]}"; do
   echo "=== diagnostics and figure: $RUN ==="
-  python analyze_gold_mining.py --out_dir "$RUN" --data_dir "$DATA" > "$RUN/diagnostics.log" 2>&1
-  python plot_gold_mining.py --out_dir "$RUN" --tau 5 > "$RUN/figure.log" 2>&1
+  # a failing diagnostics or figure step is reported but does not stop the comparison
+  python analyze_gold_mining.py --out_dir "$RUN" --data_dir "$DATA" > "$RUN/diagnostics.log" 2>&1 \
+    || echo "  diagnostics FAILED for $RUN, see $RUN/diagnostics.log"
+  python plot_gold_mining.py --out_dir "$RUN" --tau 5 > "$RUN/figure.log" 2>&1 \
+    || echo "  figure FAILED for $RUN, see $RUN/figure.log"
 done
 
 echo

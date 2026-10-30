@@ -21,6 +21,19 @@ import pandas as pd
 BANDS = [0, 1_000, 5_000, 10_000, 25_000, 40_000, 100_000]
 
 
+def to_md(df, floatfmt=".3f"):
+    """Markdown table from a DataFrame (no dependency on the optional `tabulate` package)."""
+    def cell(v):
+        if isinstance(v, float):
+            return format(v, floatfmt)
+        return str(v)
+    cols = [str(c) for c in df.columns]
+    lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    for row in df.itertuples(index=False):
+        lines.append("| " + " | ".join(cell(v) for v in row) + " |")
+    return "\n".join(lines)
+
+
 def load_runs(out_dir, pool, data_dir=None):
     """Per-query summary rows and all oracle steps of one pool."""
     queries, steps = [], []
@@ -115,9 +128,9 @@ def main():
     out = [f"# Diagnostics for {p} ({n} queries)", ""]
 
     out += ["## 1. Cost breakdown of the oracle traces", "",
-            cost_breakdown(steps, n).to_markdown(index=False, floatfmt=".3f"), "",
+            to_md(cost_breakdown(steps, n), floatfmt=".3f"), "",
             "Where the oracle stopped (summed count at its last step; budget is 100k):", "",
-            stop_breakdown(queries).to_markdown(index=False, floatfmt=".3f"), ""]
+            to_md(stop_breakdown(queries), floatfmt=".3f"), ""]
 
     corr = queries[[f"{p}@25k", "n_relevant", "share_grade2plus", "bm25"]].corr(method="spearman")[f"{p}@25k"]
     bm = queries.dropna(subset=["bm25"])
@@ -134,13 +147,13 @@ def main():
         insample_25k=("mined_insample@25k", "mean"), opus_25k=("opus_heldout@25k", "mean"),
         bm25=("bm25", "mean")).reset_index()
     out += ["Mean recall at 25k by number of relevant segments:", "",
-            by_size.to_markdown(index=False, floatfmt=".3f"), ""]
+            to_md(by_size, floatfmt=".3f"), ""]
 
     worst = queries.sort_values(f"{p}@25k").head(args.n_worst)
     cols = ["qid", "query", "n_relevant", "share_grade2plus", "bm25", f"{p}@25k", "mined_insample@25k",
             "opus_heldout@25k", f"{p}@100k", "final_cost", "n_steps", "top_terms"]
     out += [f"## Worst {args.n_worst} queries by {p}@25k", "",
-            worst[cols].to_markdown(index=False, floatfmt=".2f"), ""]
+            to_md(worst[cols], floatfmt=".2f"), ""]
 
     text = "\n".join(out)
     print(text)
