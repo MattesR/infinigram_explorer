@@ -75,9 +75,11 @@ def load(out_dir, pool):
         if os.path.exists(tpath):
             for _, r in pd.read_csv(tpath).iterrows():
                 m = TRIPLE_RE.match(r["query"])
-                if m and all(g in count_of for g in m.groups()):
+                if m and all(count_of.get(g, 0) > 0 for g in m.groups()):
+                    # sum of logs, not the product: three counts in the millions overflow int64
+                    log_prod = sum(np.log10(float(count_of[g])) for g in m.groups())
                     triples.append({"qid": qid, "count": r["count"], "pair_count": r["pair_count"],
-                                    "prod": float(np.prod([count_of[g] for g in m.groups()])),
+                                    "x": log_prod, "prod": 10 ** log_prod,
                                     "chosen": r["query"] in chosen_triples})
         for _, r in prs.iterrows():
             m = PAIR_RE.match(r["query"])
@@ -106,7 +108,7 @@ def main():
     n_per = terms.groupby("bucket", observed=False).size()
 
     # ---------- 2. pair counts vs product of piece counts ----------
-    pairs["x"] = np.log10(pairs["n_a"]) + np.log10(pairs["n_b"])
+    pairs["x"] = np.log10(pairs["n_a"].astype(float)) + np.log10(pairs["n_b"].astype(float))
     pairs["y"] = np.log10(pairs["pair_count"])
     slope, intercept = np.polyfit(pairs["x"], pairs["y"], 1)
     resid = pairs["y"] - (slope * pairs["x"] + intercept)
@@ -118,7 +120,8 @@ def main():
     has_triples = len(triples) > 0 and (triples["count"] > 0).any()
     if has_triples:
         triples = triples[triples["count"] > 0].copy()
-        triples["x"], triples["y"] = np.log10(triples["prod"]), np.log10(triples["count"])
+        triples["y"] = np.log10(triples["count"].astype(float))
+        triples = triples[np.isfinite(triples["x"]) & np.isfinite(triples["y"])]
         t_slope, t_icpt = np.polyfit(triples["x"], triples["y"], 1)
         t_rho = triples[["x", "y"]].corr(method="spearman").iloc[0, 1]
         t_within10 = ((triples["y"] - (t_slope * triples["x"] + t_icpt)).abs() <= 1).mean()
