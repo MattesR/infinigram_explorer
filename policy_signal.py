@@ -80,6 +80,7 @@ def load(out_dir, pool):
                     log_prod = sum(np.log10(float(count_of[g])) for g in m.groups())
                     triples.append({"qid": qid, "count": r["count"], "pair_count": r["pair_count"],
                                     "x": log_prod, "prod": 10 ** log_prod,
+                                    "log_third": np.log10(float(count_of[m.group(3)])),
                                     "chosen": r["query"] in chosen_triples})
         for _, r in prs.iterrows():
             m = PAIR_RE.match(r["query"])
@@ -126,6 +127,16 @@ def main():
         t_rho = triples[["x", "y"]].corr(method="spearman").iloc[0, 1]
         t_within10 = ((triples["y"] - (t_slope * triples["x"] + t_icpt)).abs() <= 1).mean()
         t_reduction = (triples["pair_count"] / triples["count"]).median()
+        # better predictors: the pair the triple came from, alone and with the third term's count
+        triples["log_pair"] = np.log10(triples["pair_count"].astype(float))
+        t_rho_pair = triples[["log_pair", "y"]].corr(method="spearman").iloc[0, 1]
+        X = np.column_stack([triples["log_pair"], triples["log_third"], np.ones(len(triples))])
+        coef, *_ = np.linalg.lstsq(X, triples["y"], rcond=None)
+        resid_pc = triples["y"] - X @ coef
+        t_within10_pc = (resid_pc.abs() <= 1).mean()
+        t_within3_pc = (resid_pc.abs() <= np.log10(3)).mean()
+        t_r2_pc = 1 - resid_pc.var() / triples["y"].var()
+        t_sd = triples["y"].std()
 
     # ---------- 3. AUCs: what counts explain vs. what only gold coverage explains ----------
     used = terms["role"] != "unused"
@@ -209,6 +220,11 @@ def main():
         print(f"Triple count vs piece counts: Spearman {t_rho:.2f}; slope {t_slope:.2f}; "
               f"{t_within10:.0%} within a factor 10 of the fit; a triple has median {t_reduction:.1f}x fewer "
               f"matches than its pair; {triples['chosen'].mean():.0%} of counted triples were chosen")
+        print(f"  spread of log10 triple counts: sd {t_sd:.2f} (pairs: {pairs['y'].std():.2f})")
+        print(f"  triple count vs its pair count: Spearman {t_rho_pair:.2f}")
+        print(f"  fit on pair count + third term's count: R^2 {t_r2_pc:.2f}, "
+              f"{t_within3_pc:.0%} within a factor 3, {t_within10_pc:.0%} within a factor 10 "
+              f"(coefficients: pair {coef[0]:.2f}, third term {coef[1]:.2f})")
     print("\nAUC (0.5 = no signal) for each decision: count (seen by the model) vs held-out coverage H (not seen)")
     print(f"  term used alone (among used terms):  count {a_alone_count:.2f}   H {a_alone_H:.2f}")
     print(f"  term used at all:                    count {a_used_count:.2f}   H {a_used_H:.2f}")
