@@ -122,7 +122,8 @@ DEFAULTS = dict(
     max_pairs=400,         # cap on pairs that get counted
     triples=False,         # experiment: refine low-precision pairs into triples (tau rule)
     tau=5.0,               # refine a pair when it adds < tau new relevant docs per 1,000 count
-    triples_per_pair=5,    # third terms counted per refined pair (most kept relevant docs first)
+    triples_per_pair=5,    # SEARCH LIMIT: third terms counted per refinement (best first); 0 = all
+    max_refinements=1,     # SEARCH LIMIT: how often one pair may be refined; 0 = unlimited
     query_budgets=(10, 20, 50, 100),  # recall is also reported after the first N queries
     beta=10.0,             # smoothing in the greedy score gain / (count + beta)
     budgets=(1_000, 5_000, 10_000, 25_000, 40_000, 100_000),
@@ -558,16 +559,18 @@ def within_span(position_lists, window):
 
 def triples_for_pair(pair, covered, terms, per_split, split_of, keys, engine, cache, cfg):
     """Third-term candidates for one pair (tau rule): the triples that keep most of the pair's
-    still uncovered relevant docs, counted in the index (at most `triples_per_pair`).
+    still uncovered relevant docs, counted in the index (at most `triples_per_pair`, 0 = all).
+    Third terms already tried for this pair in an earlier refinement are skipped.
 
     A third term c is credited on a held-out doc only if c was selected in that doc's split and
     a, b and c all occur within one stretch of `window` tokens.
     """
     a, b = pair["terms"]
     still_new = pair["H"] - covered
+    tried = pair.setdefault("tried", set())
     local = []
     for c in keys:
-        if c in (a, b) or any(_contains(c, x) or _contains(x, c) for x in (a, b)):
+        if c in (a, b) or c in tried or any(_contains(c, x) or _contains(x, c) for x in (a, b)):
             continue
         tc = terms[c]
         H = {i for i in pair["H"] & tc["docs"]
@@ -580,7 +583,9 @@ def triples_for_pair(pair, covered, terms, per_split, split_of, keys, engine, ca
     local.sort(key=lambda x: -x[0])
 
     triples, warnings = [], []
-    for _, c, H in local[:cfg["triples_per_pair"]]:
+    limit = cfg["triples_per_pair"] or None
+    for _, c, H in local[:limit]:
+        tried.add(c)
         clauses = [terms[a]["variants"], terms[b]["variants"], terms[c]["variants"]]
         key = ("triple", tuple(sorted(tuple(map(tuple, v)) for v in clauses)), cfg["window"])
         count, approx = cached_count(engine, clauses, cache, cfg, "triple", key, window=cfg["window"])
@@ -598,8 +603,10 @@ def greedy_oracle(candidates, docs, cfg, refine=None):
 
     tau rule (only when `refine` is given): before a pair is accepted with fewer than tau new
     relevant docs per 1,000 count, refine(pair, covered) adds its best triples to the pool and the
-    choice is made again. Each pair is refined at most once; if no triple beats it, it is taken.
+    choice is made again. If no triple beats it, the pair is taken. A pair is refined at most
+    `max_refinements` times (0 = unlimited), and again only after its uncovered docs have changed.
     """
+    max_ref = cfg["max_refinements"] or float("inf")
     n_all = len(docs)
     n_top = sum(d["grade"] >= cfg["min_grade"] for d in docs) or 1
     b_max = cfg["budgets"][-1]
@@ -616,9 +623,11 @@ def greedy_oracle(candidates, docs, cfg, refine=None):
         if best is None:
             break
         gain = len(best["H"] - covered)
-        if (refine is not None and best["kind"] == "pair" and not best.get("refined")
+        if (refine is not None and best["kind"] == "pair"
+                and best.get("refinements", 0) < max_ref and best.get("refined_at_gain") != gain
                 and 1000 * gain / best["count"] < cfg["tau"]):
-            best["refined"] = True
+            best["refinements"] = best.get("refinements", 0) + 1
+            best["refined_at_gain"] = gain
             pool.extend(t for t in refine(best, covered) if t["H"] and t["count"] > 0)
             continue
         new = best["H"] - covered
@@ -694,9 +703,19 @@ def run_pool(terms, docs, splits, engine, cache, cfg, min_support):
             return new
 
     trace = greedy_oracle(singles + pairs, docs, cfg, refine)
+
+    # label every counted pair by what the oracle did with it (the training signal for "refine or not")
+    taken = {t["query"] for t in trace}
+    won = Counter(t["pair"] for t in triples if t["query"] in taken)
+    for p in pairs:
+        p["taken"] = p["query"] in taken
+        p["triples_taken"] = won.get(p["query"], 0)
+        p["refinements"] = p.get("refinements", 0)
+        p["label"] = "refined" if p["triples_taken"] else ("kept" if p["taken"] else "unused")
+
     return {
         "singles": singles, "pairs": pairs, "triples": triples, "trace": trace, "warnings": warnings,
-        "n_refined": sum(1 for p in pairs if p.get("refined")),
+        "n_refined": sum(1 for p in pairs if p["refinements"]),
         "recall_at": recall_at_budgets(trace, cfg["budgets"]),
         "recall_top_at": recall_at_budgets(trace, cfg["budgets"], key="recall_top"),
         "queries_at": queries_at_budgets(trace, cfg["budgets"]),
@@ -839,7 +858,7 @@ def save_outputs(qdir, cand_rows, results, summary):
                    ["query", "count", "H", "splits", "best_ow"])
         _write_csv(os.path.join(qdir, f"{name}_pairs.csv"),
                    [{**p, "H": len(p["H"])} for p in res["pairs"]],
-                   ["query", "count", "approx", "H"])
+                   ["query", "count", "approx", "H", "label", "taken", "refinements", "triples_taken"])
         _write_csv(os.path.join(qdir, f"{name}_triples.csv"),
                    [{**t, "H": len(t["H"])} for t in res["triples"]],
                    ["query", "count", "pair", "pair_count", "approx", "H"])
@@ -922,6 +941,7 @@ def analyze_query(qid, engine, tokenizer, query_text=None, **overrides):
         "count_calls": [{"label": l, "kind": k, "field": f, "value": v} for (l, k, f), v in COUNT_STATS.items()],
         "pools": {name: {"n_selected": len(res["singles"]), "n_pairs": len(res["pairs"]),
                          "n_triples": len(res["triples"]), "n_refined": res["n_refined"],
+                         "pair_labels": dict(Counter(p["label"] for p in res["pairs"])),
                          "n_steps": len(res["trace"]), "n_warnings": len(res["warnings"])}
                   for name, res in results.items()},
     }
@@ -1077,6 +1097,10 @@ def main():
     ap.add_argument("--triples", action="store_true",
                     help="experiment: refine pairs below tau new relevant docs per 1,000 count into triples")
     ap.add_argument("--tau", type=float, default=DEFAULTS["tau"])
+    ap.add_argument("--triples_per_pair", type=int, default=DEFAULTS["triples_per_pair"],
+                    help="third terms counted per refinement; 0 = all")
+    ap.add_argument("--max_refinements", type=int, default=DEFAULTS["max_refinements"],
+                    help="how often one pair may be refined; 0 = unlimited")
     ap.add_argument("--qid_file", help="file with one query id per line")
     for key in ["qrels_path", "topics_path", "expansions_path", "data_dir", "out_dir", "bm25_pool_pkl"]:
         ap.add_argument(f"--{key}", default=DEFAULTS[key])
@@ -1086,7 +1110,7 @@ def main():
 
     overrides = {k: getattr(args, k) for k in [
         "lucene_index", "corpus_dir", "qrels_path", "topics_path", "expansions_path", "data_dir", "out_dir",
-        "bm25_pool_pkl", "triples", "tau",
+        "bm25_pool_pkl", "triples", "tau", "triples_per_pair", "max_refinements",
         "min_grade", "n_folds", "top_k", "window", "max_candidates"]}
     if args.all_topics:
         qids = list(load_topics(args.topics_path))
