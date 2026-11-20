@@ -161,15 +161,16 @@ def main():
     base_dir = os.path.dirname(os.path.normpath(args.runs[0]))
     fig_dir = os.path.join(base_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
-    fig.savefig(os.path.join(fig_dir, "target_checks.png"), dpi=200, bbox_inches="tight")
-    fig.savefig(os.path.join(fig_dir, "target_checks.pdf"), bbox_inches="tight")
+    stem = os.path.splitext(os.path.basename(args.out))[0] if args.out else "target_checks"
+    fig.savefig(os.path.join(fig_dir, f"{stem}.png"), dpi=200, bbox_inches="tight")
+    fig.savefig(os.path.join(fig_dir, f"{stem}.pdf"), bbox_inches="tight")
 
     text = "\n".join(lines)
     print(text)
     out = args.out or os.path.join(base_dir, "target_checks.md")
     with open(out, "w") as f:
         f.write(text)
-    print(f"written to {out} and {fig_dir}/target_checks.png")
+    print(f"written to {out} and {fig_dir}/{stem}.png")
 
 
 if __name__ == "__main__":
